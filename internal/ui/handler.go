@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mostlydev/cllama/internal/agentctx"
 	"github.com/mostlydev/cllama/internal/cost"
@@ -43,10 +44,10 @@ type Handler struct {
 }
 
 type providerRow struct {
-	Name      string
-	BaseURL   string
-	Auth      string
-	MaskedKey string
+	Name      string `json:"name"`
+	BaseURL   string `json:"baseURL"`
+	Auth      string `json:"auth"`
+	MaskedKey string `json:"maskedKey"`
 }
 
 type pageData struct {
@@ -147,6 +148,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case r.Method == http.MethodGet && r.URL.Path == "/costs/api":
 		h.handleCostsAPI(w)
+		return
+	case r.Method == http.MethodGet && r.URL.Path == "/events":
+		h.handleSSE(w, r)
 		return
 	default:
 		http.NotFound(w, r)
@@ -354,6 +358,185 @@ func (h *Handler) buildPodPageData() podPageData {
 	})
 
 	return podPageData{PodName: podName, Members: members}
+}
+
+// -- SSE dashboard state types --
+
+type dashboardState struct {
+	PodName      string           `json:"podName,omitempty"`
+	TotalCostUSD float64          `json:"totalCostUSD"`
+	TotalReqs    int              `json:"totalRequests"`
+	TotalTokens  int              `json:"totalTokens"`
+	Providers    []providerRow    `json:"providers"`
+	Agents       []dashboardAgent `json:"agents"`
+}
+
+type dashboardAgent struct {
+	AgentID        string           `json:"agentId"`
+	Service        string           `json:"service,omitempty"`
+	Type           string           `json:"type,omitempty"`
+	TotalRequests  int              `json:"totalRequests"`
+	TotalCostUSD   float64          `json:"totalCostUSD"`
+	TotalTokensIn  int              `json:"totalTokensIn"`
+	TotalTokensOut int              `json:"totalTokensOut"`
+	Models         []dashboardModel `json:"models"`
+}
+
+type dashboardModel struct {
+	Provider  string  `json:"provider"`
+	Model     string  `json:"model"`
+	Requests  int     `json:"requests"`
+	TokensIn  int     `json:"tokensIn"`
+	TokensOut int     `json:"tokensOut"`
+	CostUSD   float64 `json:"costUSD"`
+}
+
+func (h *Handler) buildDashboardState() dashboardState {
+	state := dashboardState{
+		Providers: []providerRow{},
+		Agents:    []dashboardAgent{},
+	}
+
+	// 1. Providers from registry (sorted by name, masked keys)
+	all := h.registry.All()
+	names := make([]string, 0, len(all))
+	for name := range all {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		p := all[name]
+		state.Providers = append(state.Providers, providerRow{
+			Name:      p.Name,
+			BaseURL:   p.BaseURL,
+			Auth:      p.Auth,
+			MaskedKey: maskKey(p.APIKey),
+		})
+	}
+
+	// 2. Agents from context root (if available), merging cost data
+	seenAgents := make(map[string]bool)
+	if h.contextRoot != "" {
+		agents, err := agentctx.ListAgents(h.contextRoot)
+		if err == nil {
+			for _, a := range agents {
+				if state.PodName == "" && a.Pod != "" {
+					state.PodName = a.Pod
+				}
+				da := dashboardAgent{
+					AgentID: a.AgentID,
+					Service: a.Service,
+					Type:    a.Type,
+					Models:  []dashboardModel{},
+				}
+				if h.accumulator != nil {
+					for _, e := range h.accumulator.ByAgent(a.AgentID) {
+						da.TotalRequests += e.RequestCount
+						da.TotalCostUSD += e.TotalCostUSD
+						da.TotalTokensIn += e.TotalInputTokens
+						da.TotalTokensOut += e.TotalOutputTokens
+						da.Models = append(da.Models, dashboardModel{
+							Provider:  e.Provider,
+							Model:     e.Model,
+							Requests:  e.RequestCount,
+							TokensIn:  e.TotalInputTokens,
+							TokensOut: e.TotalOutputTokens,
+							CostUSD:   e.TotalCostUSD,
+						})
+					}
+				}
+				state.Agents = append(state.Agents, da)
+				seenAgents[a.AgentID] = true
+			}
+		}
+	}
+
+	// 3. Agents from cost data that aren't in context (standalone requests)
+	if h.accumulator != nil {
+		grouped := h.accumulator.All()
+		agentIDs := make([]string, 0, len(grouped))
+		for id := range grouped {
+			agentIDs = append(agentIDs, id)
+		}
+		sort.Strings(agentIDs)
+		for _, id := range agentIDs {
+			if seenAgents[id] {
+				continue
+			}
+			da := dashboardAgent{
+				AgentID: id,
+				Models:  []dashboardModel{},
+			}
+			for _, e := range grouped[id] {
+				da.TotalRequests += e.RequestCount
+				da.TotalCostUSD += e.TotalCostUSD
+				da.TotalTokensIn += e.TotalInputTokens
+				da.TotalTokensOut += e.TotalOutputTokens
+				da.Models = append(da.Models, dashboardModel{
+					Provider:  e.Provider,
+					Model:     e.Model,
+					Requests:  e.RequestCount,
+					TokensIn:  e.TotalInputTokens,
+					TokensOut: e.TotalOutputTokens,
+					CostUSD:   e.TotalCostUSD,
+				})
+			}
+			state.Agents = append(state.Agents, da)
+		}
+	}
+
+	// 4. Compute totals
+	if h.accumulator != nil {
+		state.TotalCostUSD = h.accumulator.TotalCost()
+	}
+	for _, a := range state.Agents {
+		state.TotalReqs += a.TotalRequests
+		state.TotalTokens += a.TotalTokensIn + a.TotalTokensOut
+	}
+
+	// 5. Sort agents by ID
+	sort.Slice(state.Agents, func(i, j int) bool {
+		return state.Agents[i].AgentID < state.Agents[j].AgentID
+	})
+
+	return state
+}
+
+func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	// Send initial state immediately
+	h.writeSSEEvent(w, flusher)
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			h.writeSSEEvent(w, flusher)
+		}
+	}
+}
+
+func (h *Handler) writeSSEEvent(w http.ResponseWriter, flusher http.Flusher) {
+	state := h.buildDashboardState()
+	data, err := json.Marshal(state)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(w, "data:%s\n\n", data)
+	flusher.Flush()
 }
 
 func maskKey(key string) string {

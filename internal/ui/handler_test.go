@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mostlydev/cllama/internal/cost"
 	"github.com/mostlydev/cllama/internal/provider"
@@ -229,5 +231,57 @@ func TestUICostsAPIEmptyAccumulator(t *testing.T) {
 	}
 	if len(result.Agents) != 0 {
 		t.Errorf("expected empty agents map, got %d entries", len(result.Agents))
+	}
+}
+
+func TestSSEEndpointStreamsEvents(t *testing.T) {
+	reg := provider.NewRegistry(t.TempDir())
+	reg.Set("anthropic", &provider.Provider{Name: "anthropic", BaseURL: "https://api.anthropic.com/v1", APIKey: "sk-test", Auth: "bearer"})
+	acc := cost.NewAccumulator()
+	acc.Record("tiverton", "anthropic", "claude-sonnet-4", 1000, 500, 0.0105)
+
+	h := NewHandler(reg, WithAccumulator(acc))
+
+	req := httptest.NewRequest("GET", "/events", nil)
+	w := httptest.NewRecorder()
+
+	// Run handler in goroutine since SSE blocks; cancel via context
+	ctx, cancel := context.WithTimeout(req.Context(), 200*time.Millisecond)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	h.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "data:") {
+		t.Fatal("expected SSE data line")
+	}
+	if !strings.Contains(body, "anthropic") {
+		t.Error("expected provider name in SSE payload")
+	}
+	if !strings.Contains(body, "tiverton") {
+		t.Error("expected agent name in SSE payload")
+	}
+
+	// Verify it's valid JSON inside the data line
+	lines := strings.Split(body, "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "data:") {
+			jsonStr := strings.TrimPrefix(line, "data:")
+			var state map[string]interface{}
+			if err := json.Unmarshal([]byte(jsonStr), &state); err != nil {
+				t.Fatalf("SSE data is not valid JSON: %v", err)
+			}
+			if _, ok := state["providers"]; !ok {
+				t.Error("expected 'providers' key in state")
+			}
+			if _, ok := state["agents"]; !ok {
+				t.Error("expected 'agents' key in state")
+			}
+			if _, ok := state["totalCostUSD"]; !ok {
+				t.Error("expected 'totalCostUSD' key in state")
+			}
+			break
+		}
 	}
 }
