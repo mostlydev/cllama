@@ -50,54 +50,6 @@ type providerRow struct {
 	MaskedKey string `json:"maskedKey"`
 }
 
-type pageData struct {
-	Providers []providerRow
-	Error     string
-}
-
-// -- costs page types --
-
-type costsPageData struct {
-	TotalCostUSD  float64
-	TotalRequests int
-	TotalTokens   int
-	Agents        []agentCostRow
-}
-
-type agentCostRow struct {
-	AgentID        string
-	TotalRequests  int
-	TotalTokensIn  int
-	TotalTokensOut int
-	TotalCostUSD   float64
-	Models         []modelCostRow
-}
-
-type modelCostRow struct {
-	Provider  string
-	Model     string
-	Requests  int
-	TokensIn  int
-	TokensOut int
-	CostUSD   float64
-}
-
-// -- pod page types --
-
-type podPageData struct {
-	PodName string
-	Members []podMemberRow
-}
-
-type podMemberRow struct {
-	AgentID       string
-	Service       string
-	Type          string
-	TotalRequests int
-	TotalCostUSD  float64
-	Models        []string // models seen in live traffic
-}
-
 // -- costs API types --
 
 type costsAPIResponse struct {
@@ -136,64 +88,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/":
 		h.renderDashboard(w)
-		return
-	case r.Method == http.MethodPost && r.URL.Path == "/providers":
-		h.handleProviderUpdate(w, r)
-		return
-	case r.Method == http.MethodGet && r.URL.Path == "/pod":
-		h.renderPod(w)
-		return
-	case r.Method == http.MethodGet && r.URL.Path == "/costs":
-		h.renderCosts(w)
-		return
-	case r.Method == http.MethodGet && r.URL.Path == "/costs/api":
-		h.handleCostsAPI(w)
-		return
 	case r.Method == http.MethodGet && r.URL.Path == "/events":
 		h.handleSSE(w, r)
-		return
+	case r.Method == http.MethodGet && r.URL.Path == "/costs/api":
+		h.handleCostsAPI(w)
 	default:
 		http.NotFound(w, r)
-		return
 	}
-}
-
-func (h *Handler) handleProviderUpdate(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		h.renderIndex(w, "invalid form body", http.StatusBadRequest)
-		return
-	}
-
-	name := strings.ToLower(strings.TrimSpace(r.FormValue("name")))
-	if name == "" {
-		h.renderIndex(w, "provider name is required", http.StatusBadRequest)
-		return
-	}
-
-	action := strings.ToLower(strings.TrimSpace(r.FormValue("action")))
-	switch action {
-	case "delete":
-		h.registry.Delete(name)
-	default:
-		baseURL := strings.TrimSpace(r.FormValue("base_url"))
-		auth := strings.ToLower(strings.TrimSpace(r.FormValue("auth")))
-		if auth == "" {
-			auth = "bearer"
-		}
-		h.registry.Set(name, &provider.Provider{
-			Name:    name,
-			BaseURL: baseURL,
-			APIKey:  strings.TrimSpace(r.FormValue("api_key")),
-			Auth:    auth,
-		})
-	}
-
-	if err := h.registry.SaveToFile(); err != nil {
-		h.renderIndex(w, "failed to persist providers.json: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (h *Handler) renderDashboard(w http.ResponseWriter) {
@@ -202,89 +103,12 @@ func (h *Handler) renderDashboard(w http.ResponseWriter) {
 	_ = h.tpl.ExecuteTemplate(w, "dashboard.html", state)
 }
 
-func (h *Handler) renderIndex(w http.ResponseWriter, errText string, status int) {
-	all := h.registry.All()
-	names := make([]string, 0, len(all))
-	for name := range all {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	rows := make([]providerRow, 0, len(names))
-	for _, name := range names {
-		p := all[name]
-		rows = append(rows, providerRow{
-			Name:      p.Name,
-			BaseURL:   p.BaseURL,
-			Auth:      p.Auth,
-			MaskedKey: maskKey(p.APIKey),
-		})
-	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(status)
-	_ = h.tpl.ExecuteTemplate(w, "index.html", pageData{Providers: rows, Error: errText})
-}
-
-func (h *Handler) renderCosts(w http.ResponseWriter) {
-	data := h.buildCostsPageData()
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = h.tpl.ExecuteTemplate(w, "costs.html", data)
-}
-
 func (h *Handler) handleCostsAPI(w http.ResponseWriter) {
 	resp := h.buildCostsAPIResponse()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(resp)
-}
-
-func (h *Handler) buildCostsPageData() costsPageData {
-	if h.accumulator == nil {
-		return costsPageData{}
-	}
-
-	grouped := h.accumulator.All()
-	agentIDs := make([]string, 0, len(grouped))
-	for id := range grouped {
-		agentIDs = append(agentIDs, id)
-	}
-	sort.Strings(agentIDs)
-
-	var agents []agentCostRow
-	for _, id := range agentIDs {
-		entries := grouped[id]
-		row := agentCostRow{AgentID: id}
-		for _, e := range entries {
-			row.TotalRequests += e.RequestCount
-			row.TotalTokensIn += e.TotalInputTokens
-			row.TotalTokensOut += e.TotalOutputTokens
-			row.TotalCostUSD += e.TotalCostUSD
-			row.Models = append(row.Models, modelCostRow{
-				Provider:  e.Provider,
-				Model:     e.Model,
-				Requests:  e.RequestCount,
-				TokensIn:  e.TotalInputTokens,
-				TokensOut: e.TotalOutputTokens,
-				CostUSD:   e.TotalCostUSD,
-			})
-		}
-		agents = append(agents, row)
-	}
-
-	var totalReqs, totalToks int
-	for _, a := range agents {
-		totalReqs += a.TotalRequests
-		totalToks += a.TotalTokensIn + a.TotalTokensOut
-	}
-
-	return costsPageData{
-		TotalCostUSD:  h.accumulator.TotalCost(),
-		TotalRequests: totalReqs,
-		TotalTokens:   totalToks,
-		Agents:        agents,
-	}
 }
 
 func (h *Handler) buildCostsAPIResponse() costsAPIResponse {
@@ -314,56 +138,6 @@ func (h *Handler) buildCostsAPIResponse() costsAPIResponse {
 		resp.Agents[id] = agent
 	}
 	return resp
-}
-
-func (h *Handler) renderPod(w http.ResponseWriter) {
-	data := h.buildPodPageData()
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = h.tpl.ExecuteTemplate(w, "pod.html", data)
-}
-
-func (h *Handler) buildPodPageData() podPageData {
-	var members []podMemberRow
-	var podName string
-
-	if h.contextRoot != "" {
-		agents, err := agentctx.ListAgents(h.contextRoot)
-		if err == nil {
-			for _, a := range agents {
-				if podName == "" && a.Pod != "" {
-					podName = a.Pod
-				}
-				m := podMemberRow{
-					AgentID: a.AgentID,
-					Service: a.Service,
-					Type:    a.Type,
-				}
-
-				// merge live cost data if accumulator available
-				if h.accumulator != nil {
-					entries := h.accumulator.ByAgent(a.AgentID)
-					seen := make(map[string]bool)
-					for _, e := range entries {
-						m.TotalRequests += e.RequestCount
-						m.TotalCostUSD += e.TotalCostUSD
-						modelKey := fmt.Sprintf("%s/%s", e.Provider, e.Model)
-						if !seen[modelKey] {
-							m.Models = append(m.Models, modelKey)
-							seen[modelKey] = true
-						}
-					}
-				}
-
-				members = append(members, m)
-			}
-		}
-	}
-
-	sort.Slice(members, func(i, j int) bool {
-		return members[i].AgentID < members[j].AgentID
-	})
-
-	return podPageData{PodName: podName, Members: members}
 }
 
 // -- SSE dashboard state types --

@@ -6,9 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,84 +13,6 @@ import (
 	"github.com/mostlydev/cllama/internal/cost"
 	"github.com/mostlydev/cllama/internal/provider"
 )
-
-func TestUIListsProviders(t *testing.T) {
-	reg := provider.NewRegistry(t.TempDir())
-	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: "https://api.openai.com/v1", APIKey: "sk-test", Auth: "bearer"})
-	h := NewHandler(reg)
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected 200, got %d", w.Code)
-	}
-	if !strings.Contains(w.Body.String(), "openai") {
-		t.Error("expected provider name in response")
-	}
-}
-
-func TestUIUpsertProvider(t *testing.T) {
-	authDir := t.TempDir()
-	reg := provider.NewRegistry(authDir)
-	h := NewHandler(reg)
-
-	form := url.Values{}
-	form.Set("name", "openrouter")
-	form.Set("base_url", "https://openrouter.ai/api/v1")
-	form.Set("api_key", "sk-or-test")
-	form.Set("auth", "bearer")
-
-	req := httptest.NewRequest(http.MethodPost, "/providers", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-
-	if w.Code != http.StatusSeeOther {
-		t.Fatalf("expected 303, got %d body=%s", w.Code, w.Body.String())
-	}
-
-	p, err := reg.Get("openrouter")
-	if err != nil {
-		t.Fatalf("provider not saved in memory: %v", err)
-	}
-	if p.APIKey != "sk-or-test" {
-		t.Fatalf("expected api key saved, got %q", p.APIKey)
-	}
-
-	data, err := os.ReadFile(filepath.Join(authDir, "providers.json"))
-	if err != nil {
-		t.Fatalf("providers.json missing: %v", err)
-	}
-	if !strings.Contains(string(data), "openrouter") {
-		t.Fatalf("providers.json missing provider entry: %s", string(data))
-	}
-}
-
-func TestUIDeleteProvider(t *testing.T) {
-	reg := provider.NewRegistry(t.TempDir())
-	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: "https://api.openai.com/v1", APIKey: "sk-test", Auth: "bearer"})
-	h := NewHandler(reg)
-
-	form := url.Values{}
-	form.Set("name", "openai")
-	form.Set("action", "delete")
-
-	req := httptest.NewRequest(http.MethodPost, "/providers", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-
-	if w.Code != http.StatusSeeOther {
-		t.Fatalf("expected 303, got %d", w.Code)
-	}
-
-	_, err := reg.Get("openai")
-	if err == nil {
-		t.Fatalf("expected provider to be deleted")
-	}
-}
 
 func TestMaskKey(t *testing.T) {
 	if got := maskKey(""); got != "" {
@@ -115,52 +34,6 @@ func TestNotFound(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		b, _ := io.ReadAll(w.Result().Body)
 		t.Fatalf("expected 404, got %d body=%s", w.Code, string(b))
-	}
-}
-
-func TestUICostsPageRenders(t *testing.T) {
-	reg := provider.NewRegistry(t.TempDir())
-	acc := cost.NewAccumulator()
-	acc.Record("tiverton", "anthropic", "claude-sonnet-4", 1000, 500, 0.0105)
-	acc.Record("westin", "openai", "gpt-4o", 2000, 1000, 0.035)
-
-	h := NewHandler(reg, WithAccumulator(acc))
-	req := httptest.NewRequest("GET", "/costs", nil)
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-
-	if w.Code != 200 {
-		t.Errorf("expected 200, got %d", w.Code)
-	}
-	body := w.Body.String()
-	if !strings.Contains(body, "tiverton") {
-		t.Error("expected agent name 'tiverton' in response")
-	}
-	if !strings.Contains(body, "westin") {
-		t.Error("expected agent name 'westin' in response")
-	}
-	if !strings.Contains(body, "0.0105") {
-		t.Error("expected cost value 0.0105 in response")
-	}
-	if !strings.Contains(body, "0.0455") {
-		t.Error("expected total cost 0.0455 in response")
-	}
-}
-
-func TestUICostsPageRendersEmpty(t *testing.T) {
-	reg := provider.NewRegistry(t.TempDir())
-	h := NewHandler(reg) // no accumulator
-
-	req := httptest.NewRequest("GET", "/costs", nil)
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-
-	if w.Code != 200 {
-		t.Errorf("expected 200, got %d", w.Code)
-	}
-	body := w.Body.String()
-	if !strings.Contains(body, "No cost data") {
-		t.Error("expected empty-state message")
 	}
 }
 
