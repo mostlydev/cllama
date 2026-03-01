@@ -92,6 +92,12 @@
       align-items: center;
       gap: 16px;
     }
+    .topbar-stat {
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
     .topbar-spend {
       font-family: "Geist Mono", monospace;
       font-size: 13px;
@@ -368,6 +374,7 @@
     @media (max-width: 720px) {
       .agent-grid { grid-template-columns: 1fr; }
       .topbar-center { display: none; }
+      .topbar-stat { display: none; }
       .topbar-spend { font-size: 11px; }
       th:nth-child(3), td:nth-child(3) { display: none; }
     }
@@ -378,6 +385,8 @@
     <div class="topbar-brand"><span>cllama</span> passthrough</div>
     <div class="topbar-center">{{if .PodName}}{{.PodName}}{{end}}</div>
     <div class="topbar-right">
+      <span class="topbar-stat" data-total-requests>{{.TotalReqs}} reqs</span>
+      <span class="topbar-stat" data-total-tokens>{{.TotalTokens}} tok</span>
       <span class="topbar-spend" data-total-cost>${{printf "%.4f" .TotalCostUSD}}</span>
       <div class="live-indicator">
         <span class="live-dot"></span>
@@ -477,9 +486,13 @@
     es.onmessage = function(e) {
       var state = JSON.parse(e.data);
       var el = function(sel) { return document.querySelector(sel); };
-      // Update header total cost
+      // Update header stats
       var costEl = el('[data-total-cost]');
       if (costEl) costEl.textContent = '$' + state.totalCostUSD.toFixed(4);
+      var reqsEl = el('[data-total-requests]');
+      if (reqsEl) reqsEl.textContent = state.totalRequests + ' reqs';
+      var toksEl = el('[data-total-tokens]');
+      if (toksEl) toksEl.textContent = state.totalTokens + ' tok';
       // Update agent cards
       (state.agents || []).forEach(function(a) {
         var card = document.querySelector('[data-agent="' + a.agentId + '"]');
@@ -498,6 +511,10 @@
     es.onerror = function() {
       var ind = document.querySelector('.live-indicator');
       if (ind) ind.classList.add('disconnected');
+    };
+    es.onopen = function() {
+      var ind = document.querySelector('.live-indicator');
+      if (ind) ind.classList.remove('disconnected');
     };
   </script>
 </body>
