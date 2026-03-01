@@ -234,6 +234,39 @@ func TestUICostsAPIEmptyAccumulator(t *testing.T) {
 	}
 }
 
+func TestDashboardRendersAllSections(t *testing.T) {
+	reg := provider.NewRegistry(t.TempDir())
+	reg.Set("anthropic", &provider.Provider{Name: "anthropic", BaseURL: "https://api.anthropic.com/v1", APIKey: "sk-test-key-1234", Auth: "bearer"})
+	acc := cost.NewAccumulator()
+	acc.Record("tiverton", "anthropic", "claude-sonnet-4", 1000, 500, 0.0105)
+
+	h := NewHandler(reg, WithAccumulator(acc))
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+
+	// Should contain provider info (read-only)
+	if !strings.Contains(body, "anthropic") {
+		t.Error("expected provider name in dashboard")
+	}
+	if !strings.Contains(body, "sk-t...1234") {
+		t.Error("expected masked API key in dashboard")
+	}
+	// Should NOT contain provider form
+	if strings.Contains(body, "method=\"post\"") {
+		t.Error("dashboard should not contain provider management form")
+	}
+	// Should contain SSE connection script
+	if !strings.Contains(body, "EventSource") {
+		t.Error("expected EventSource script for live updates")
+	}
+}
+
 func TestSSEEndpointStreamsEvents(t *testing.T) {
 	reg := provider.NewRegistry(t.TempDir())
 	reg.Set("anthropic", &provider.Provider{Name: "anthropic", BaseURL: "https://api.anthropic.com/v1", APIKey: "sk-test", Auth: "bearer"})

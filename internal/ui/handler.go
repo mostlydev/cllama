@@ -135,7 +135,7 @@ func NewHandler(reg *provider.Registry, opts ...UIOption) http.Handler {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/":
-		h.renderIndex(w, "", http.StatusOK)
+		h.renderDashboard(w)
 		return
 	case r.Method == http.MethodPost && r.URL.Path == "/providers":
 		h.handleProviderUpdate(w, r)
@@ -194,6 +194,12 @@ func (h *Handler) handleProviderUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (h *Handler) renderDashboard(w http.ResponseWriter) {
+	state := h.buildDashboardState()
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = h.tpl.ExecuteTemplate(w, "dashboard.html", state)
 }
 
 func (h *Handler) renderIndex(w http.ResponseWriter, errText string, status int) {
@@ -517,26 +523,33 @@ func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request) {
 	defer ticker.Stop()
 
 	// Send initial state immediately
-	h.writeSSEEvent(w, flusher)
+	if !h.writeSSEEvent(w, flusher) {
+		return
+	}
 
 	for {
 		select {
 		case <-r.Context().Done():
 			return
 		case <-ticker.C:
-			h.writeSSEEvent(w, flusher)
+			if !h.writeSSEEvent(w, flusher) {
+				return
+			}
 		}
 	}
 }
 
-func (h *Handler) writeSSEEvent(w http.ResponseWriter, flusher http.Flusher) {
+func (h *Handler) writeSSEEvent(w http.ResponseWriter, flusher http.Flusher) bool {
 	state := h.buildDashboardState()
 	data, err := json.Marshal(state)
 	if err != nil {
-		return
+		return true // state is all primitives; marshal won't fail in practice
 	}
-	fmt.Fprintf(w, "data:%s\n\n", data)
+	if _, err := fmt.Fprintf(w, "data:%s\n\n", data); err != nil {
+		return false // client disconnected
+	}
 	flusher.Flush()
+	return true
 }
 
 func maskKey(key string) string {

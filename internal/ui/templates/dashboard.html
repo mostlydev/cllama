@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>cllama{{if .PodName}} &mdash; {{.PodName}}{{end}}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0c1017;
+      --bg-raised: #131a24;
+      --bg-surface: #19222f;
+      --ink: #d4dce8;
+      --ink-bright: #edf2f7;
+      --muted: #5e7085;
+      --line: #1f2d3d;
+      --line-bright: #2a3a4d;
+      --amber: #f0a500;
+      --amber-dim: #a07000;
+      --amber-glow: rgba(240, 165, 0, 0.12);
+      --cyan: #22d3ee;
+      --cyan-dim: #0e7490;
+      --cyan-glow: rgba(34, 211, 238, 0.08);
+      --red: #ef4444;
+      --red-dim: #7f1d1d;
+      --green: #34d399;
+      --green-dim: #065f46;
+      --purple: #a78bfa;
+      --purple-dim: #4c1d95;
+      --purple-glow: rgba(167, 139, 250, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Outfit", sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      min-height: 100vh;
+      position: relative;
+    }
+
+    /* subtle scan-line texture */
+    body::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0,0,0,0.03) 2px,
+        rgba(0,0,0,0.03) 4px
+      );
+      z-index: 9999;
+    }
+
+    /* ── header bar ─────────────────────────────────── */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      height: 48px;
+      background: var(--bg-raised);
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+    }
+    .topbar-brand {
+      font-family: "Geist Mono", monospace;
+      font-weight: 600;
+      color: var(--muted);
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      font-size: 11px;
+    }
+    .topbar-brand span { color: var(--cyan); }
+
+    .topbar-center {
+      font-family: "Geist Mono", monospace;
+      font-size: 12px;
+      color: var(--ink);
+      font-weight: 500;
+    }
+
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .topbar-spend {
+      font-family: "Geist Mono", monospace;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--amber);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .live-indicator {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      color: var(--green);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .live-indicator.disconnected {
+      color: var(--red);
+    }
+    .live-indicator.disconnected .live-dot {
+      background: var(--red);
+      animation: none;
+    }
+    .live-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      animation: pulse 2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.4); }
+      50% { opacity: 0.6; box-shadow: 0 0 0 4px rgba(52, 211, 153, 0); }
+    }
+
+    /* ── layout ──────────────────────────────────────── */
+    main {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 32px 24px;
+    }
+
+    /* ── panels ──────────────────────────────────────── */
+    .panel {
+      background: var(--bg-raised);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-bottom: 20px;
+      overflow: hidden;
+    }
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .panel-title {
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin: 0;
+    }
+    .panel-count {
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      color: var(--muted);
+      background: var(--bg);
+      padding: 2px 8px;
+      border-radius: 4px;
+    }
+
+    /* ── providers table ─────────────────────────────── */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th {
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      font-weight: 500;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      text-align: left;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--bg);
+    }
+    td {
+      padding: 11px 14px;
+      font-size: 13px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: middle;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(34, 211, 238, 0.02); }
+
+    .cell-name {
+      font-family: "Geist Mono", monospace;
+      font-weight: 600;
+      color: var(--cyan);
+      font-size: 13px;
+    }
+    .cell-url {
+      font-family: "Geist Mono", monospace;
+      font-size: 12px;
+      color: var(--ink);
+      word-break: break-all;
+    }
+    .cell-auth {
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 3px;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      color: var(--muted);
+    }
+    .cell-key {
+      font-family: "Geist Mono", monospace;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .empty-row {
+      text-align: center;
+      padding: 32px 14px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    /* ── agent cards ─────────────────────────────────── */
+    .agent-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 14px;
+      padding: 18px;
+    }
+
+    .agent-card {
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 18px;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    .agent-card:hover {
+      border-color: var(--line-bright);
+      box-shadow: 0 0 20px rgba(34, 211, 238, 0.04);
+    }
+
+    .agent-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }
+    .agent-name {
+      font-family: "Geist Mono", monospace;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--cyan);
+    }
+    .agent-type {
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      padding: 3px 8px;
+      border-radius: 3px;
+      background: var(--purple-glow);
+      border: 1px solid var(--purple-dim);
+      color: var(--purple);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .agent-stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .agent-stat {
+      background: var(--bg-raised);
+      border-radius: 4px;
+      padding: 10px 12px;
+    }
+    .agent-stat-value {
+      font-family: "Geist Mono", monospace;
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--ink-bright);
+      font-variant-numeric: tabular-nums;
+      line-height: 1;
+      margin-bottom: 3px;
+    }
+    .agent-stat-value.cost { color: var(--amber); }
+    .agent-stat-label {
+      font-family: "Geist Mono", monospace;
+      font-size: 9px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .agent-models {
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+    }
+    .agent-models-label {
+      font-family: "Geist Mono", monospace;
+      font-size: 9px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 6px;
+    }
+    .model-tag {
+      display: inline-block;
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      padding: 3px 8px;
+      margin: 0 4px 4px 0;
+      border-radius: 3px;
+      background: var(--bg-surface);
+      border: 1px solid var(--line);
+      color: var(--ink);
+    }
+    .no-models {
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      color: var(--muted);
+      font-style: italic;
+    }
+
+    /* ── empty state ─────────────────────────────────── */
+    .empty-state {
+      text-align: center;
+      padding: 48px 24px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .empty-state code {
+      font-family: "Geist Mono", monospace;
+      color: var(--cyan);
+      font-size: 12px;
+    }
+
+    /* ── animations ──────────────────────────────────── */
+    .fade-in {
+      animation: fadeIn 0.3s ease-out both;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .panel:nth-child(1) { animation-delay: 0s; }
+    .panel:nth-child(2) { animation-delay: 0.06s; }
+    .panel:nth-child(3) { animation-delay: 0.12s; }
+
+    .agent-card:nth-child(1) { animation-delay: 0s; }
+    .agent-card:nth-child(2) { animation-delay: 0.04s; }
+    .agent-card:nth-child(3) { animation-delay: 0.08s; }
+    .agent-card:nth-child(4) { animation-delay: 0.12s; }
+    .agent-card:nth-child(5) { animation-delay: 0.16s; }
+    .agent-card:nth-child(6) { animation-delay: 0.20s; }
+
+    /* ── responsive ──────────────────────────────────── */
+    @media (max-width: 720px) {
+      .agent-grid { grid-template-columns: 1fr; }
+      .topbar-center { display: none; }
+      .topbar-spend { font-size: 11px; }
+      th:nth-child(3), td:nth-child(3) { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-brand"><span>cllama</span> passthrough</div>
+    <div class="topbar-center">{{if .PodName}}{{.PodName}}{{end}}</div>
+    <div class="topbar-right">
+      <span class="topbar-spend" data-total-cost>${{printf "%.4f" .TotalCostUSD}}</span>
+      <div class="live-indicator">
+        <span class="live-dot"></span>
+        live
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- ── Providers Section ────────────────────────── -->
+    <section class="panel fade-in">
+      <div class="panel-header">
+        <h2 class="panel-title">Providers</h2>
+        <span class="panel-count">{{len .Providers}}</span>
+      </div>
+      {{if .Providers}}
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Base URL</th>
+            <th>Auth</th>
+            <th>Key</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Providers}}
+          <tr>
+            <td><span class="cell-name">{{.Name}}</span></td>
+            <td><span class="cell-url">{{.BaseURL}}</span></td>
+            <td><span class="cell-auth">{{.Auth}}</span></td>
+            <td><span class="cell-key">{{.MaskedKey}}</span></td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+      {{else}}
+      <div class="empty-row">No providers configured.</div>
+      {{end}}
+    </section>
+
+    <!-- ── Agents Section ───────────────────────────── -->
+    <section class="panel fade-in">
+      <div class="panel-header">
+        <h2 class="panel-title">Agents</h2>
+        <span class="panel-count">{{len .Agents}}</span>
+      </div>
+      {{if .Agents}}
+      <div class="agent-grid">
+        {{range .Agents}}
+        <div class="agent-card fade-in" data-agent="{{.AgentID}}">
+          <div class="agent-card-header">
+            <span class="agent-name">{{.AgentID}}</span>
+            {{if .Type}}<span class="agent-type">{{.Type}}</span>{{end}}
+          </div>
+
+          <div class="agent-stats">
+            <div class="agent-stat">
+              <div class="agent-stat-value" data-field="requests">{{.TotalRequests}}</div>
+              <div class="agent-stat-label">Requests</div>
+            </div>
+            <div class="agent-stat">
+              <div class="agent-stat-value cost" data-field="cost">${{printf "%.4f" .TotalCostUSD}}</div>
+              <div class="agent-stat-label">Cost</div>
+            </div>
+            <div class="agent-stat">
+              <div class="agent-stat-value" data-field="tokens-in">{{.TotalTokensIn}}</div>
+              <div class="agent-stat-label">Tokens In</div>
+            </div>
+            <div class="agent-stat">
+              <div class="agent-stat-value" data-field="tokens-out">{{.TotalTokensOut}}</div>
+              <div class="agent-stat-label">Tokens Out</div>
+            </div>
+          </div>
+
+          <div class="agent-models">
+            <div class="agent-models-label">Models Used</div>
+            {{if .Models}}
+              {{range .Models}}<span class="model-tag">{{.Provider}}/{{.Model}}</span>{{end}}
+            {{else}}
+              <span class="no-models">no requests yet</span>
+            {{end}}
+          </div>
+        </div>
+        {{end}}
+      </div>
+      {{else}}
+      <div class="empty-state">
+        <p>No agent activity yet.</p>
+      </div>
+      {{end}}
+    </section>
+  </main>
+
+  <script>
+    var es = new EventSource('/events');
+    es.onmessage = function(e) {
+      var state = JSON.parse(e.data);
+      var el = function(sel) { return document.querySelector(sel); };
+      // Update header total cost
+      var costEl = el('[data-total-cost]');
+      if (costEl) costEl.textContent = '$' + state.totalCostUSD.toFixed(4);
+      // Update agent cards
+      (state.agents || []).forEach(function(a) {
+        var card = document.querySelector('[data-agent="' + a.agentId + '"]');
+        if (!card) return;
+        var f = function(name) { return card.querySelector('[data-field="' + name + '"]'); };
+        var reqEl = f('requests');
+        if (reqEl) reqEl.textContent = a.totalRequests;
+        var costEl = f('cost');
+        if (costEl) costEl.textContent = '$' + a.totalCostUSD.toFixed(4);
+        var inEl = f('tokens-in');
+        if (inEl) inEl.textContent = a.totalTokensIn;
+        var outEl = f('tokens-out');
+        if (outEl) outEl.textContent = a.totalTokensOut;
+      });
+    };
+    es.onerror = function() {
+      var ind = document.querySelector('.live-indicator');
+      if (ind) ind.classList.add('disconnected');
+    };
+  </script>
+</body>
+</html>
