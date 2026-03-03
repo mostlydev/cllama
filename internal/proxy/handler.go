@@ -132,6 +132,23 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		return
 	}
 
+	// Format bridge: if the resolved provider uses Anthropic format but
+	// the incoming request is OpenAI format (/v1/chat/completions), route
+	// through OpenRouter instead (which accepts OpenAI format for all models).
+	if strings.EqualFold(prov.APIFormat, "anthropic") {
+		bridge, bridgeErr := h.registry.Get("openrouter")
+		if bridgeErr != nil {
+			h.fail(w, http.StatusBadGateway,
+				fmt.Sprintf("provider %q uses anthropic format but request is openai format; configure openrouter for format bridging", providerName),
+				agentID, requestedModel, start, bridgeErr)
+			return
+		}
+		// Reconstruct model as provider/model so OpenRouter routes correctly.
+		upstreamModel = providerName + "/" + upstreamModel
+		providerName = bridge.Name
+		prov = bridge
+	}
+
 	payload["model"] = upstreamModel
 	outBody, err := json.Marshal(payload)
 	if err != nil {

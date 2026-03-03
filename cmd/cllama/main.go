@@ -100,9 +100,11 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("POST /v1/chat/completions", proxy.NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
+	proxyHandler := proxy.NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
 		return agentctx.Load(contextRoot, agentID)
-	}, logger, proxy.WithCostTracking(acc, pricing)))
+	}, logger, proxy.WithCostTracking(acc, pricing))
+	mux.Handle("POST /v1/chat/completions", proxyHandler)
+	mux.Handle("POST /v1/messages", proxyHandler)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
