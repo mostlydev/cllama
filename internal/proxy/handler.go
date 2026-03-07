@@ -149,6 +149,10 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		prov = bridge
 	}
 
+	if h.accumulator != nil && h.pricing != nil && isStreamingChatCompletions(r.URL.Path, payload) {
+		ensureStreamUsage(payload)
+	}
+
 	payload["model"] = upstreamModel
 	outBody, err := json.Marshal(payload)
 	if err != nil {
@@ -358,6 +362,23 @@ func splitModel(model string) (providerName, upstreamModel string, err error) {
 	return strings.ToLower(providerName), upstreamModel, nil
 }
 
+func isStreamingChatCompletions(path string, payload map[string]any) bool {
+	if !strings.HasPrefix(path, "/v1/chat/completions") {
+		return false
+	}
+	stream, _ := payload["stream"].(bool)
+	return stream
+}
+
+func ensureStreamUsage(payload map[string]any) {
+	streamOptions, _ := payload["stream_options"].(map[string]any)
+	if streamOptions == nil {
+		streamOptions = make(map[string]any)
+	}
+	streamOptions["include_usage"] = true
+	payload["stream_options"] = streamOptions
+}
+
 func buildUpstreamURL(baseURL, incomingPath, rawQuery string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(baseURL))
 	if err != nil {
@@ -384,7 +405,7 @@ func buildUpstreamURL(baseURL, incomingPath, rawQuery string) (string, error) {
 
 func copyRequestHeaders(dst, src http.Header) {
 	for k, vals := range src {
-		if isHopByHopHeader(k) || strings.EqualFold(k, "Authorization") {
+		if isHopByHopHeader(k) || strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Accept-Encoding") {
 			continue
 		}
 		for _, v := range vals {

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -110,8 +111,8 @@ func TestHandlerRecordsCost(t *testing.T) {
 	defer backend.Close()
 
 	reg := provider.NewRegistry("")
-	reg.Set("anthropic", &provider.Provider{
-		Name: "anthropic", BaseURL: backend.URL, APIKey: "sk-real", Auth: "bearer",
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: backend.URL, APIKey: "sk-real", Auth: "bearer",
 	})
 
 	acc := cost.NewAccumulator()
@@ -119,7 +120,7 @@ func TestHandlerRecordsCost(t *testing.T) {
 	h := NewHandler(reg, stubContextLoaderWithToken("tiverton", "tiverton:dummy123"), logging.New(io.Discard),
 		WithCostTracking(acc, pricing))
 
-	body := `{"model":"anthropic/claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`
+	body := `{"model":"openrouter/anthropic/claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
 	w := httptest.NewRecorder()
@@ -182,6 +183,118 @@ func TestHandlerRecordsCostFromSSE(t *testing.T) {
 	}
 	if entries[0].TotalCostUSD <= 0 {
 		t.Error("expected positive cost")
+	}
+}
+
+func TestHandlerEnablesUsageForStreamingChatCompletions(t *testing.T) {
+	var sawIncludeUsage bool
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if opts, ok := payload["stream_options"].(map[string]any); ok {
+			if includeUsage, ok := opts["include_usage"].(bool); ok && includeUsage {
+				sawIncludeUsage = true
+			}
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+		if sawIncludeUsage {
+			w.Write([]byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":30,\"total_tokens\":150}}\n\n"))
+		}
+		w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: backend.URL, APIKey: "sk-real", Auth: "bearer",
+	})
+
+	acc := cost.NewAccumulator()
+	pricing := cost.DefaultPricing()
+	h := NewHandler(reg, stubContextLoaderWithToken("pc-roll", "pc-roll:dummy123"), logging.New(io.Discard),
+		WithCostTracking(acc, pricing))
+
+	body := `{"model":"openrouter/anthropic/claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer pc-roll:dummy123")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !sawIncludeUsage {
+		t.Fatal("expected include_usage=true in upstream streaming request")
+	}
+
+	entries := acc.ByAgent("pc-roll")
+	if len(entries) != 1 {
+		t.Fatalf("expected one cost entry, got %d", len(entries))
+	}
+	if entries[0].TotalInputTokens != 120 || entries[0].TotalOutputTokens != 30 {
+		t.Fatalf("unexpected token counts: %+v", entries[0])
+	}
+	if entries[0].TotalCostUSD <= 0 {
+		t.Fatalf("expected positive cost, got %+v", entries[0])
+	}
+}
+
+func TestHandlerRecordsCostFromGzipJSONResponse(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+
+		zw := gzip.NewWriter(w)
+		_, err := zw.Write([]byte(`{
+			"id": "chatcmpl-1",
+			"choices": [{"message": {"content": "hello"}}],
+			"usage": {"prompt_tokens": 90, "completion_tokens": 20, "total_tokens": 110}
+		}`))
+		if err != nil {
+			t.Fatalf("gzip write: %v", err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatalf("gzip close: %v", err)
+		}
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: backend.URL, APIKey: "sk-real", Auth: "bearer",
+	})
+
+	acc := cost.NewAccumulator()
+	pricing := cost.DefaultPricing()
+	h := NewHandler(reg, stubContextLoaderWithToken("pc-roll", "pc-roll:dummy123"), logging.New(io.Discard),
+		WithCostTracking(acc, pricing))
+
+	body := `{"model":"openrouter/anthropic/claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer pc-roll:dummy123")
+	req.Header.Set("Accept-Encoding", "gzip")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	entries := acc.ByAgent("pc-roll")
+	if len(entries) != 1 {
+		t.Fatalf("expected one cost entry, got %d", len(entries))
+	}
+	if entries[0].TotalInputTokens != 90 || entries[0].TotalOutputTokens != 20 {
+		t.Fatalf("unexpected token counts: %+v", entries[0])
+	}
+	if entries[0].TotalCostUSD <= 0 {
+		t.Fatalf("expected positive cost, got %+v", entries[0])
 	}
 }
 
