@@ -128,8 +128,19 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 
 	prov, err := h.registry.Get(providerName)
 	if err != nil {
-		h.fail(w, http.StatusBadGateway, "unknown provider", agentID, requestedModel, start, err)
-		return
+		// Compatibility: some clients targeting OpenRouter via an OpenAI-compatible
+		// provider config send vendor-prefixed model IDs like "anthropic/claude-*"
+		// instead of "openrouter/anthropic/claude-*". If no first-party provider is
+		// configured for that prefix, route through OpenRouter and preserve the full
+		// vendor/model path as the upstream model.
+		bridge, bridgeErr := h.registry.Get("openrouter")
+		if bridgeErr != nil || strings.EqualFold(providerName, "openrouter") {
+			h.fail(w, http.StatusBadGateway, "unknown provider", agentID, requestedModel, start, err)
+			return
+		}
+		upstreamModel = providerName + "/" + upstreamModel
+		providerName = bridge.Name
+		prov = bridge
 	}
 
 	// Format bridge: if the resolved provider uses Anthropic format but
