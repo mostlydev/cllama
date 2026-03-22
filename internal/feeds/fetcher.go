@@ -142,6 +142,9 @@ func (f *Fetcher) doFetch(ctx context.Context, agentID string, entry FeedEntry) 
 	req.Header.Set("X-Claw-Pod", f.podName)
 	req.Header.Set("Accept", "text/plain, text/markdown, application/json")
 	req.Header.Set("X-Forwarded-Proto", "https")
+	if entry.Auth != "" {
+		req.Header.Set("Authorization", "Bearer "+entry.Auth)
+	}
 
 	resp, err := f.client.Do(req)
 	if err != nil {

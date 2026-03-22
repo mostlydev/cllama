@@ -23,6 +23,7 @@ type FeedEntry struct {
 	Path   string `json:"path"`
 	TTL    int    `json:"ttl"`
 	URL    string `json:"url"`
+	Auth   string `json:"auth,omitempty"` // bearer token for authenticated feeds
 }
 
 // LoadManifest reads feeds.json from contextDir. Returns nil, nil if the file
