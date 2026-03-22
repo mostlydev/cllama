@@ -62,7 +62,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 	apiServer := &http.Server{
 		Addr:              cfg.APIAddr,
-		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing),
+		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	uiServer := &http.Server{
@@ -98,11 +98,15 @@ func run(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing) http.Handler {
+func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string) http.Handler {
 	mux := http.NewServeMux()
+	opts := []proxy.HandlerOption{proxy.WithCostTracking(acc, pricing)}
+	if podName != "" {
+		opts = append(opts, proxy.WithFeeds(podName))
+	}
 	proxyHandler := proxy.NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
 		return agentctx.Load(contextRoot, agentID)
-	}, logger, proxy.WithCostTracking(acc, pricing))
+	}, logger, opts...)
 	mux.Handle("POST /v1/chat/completions", proxyHandler)
 	mux.Handle("POST /v1/messages", proxyHandler)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {

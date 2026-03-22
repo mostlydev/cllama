@@ -10,6 +10,7 @@ import (
 // AgentContext holds the per-agent mounted contract and metadata files.
 type AgentContext struct {
 	AgentID     string
+	ContextDir  string
 	AgentsMD    []byte
 	ClawdapusMD []byte
 	Metadata    map[string]any
@@ -41,6 +42,7 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 
 	return &AgentContext{
 		AgentID:     agentID,
+		ContextDir:  dir,
 		AgentsMD:    agentsMD,
 		ClawdapusMD: clawdapusMD,
 		Metadata:    meta,
@@ -63,6 +65,14 @@ func (a *AgentContext) MetadataString(key string) string {
 	}
 	v, _ := a.Metadata[key].(string)
 	return v
+}
+
+// FeedsPath returns the path to the agent's feeds.json manifest.
+func (a *AgentContext) FeedsPath() string {
+	if a == nil || a.ContextDir == "" {
+		return ""
+	}
+	return filepath.Join(a.ContextDir, "feeds.json")
 }
 
 // AgentSummary is a lightweight view of an agent for listing purposes.

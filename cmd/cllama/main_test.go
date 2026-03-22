@@ -75,7 +75,7 @@ func TestDualServerIntegrationSmoke(t *testing.T) {
 	}
 	pricing := cost.DefaultPricing()
 	acc := cost.NewAccumulator()
-	apiHandler := newAPIHandler(contextRoot, reg, logging.New(io.Discard), acc, pricing)
+	apiHandler := newAPIHandler(contextRoot, reg, logging.New(io.Discard), acc, pricing, "test-pod")
 	uiHandler := newUIHandler(reg, acc, contextRoot)
 
 	apiServer := &http.Server{Handler: apiHandler}

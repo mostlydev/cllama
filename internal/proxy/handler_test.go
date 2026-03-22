@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mostlydev/cllama/internal/agentctx"
@@ -423,6 +427,210 @@ func TestHandlerAnthropicRejectsUnknownAgent(t *testing.T) {
 	}
 }
 
+func TestHandlerInjectsFeedsIntoOpenAI(t *testing.T) {
+	feedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("Wallet: $5,000 cash | $20,000 invested"))
+	}))
+	defer feedSrv.Close()
+
+	ctxDir := t.TempDir()
+	agentDir := filepath.Join(ctxDir, "weston")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	feedsJSON := fmt.Sprintf(`[{"name":"market-context","source":"trading-api","path":"/api/v1/market_context/weston","ttl":300,"url":"%s"}]`, feedSrv.URL)
+	if err := os.WriteFile(filepath.Join(agentDir, "feeds.json"), []byte(feedsJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# C"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# I"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"weston:secret","pod":"test-pod"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	contextLoader := func(agentID string) (*agentctx.AgentContext, error) {
+		return agentctx.Load(ctxDir, agentID)
+	}
+
+	h := NewHandler(reg, contextLoader, nil, WithFeeds("test-pod"))
+	body := `{"model":"openrouter/anthropic/claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer weston:secret")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	messages, _ := payload["messages"].([]any)
+	if len(messages) < 2 {
+		t.Fatalf("expected >=2 messages (feed + user), got %d", len(messages))
+	}
+	first := messages[0].(map[string]any)
+	content, _ := first["content"].(string)
+	if !strings.Contains(content, "Wallet: $5,000") {
+		t.Errorf("expected feed content in first message, got: %s", content)
+	}
+	if !strings.Contains(content, "BEGIN FEED: market-context") {
+		t.Errorf("expected feed delimiter, got: %s", content)
+	}
+}
+
+func TestHandlerInjectsFeedsIntoAnthropic(t *testing.T) {
+	feedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("Fleet nominal"))
+	}))
+	defer feedSrv.Close()
+
+	ctxDir := t.TempDir()
+	agentDir := filepath.Join(ctxDir, "nano-bot")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	feedsJSON := fmt.Sprintf(`[{"name":"alerts","source":"claw-api","path":"/fleet/alerts","ttl":30,"url":"%s"}]`, feedSrv.URL)
+	if err := os.WriteFile(filepath.Join(agentDir, "feeds.json"), []byte(feedsJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# C"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# I"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"nano-bot:secret456"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_01","type":"message","content":[{"type":"text","text":"hello"}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	contextLoader := func(agentID string) (*agentctx.AgentContext, error) {
+		return agentctx.Load(ctxDir, agentID)
+	}
+
+	h := NewHandler(reg, contextLoader, nil, WithFeeds("test-pod"))
+	body := `{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:secret456")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	sys, _ := payload["system"].(string)
+	if !strings.Contains(sys, "Fleet nominal") {
+		t.Errorf("expected feed in system field, got: %q", sys)
+	}
+}
+
+func TestHandlerNoFeedsStillWorks(t *testing.T) {
+	ctxDir := t.TempDir()
+	agentDir := filepath.Join(ctxDir, "bare-agent")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# C"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# I"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"bare-agent:secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	contextLoader := func(agentID string) (*agentctx.AgentContext, error) {
+		return agentctx.Load(ctxDir, agentID)
+	}
+
+	h := NewHandler(reg, contextLoader, nil, WithFeeds("test-pod"))
+	body := `{"model":"openrouter/anthropic/claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer bare-agent:secret")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	messages, _ := payload["messages"].([]any)
+	if len(messages) != 1 {
+		t.Errorf("expected 1 message (no feeds), got %d", len(messages))
+	}
+}
+
 func stubContextLoaderWithToken(agentID, token string) ContextLoader {
 	return func(id string) (*agentctx.AgentContext, error) {
 		if id != agentID {
@@ -430,6 +638,7 @@ func stubContextLoaderWithToken(agentID, token string) ContextLoader {
 		}
 		return &agentctx.AgentContext{
 			AgentID:     id,
+			ContextDir:  "/claw/context/" + id,
 			AgentsMD:    []byte("# Contract"),
 			ClawdapusMD: []byte("# Infra"),
 			Metadata: map[string]any{

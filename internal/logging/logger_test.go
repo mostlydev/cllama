@@ -83,3 +83,26 @@ func TestLogResponseWithoutCost(t *testing.T) {
 		t.Error("expected no tokens_in when CostInfo is nil")
 	}
 }
+
+func TestLogFeedFetchIncludesFeedFields(t *testing.T) {
+	var buf bytes.Buffer
+	l := New(&buf)
+	l.LogFeedFetch("weston", "market-context", "http://trading-api:4000/api/v1/market_context/weston", 200, 85, nil)
+
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if entry["type"] != "feed_fetch" {
+		t.Fatalf("expected type=feed_fetch, got %v", entry["type"])
+	}
+	if entry["feed_name"] != "market-context" {
+		t.Errorf("expected feed_name, got %v", entry["feed_name"])
+	}
+	if entry["feed_url"] != "http://trading-api:4000/api/v1/market_context/weston" {
+		t.Errorf("expected feed_url, got %v", entry["feed_url"])
+	}
+	if entry["status_code"].(float64) != 200 {
+		t.Errorf("expected status_code=200, got %v", entry["status_code"])
+	}
+}

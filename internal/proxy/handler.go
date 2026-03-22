@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/mostlydev/cllama/internal/agentctx"
 	"github.com/mostlydev/cllama/internal/cost"
+	"github.com/mostlydev/cllama/internal/feeds"
 	"github.com/mostlydev/cllama/internal/identity"
 	"github.com/mostlydev/cllama/internal/logging"
 	"github.com/mostlydev/cllama/internal/provider"
@@ -29,6 +31,7 @@ type Handler struct {
 	logger      *logging.Logger
 	accumulator *cost.Accumulator
 	pricing     *cost.Pricing
+	feedFetcher *feeds.Fetcher
 }
 
 // HandlerOption configures optional Handler behaviour.
@@ -39,6 +42,13 @@ func WithCostTracking(acc *cost.Accumulator, pricing *cost.Pricing) HandlerOptio
 	return func(h *Handler) {
 		h.accumulator = acc
 		h.pricing = pricing
+	}
+}
+
+// WithFeeds enables feed injection using the given pod name for identity headers.
+func WithFeeds(podName string) HandlerOption {
+	return func(h *Handler) {
+		h.feedFetcher = feeds.NewFetcher(podName, nil, h.logger)
 	}
 }
 
@@ -64,6 +74,31 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 		opt(h)
 	}
 	return h
+}
+
+func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext) string {
+	if h.feedFetcher == nil || agentCtx == nil || agentCtx.ContextDir == "" {
+		return ""
+	}
+
+	entries, err := feeds.LoadManifest(agentCtx.ContextDir)
+	if err != nil {
+		h.logger.LogError(agentID, "", 0, 0, fmt.Errorf("load feed manifest: %w", err))
+		return ""
+	}
+	if len(entries) == 0 {
+		return ""
+	}
+
+	results := make([]feeds.FeedResult, 0, len(entries))
+	for _, entry := range entries {
+		result, err := h.feedFetcher.Fetch(reqCtx, agentID, entry)
+		if err != nil {
+			continue
+		}
+		results = append(results, result)
+	}
+	return feeds.FormatAllFeeds(results)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -92,14 +127,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Route based on path: /v1/messages → Anthropic flow, everything else → OpenAI flow
 	if strings.HasPrefix(r.URL.Path, "/v1/messages") {
-		h.handleAnthropicMessages(w, r, agentID, start)
+		h.handleAnthropicMessages(w, r, agentID, ctx, start)
 		return
 	}
 
-	h.handleOpenAI(w, r, agentID, start)
+	h.handleOpenAI(w, r, agentID, ctx, start)
 }
 
-func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID string, start time.Time) {
+func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, start time.Time) {
 	inBody, err := io.ReadAll(r.Body)
 	if err != nil {
 		h.fail(w, http.StatusBadRequest, "failed to read request body", agentID, "", start, err)
@@ -111,6 +146,9 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	if err := json.Unmarshal(inBody, &payload); err != nil {
 		h.fail(w, http.StatusBadRequest, "invalid JSON body", agentID, "", start, err)
 		return
+	}
+	if feedBlock := h.fetchFeeds(r.Context(), agentID, agentCtx); feedBlock != "" {
+		feeds.InjectOpenAI(payload, feedBlock)
 	}
 
 	requestedModel, _ := payload["model"].(string)
@@ -192,7 +230,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	h.proxyAndLog(w, outReq, agentID, providerName, requestedModel, upstreamModel, start)
 }
 
-func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request, agentID string, start time.Time) {
+func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, start time.Time) {
 	inBody, err := io.ReadAll(r.Body)
 	if err != nil {
 		h.fail(w, http.StatusBadRequest, "failed to read request body", agentID, "", start, err)
@@ -204,6 +242,9 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	if err := json.Unmarshal(inBody, &payload); err != nil {
 		h.fail(w, http.StatusBadRequest, "invalid JSON body", agentID, "", start, err)
 		return
+	}
+	if feedBlock := h.fetchFeeds(r.Context(), agentID, agentCtx); feedBlock != "" {
+		feeds.InjectAnthropic(payload, feedBlock)
 	}
 
 	requestedModel, _ := payload["model"].(string)

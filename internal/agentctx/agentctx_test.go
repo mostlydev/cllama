@@ -46,3 +46,33 @@ func TestLoadMissingDirErrors(t *testing.T) {
 		t.Error("expected error for missing dir")
 	}
 }
+
+func TestAgentContextFeedsPath(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "weston")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# C"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# I"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"weston:x"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "feeds.json"), []byte(`[{"name":"test"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "weston")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expected := filepath.Join(agentDir, "feeds.json")
+	if ctx.FeedsPath() != expected {
+		t.Errorf("expected %q, got %q", expected, ctx.FeedsPath())
+	}
+}

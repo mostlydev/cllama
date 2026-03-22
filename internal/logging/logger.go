@@ -18,6 +18,8 @@ type entry struct {
 	ClawID       string   `json:"claw_id,omitempty"`
 	Type         string   `json:"type"`
 	Model        string   `json:"model,omitempty"`
+	FeedName     string   `json:"feed_name,omitempty"`
+	FeedURL      string   `json:"feed_url,omitempty"`
 	LatencyMS    *int64   `json:"latency_ms,omitempty"`
 	StatusCode   *int     `json:"status_code,omitempty"`
 	TokensIn     *int     `json:"tokens_in,omitempty"`
@@ -109,6 +111,25 @@ func (l *Logger) LogIntervention(clawID, model, reason string) {
 		Model:        model,
 		Intervention: &reasonCopy,
 	})
+}
+
+func (l *Logger) LogFeedFetch(clawID, feedName, feedURL string, statusCode int, latencyMS int64, err error) {
+	e := entry{
+		TS:           time.Now().UTC().Format(time.RFC3339),
+		ClawID:       clawID,
+		Type:         "feed_fetch",
+		FeedName:     feedName,
+		FeedURL:      feedURL,
+		LatencyMS:    ptrI64(latencyMS),
+		Intervention: nil,
+	}
+	if statusCode > 0 {
+		e.StatusCode = ptrInt(statusCode)
+	}
+	if err != nil {
+		e.Error = err.Error()
+	}
+	l.log(e)
 }
 
 func (l *Logger) log(e entry) {
