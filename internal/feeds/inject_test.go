@@ -54,6 +54,17 @@ func TestFormatFeedBlockUnavailable(t *testing.T) {
 	}
 }
 
+func TestFormatFeedBlockEmptyContent(t *testing.T) {
+	result := FeedResult{
+		Name:      "quiet-feed",
+		Source:    "claw-wall",
+		FetchedAt: time.Now(),
+	}
+	if block := FormatFeedBlock(result); block != "" {
+		t.Fatalf("expected empty block for empty feed content, got %q", block)
+	}
+}
+
 func TestFormatFeedBlockTruncated(t *testing.T) {
 	result := FeedResult{
 		Name:      "big-feed",
@@ -79,6 +90,20 @@ func TestFormatAllFeeds(t *testing.T) {
 	}
 	if strings.Count(combined, "BEGIN FEED") != 2 {
 		t.Errorf("expected 2 feed blocks, got %d", strings.Count(combined, "BEGIN FEED"))
+	}
+}
+
+func TestFormatAllFeedsSkipsEmptyBlocks(t *testing.T) {
+	results := []FeedResult{
+		{Name: "quiet-feed", Source: "claw-wall", FetchedAt: time.Now()},
+		{Name: "feed-b", Source: "svc-b", Content: "data-b", FetchedAt: time.Now()},
+	}
+	combined := FormatAllFeeds(results)
+	if strings.HasPrefix(combined, "\n") {
+		t.Fatalf("expected no leading newline when skipping empty feed block, got %q", combined)
+	}
+	if strings.Count(combined, "BEGIN FEED") != 1 {
+		t.Fatalf("expected only one non-empty feed block, got %q", combined)
 	}
 }
 
