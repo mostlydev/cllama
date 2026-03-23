@@ -107,6 +107,127 @@ func TestUICostsAPIEmptyAccumulator(t *testing.T) {
 	}
 }
 
+// -- bearer auth tests --------------------------------------------------------
+
+func TestUITokenBlocksUnauthenticated(t *testing.T) {
+	reg := provider.NewRegistry(t.TempDir())
+	h := NewHandler(reg, WithUIToken("secret-token"))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 without token, got %d", w.Code)
+	}
+}
+
+func TestUITokenBlocksWrongToken(t *testing.T) {
+	reg := provider.NewRegistry(t.TempDir())
+	h := NewHandler(reg, WithUIToken("secret-token"))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer wrong-token")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 with wrong token, got %d", w.Code)
+	}
+}
+
+func TestUITokenAllowsCorrectToken(t *testing.T) {
+	reg := provider.NewRegistry(t.TempDir())
+	h := NewHandler(reg, WithUIToken("secret-token"))
+	req := httptest.NewRequest(http.MethodGet, "/costs/api", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 with correct token, got %d", w.Code)
+	}
+}
+
+func TestUITokenDisabledAllowsAll(t *testing.T) {
+	reg := provider.NewRegistry(t.TempDir())
+	h := NewHandler(reg) // no WithUIToken → no auth
+	req := httptest.NewRequest(http.MethodGet, "/costs/api", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 without token configured, got %d", w.Code)
+	}
+}
+
+// -- key management POST routes -----------------------------------------------
+
+func TestHandleKeyAddCreatesRuntimeKey(t *testing.T) {
+	dir := t.TempDir()
+	reg := provider.NewRegistry(dir)
+	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: "https://api.openai.com/v1", APIKey: "sk-existing", Auth: "bearer"})
+
+	h := NewHandler(reg)
+	body := strings.NewReader("provider=openai&label=extra&secret=sk-new-runtime")
+	req := httptest.NewRequest(http.MethodPost, "/keys/add", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusSeeOther && w.Code != http.StatusOK {
+		t.Errorf("expected redirect or 200 after add, got %d: %s", w.Code, w.Body.String())
+	}
+
+	all := reg.All()
+	state, ok := all["openai"]
+	if !ok {
+		t.Fatal("openai not in registry")
+	}
+	var found bool
+	for _, k := range state.Keys {
+		if k.Secret == "sk-new-runtime" {
+			found = true
+			if k.Source != "runtime" {
+				t.Errorf("expected source=runtime, got %q", k.Source)
+			}
+		}
+	}
+	if !found {
+		t.Error("new runtime key not found in pool")
+	}
+}
+
+func TestHandleKeyDeleteRemovesKey(t *testing.T) {
+	dir := t.TempDir()
+	reg := provider.NewRegistry(dir)
+	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: "https://api.openai.com/v1", APIKey: "sk-existing", Auth: "bearer"})
+
+	all := reg.All()
+	var keyID string
+	for _, k := range all["openai"].Keys {
+		keyID = k.ID
+	}
+	if keyID == "" {
+		t.Fatal("no keys found to delete")
+	}
+
+	// Add a second key so deleting the first doesn't leave the pool empty of active key.
+	_, _ = reg.AddRuntimeKey("openai", "extra", "sk-extra")
+
+	h := NewHandler(reg)
+	formBody := strings.NewReader("provider=openai&key_id=" + keyID)
+	req := httptest.NewRequest(http.MethodPost, "/keys/delete", formBody)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusSeeOther && w.Code != http.StatusOK {
+		t.Errorf("expected redirect or 200 after delete, got %d: %s", w.Code, w.Body.String())
+	}
+
+	all = reg.All()
+	for _, k := range all["openai"].Keys {
+		if k.ID == keyID {
+			t.Errorf("deleted key %q still present", keyID)
+		}
+	}
+}
+
 func TestDashboardRendersAllSections(t *testing.T) {
 	reg := provider.NewRegistry(t.TempDir())
 	reg.Set("anthropic", &provider.Provider{Name: "anthropic", BaseURL: "https://api.anthropic.com/v1", APIKey: "sk-test-key-1234", Auth: "bearer"})

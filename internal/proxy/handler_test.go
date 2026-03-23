@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mostlydev/cllama/internal/agentctx"
 	"github.com/mostlydev/cllama/internal/cost"
@@ -628,6 +629,169 @@ func TestHandlerNoFeedsStillWorks(t *testing.T) {
 	messages, _ := payload["messages"].([]any)
 	if len(messages) != 1 {
 		t.Errorf("expected 1 message (no feeds), got %d", len(messages))
+	}
+}
+
+// -- failure classification and retry tests ------------------------------------
+
+func TestHandlerMarksKeyDeadOn401AndFallsBack(t *testing.T) {
+	callCount := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":{"message":"invalid key"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"chatcmpl-2","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer backend.Close()
+
+	dir := t.TempDir()
+	reg := provider.NewRegistry(dir)
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-dead", Auth: "bearer",
+	})
+	// Add a second key via AddRuntimeKey.
+	secondID, err := reg.AddRuntimeKey("openai", "backup", "sk-alive")
+	if err != nil {
+		t.Fatalf("AddRuntimeKey: %v", err)
+	}
+	// Activate the second key so SelectKey has a fallback after marking first dead.
+	_ = reg.ActivateKey("openai", secondID)
+
+	h := NewHandler(reg, stubContextLoaderWithToken("agent", "agent:tok"), nil)
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer agent:tok")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 after fallback, got %d: %s", w.Code, w.Body.String())
+	}
+	if callCount < 2 {
+		t.Errorf("expected at least 2 backend calls (dead + retry), got %d", callCount)
+	}
+}
+
+func TestHandlerReturns429WhenAllKeysCooling(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":{"message":"rate limit exceeded"}}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-limited", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithToken("agent", "agent:tok"), nil)
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer agent:tok")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	// Only one key; after cooldown, SelectKey returns CooldownError → 503.
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 when all keys cooling, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandlerMarksDeadOn429QuotaExhausted(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":{"message":"You exceeded your current quota, please check your plan"}}`))
+	}))
+	defer backend.Close()
+
+	dir := t.TempDir()
+	reg := provider.NewRegistry(dir)
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-quota-gone", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithToken("agent", "agent:tok"), nil)
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer agent:tok")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	// Quota-429 marks key dead; single key → no usable keys → 502.
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("expected 502 when quota key is dead, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify the key is actually dead in the registry.
+	all := reg.All()
+	state, ok := all["openai"]
+	if !ok {
+		t.Fatal("openai not in registry after quota exhaustion")
+	}
+	if len(state.Keys) == 0 {
+		t.Fatal("no keys in openai pool")
+	}
+	if state.Keys[0].State != provider.KeyStateDead {
+		t.Errorf("expected key state=dead, got %q", state.Keys[0].State)
+	}
+}
+
+func TestClassifyResponse(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   int
+		body     string
+		want     responseClass
+	}{
+		{"401 → auth", 401, "", classAuth},
+		{"403 → auth", 403, "", classAuth},
+		{"402 → auth", 402, "", classAuth},
+		{"429 rate-limit → cooldown", 429, `{"error":"rate limited"}`, classRateLimit},
+		{"429 quota → auth", 429, `exceeded your current quota`, classAuth},
+		{"429 insufficient_quota → auth", 429, `{"error":{"code":"insufficient_quota"}}`, classAuth},
+		{"200 → ok", 200, "", classOK},
+		{"500 → ok", 500, "", classOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{
+				StatusCode: tc.status,
+				Body:       io.NopCloser(strings.NewReader(tc.body)),
+			}
+			got := classifyResponse(resp)
+			if got != tc.want {
+				t.Errorf("classifyResponse(%d, %q) = %v, want %v", tc.status, tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseCooldownDuration(t *testing.T) {
+	cases := []struct {
+		retryAfter string
+		wantSecs   int
+	}{
+		{"", 10},
+		{"30", 30},
+		{"120", 60}, // capped at 60
+		{"abc", 10}, // invalid → default
+	}
+	for _, tc := range cases {
+		hdr := http.Header{}
+		if tc.retryAfter != "" {
+			hdr.Set("Retry-After", tc.retryAfter)
+		}
+		resp := &http.Response{Header: hdr}
+		got := parseCooldownDuration(resp)
+		wantNs := int64(tc.wantSecs) * int64(time.Second)
+		if int64(got) != wantNs {
+			t.Errorf("Retry-After=%q: got %v, want %ds", tc.retryAfter, got, tc.wantSecs)
+		}
 	}
 }
 

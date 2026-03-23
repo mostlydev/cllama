@@ -550,6 +550,36 @@ func (r *Registry) mutateKey(providerName, keyID string, fn func(*KeyEntry)) err
 	return fmt.Errorf("key %q not found in provider %q", keyID, providerName)
 }
 
+// Set registers a Provider directly, wrapping it as a single-key ProviderState.
+// This is intended for testing and programmatic seeding where the caller already
+// has a resolved Provider struct.
+func (r *Registry) Set(name string, p *Provider) {
+	n := normalizeName(name)
+	if n == "" {
+		return
+	}
+	state := &ProviderState{
+		BaseURL:   p.BaseURL,
+		Auth:      p.Auth,
+		APIFormat: p.APIFormat,
+	}
+	if p.APIKey != "" {
+		keyID := "direct:" + n
+		state.ActiveKeyID = keyID
+		state.Keys = []KeyEntry{{
+			ID:      keyID,
+			Label:   "primary",
+			Secret:  p.APIKey,
+			Source:  "seed",
+			State:   KeyStateReady,
+			AddedAt: time.Now().UTC().Format(time.RFC3339),
+		}}
+	}
+	r.mu.Lock()
+	r.providers[n] = state
+	r.mu.Unlock()
+}
+
 // All returns a copy of all ProviderState entries, keyed by provider name.
 func (r *Registry) All() map[string]*ProviderState {
 	r.mu.RLock()
