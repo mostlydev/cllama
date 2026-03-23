@@ -36,18 +36,43 @@ func WithContextRoot(root string) UIOption {
 	}
 }
 
+// WithUIToken requires Bearer authentication on all UI routes.
+// If the token is empty, authentication is disabled (dev mode).
+func WithUIToken(token string) UIOption {
+	return func(h *Handler) {
+		h.uiToken = token
+	}
+}
+
 type Handler struct {
 	registry    *provider.Registry
 	accumulator *cost.Accumulator
 	contextRoot string
+	uiToken     string
 	tpl         *template.Template
 }
 
 type providerRow struct {
-	Name      string `json:"name"`
-	BaseURL   string `json:"baseURL"`
-	Auth      string `json:"auth"`
-	MaskedKey string `json:"maskedKey"`
+	Name         string    `json:"name"`
+	BaseURL      string    `json:"baseURL"`
+	Auth         string    `json:"auth"`
+	MaskedKey    string    `json:"maskedKey"`
+	ActiveKeyID  string    `json:"activeKeyID"`
+	ReadyCount   int       `json:"readyCount"`
+	CooldownCount int      `json:"cooldownCount"`
+	DeadCount    int       `json:"deadCount"`
+	Keys         []keyRow  `json:"keys"`
+}
+
+type keyRow struct {
+	ID            string `json:"id"`
+	Label         string `json:"label"`
+	Source        string `json:"source"`
+	State         string `json:"state"`
+	CooldownUntil string `json:"cooldownUntil"`
+	LastErrorCode int    `json:"lastErrorCode"`
+	LastErrorAt   string `json:"lastErrorAt"`
+	MaskedSecret  string `json:"maskedSecret"`
 }
 
 // -- costs API types --
@@ -85,6 +110,9 @@ func NewHandler(reg *provider.Registry, opts ...UIOption) http.Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !h.checkBearer(w, r) {
+		return
+	}
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/":
 		h.renderDashboard(w)
@@ -92,9 +120,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleSSE(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/costs/api":
 		h.handleCostsAPI(w)
+	case r.Method == http.MethodPost && r.URL.Path == "/keys/add":
+		h.handleKeyAdd(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/keys/activate":
+		h.handleKeyActivate(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/keys/disable":
+		h.handleKeyDisable(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/keys/delete":
+		h.handleKeyDelete(w, r)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// checkBearer enforces the CLLAMA_UI_TOKEN when configured.
+// It returns true if the request is authorized (or no token is configured).
+func (h *Handler) checkBearer(w http.ResponseWriter, r *http.Request) bool {
+	if h.uiToken == "" {
+		return true
+	}
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	presented := strings.TrimPrefix(auth, "Bearer ")
+	if !constantTimeEqualStr(presented, h.uiToken) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+func constantTimeEqualStr(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var result byte
+	for i := 0; i < len(a); i++ {
+		result |= a[i] ^ b[i]
+	}
+	return result == 0
 }
 
 func (h *Handler) renderDashboard(w http.ResponseWriter) {
@@ -171,6 +237,90 @@ type dashboardModel struct {
 	CostUSD   float64 `json:"costUSD"`
 }
 
+// -- key management handlers --
+
+func (h *Handler) handleKeyAdd(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	prov := strings.TrimSpace(r.FormValue("provider"))
+	label := strings.TrimSpace(r.FormValue("label"))
+	secret := strings.TrimSpace(r.FormValue("secret"))
+	if prov == "" || secret == "" {
+		http.Error(w, "provider and secret are required", http.StatusBadRequest)
+		return
+	}
+	keyID, err := h.registry.AddRuntimeKey(prov, label, secret)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_ = h.registry.SaveToFile()
+	redirectWithMsg(w, r, fmt.Sprintf("Key %s added to %s", keyID, prov))
+}
+
+func (h *Handler) handleKeyActivate(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	prov := strings.TrimSpace(r.FormValue("provider"))
+	keyID := strings.TrimSpace(r.FormValue("key_id"))
+	if prov == "" || keyID == "" {
+		http.Error(w, "provider and key_id are required", http.StatusBadRequest)
+		return
+	}
+	if err := h.registry.ActivateKey(prov, keyID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_ = h.registry.SaveToFile()
+	redirectWithMsg(w, r, fmt.Sprintf("Key %s activated for %s", keyID, prov))
+}
+
+func (h *Handler) handleKeyDisable(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	prov := strings.TrimSpace(r.FormValue("provider"))
+	keyID := strings.TrimSpace(r.FormValue("key_id"))
+	if prov == "" || keyID == "" {
+		http.Error(w, "provider and key_id are required", http.StatusBadRequest)
+		return
+	}
+	if err := h.registry.DisableKey(prov, keyID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_ = h.registry.SaveToFile()
+	redirectWithMsg(w, r, fmt.Sprintf("Key %s disabled for %s", keyID, prov))
+}
+
+func (h *Handler) handleKeyDelete(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	prov := strings.TrimSpace(r.FormValue("provider"))
+	keyID := strings.TrimSpace(r.FormValue("key_id"))
+	if prov == "" || keyID == "" {
+		http.Error(w, "provider and key_id are required", http.StatusBadRequest)
+		return
+	}
+	if err := h.registry.DeleteKey(prov, keyID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_ = h.registry.SaveToFile()
+	redirectWithMsg(w, r, fmt.Sprintf("Key %s deleted from %s", keyID, prov))
+}
+
+func redirectWithMsg(w http.ResponseWriter, r *http.Request, _ string) {
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 func (h *Handler) buildDashboardState() dashboardState {
 	state := dashboardState{
 		Providers: []providerRow{},
@@ -186,12 +336,34 @@ func (h *Handler) buildDashboardState() dashboardState {
 	sort.Strings(names)
 	for _, name := range names {
 		p := all[name]
-		state.Providers = append(state.Providers, providerRow{
-			Name:      p.Name,
-			BaseURL:   p.BaseURL,
-			Auth:      p.Auth,
-			MaskedKey: maskKey(p.APIKey),
-		})
+		row := providerRow{
+			Name:        name,
+			BaseURL:     p.BaseURL,
+			Auth:        p.Auth,
+			MaskedKey:   maskActiveKey(p),
+			ActiveKeyID: p.ActiveKeyID,
+		}
+		for _, k := range p.Keys {
+			switch k.State {
+			case "ready":
+				row.ReadyCount++
+			case "cooldown":
+				row.CooldownCount++
+			case "dead":
+				row.DeadCount++
+			}
+			row.Keys = append(row.Keys, keyRow{
+				ID:            k.ID,
+				Label:         k.Label,
+				Source:        k.Source,
+				State:         string(k.State),
+				CooldownUntil: k.CooldownUntil,
+				LastErrorCode: k.LastErrorCode,
+				LastErrorAt:   k.LastErrorAt,
+				MaskedSecret:  maskKey(k.Secret),
+			})
+		}
+		state.Providers = append(state.Providers, row)
 	}
 
 	// 2. Agents from context root (if available), merging cost data
@@ -324,6 +496,24 @@ func (h *Handler) writeSSEEvent(w http.ResponseWriter, flusher http.Flusher) boo
 	}
 	flusher.Flush()
 	return true
+}
+
+func maskActiveKey(state *provider.ProviderState) string {
+	if state == nil {
+		return ""
+	}
+	// Show the active key's secret, masked. Fall back to first ready key.
+	for _, k := range state.Keys {
+		if k.ID == state.ActiveKeyID {
+			return maskKey(k.Secret)
+		}
+	}
+	for _, k := range state.Keys {
+		if k.State == "ready" {
+			return maskKey(k.Secret)
+		}
+	}
+	return ""
 }
 
 func maskKey(key string) string {

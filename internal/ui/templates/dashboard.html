@@ -228,6 +228,114 @@
       color: var(--muted);
     }
 
+    /* ── pool status badges ──────────────────────────── */
+    .pool-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 3px;
+      margin-right: 3px;
+    }
+    .badge-ready   { background: rgba(52,211,153,0.1); border: 1px solid rgba(52,211,153,0.3); color: var(--green); }
+    .badge-cooldown{ background: rgba(240,165,0,0.1);  border: 1px solid rgba(240,165,0,0.3);  color: var(--amber); }
+    .badge-dead    { background: rgba(239,68,68,0.1);  border: 1px solid rgba(239,68,68,0.3);  color: var(--red); }
+    .badge-disabled{ background: rgba(94,112,133,0.1); border: 1px solid rgba(94,112,133,0.3); color: var(--muted); }
+
+    /* ── key list ────────────────────────────────────── */
+    .key-list {
+      border-top: 1px solid var(--line);
+      padding: 0;
+    }
+    .key-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto auto;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 14px;
+      border-bottom: 1px solid var(--line);
+      font-size: 12px;
+    }
+    .key-row:last-child { border-bottom: none; }
+    .key-id {
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      color: var(--ink);
+    }
+    .key-label {
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      color: var(--muted);
+      margin-left: 6px;
+    }
+    .key-actions {
+      display: flex;
+      gap: 5px;
+    }
+    .btn-sm {
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      padding: 3px 8px;
+      border-radius: 3px;
+      border: 1px solid;
+      cursor: pointer;
+      background: transparent;
+      transition: background 0.1s;
+    }
+    .btn-activate { border-color: rgba(52,211,153,0.4);  color: var(--green); }
+    .btn-activate:hover { background: rgba(52,211,153,0.1); }
+    .btn-disable  { border-color: rgba(94,112,133,0.4);  color: var(--muted); }
+    .btn-disable:hover  { background: rgba(94,112,133,0.1); }
+    .btn-delete   { border-color: rgba(239,68,68,0.4);   color: var(--red); }
+    .btn-delete:hover   { background: rgba(239,68,68,0.1); }
+
+    /* ── add-key form ────────────────────────────────── */
+    .add-key-form {
+      padding: 14px 18px;
+      border-top: 1px solid var(--line);
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: flex-end;
+    }
+    .add-key-form label {
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      display: block;
+      margin-bottom: 4px;
+    }
+    .add-key-form input, .add-key-form select {
+      font-family: "Geist Mono", monospace;
+      font-size: 12px;
+      background: var(--bg);
+      border: 1px solid var(--line-bright);
+      border-radius: 4px;
+      color: var(--ink);
+      padding: 6px 10px;
+      outline: none;
+    }
+    .add-key-form input:focus, .add-key-form select:focus {
+      border-color: var(--cyan-dim);
+    }
+    .btn-primary {
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      padding: 7px 14px;
+      border-radius: 4px;
+      border: 1px solid var(--cyan-dim);
+      background: var(--cyan-glow);
+      color: var(--cyan);
+      cursor: pointer;
+      transition: background 0.1s;
+      align-self: flex-end;
+    }
+    .btn-primary:hover { background: rgba(34,211,238,0.15); }
+
     .empty-row {
       text-align: center;
       padding: 32px 14px;
@@ -409,20 +517,84 @@
             <th>Name</th>
             <th>Base URL</th>
             <th>Auth</th>
-            <th>Key</th>
+            <th>Active Key</th>
+            <th>Pool</th>
           </tr>
         </thead>
         <tbody>
           {{range .Providers}}
+          {{$p := .}}
           <tr>
             <td><span class="cell-name">{{.Name}}</span></td>
             <td><span class="cell-url">{{.BaseURL}}</span></td>
             <td><span class="cell-auth">{{.Auth}}</span></td>
             <td><span class="cell-key">{{.MaskedKey}}</span></td>
+            <td>
+              {{if gt .ReadyCount 0}}<span class="pool-badge badge-ready">{{.ReadyCount}} ready</span>{{end}}
+              {{if gt .CooldownCount 0}}<span class="pool-badge badge-cooldown">{{.CooldownCount}} cool</span>{{end}}
+              {{if gt .DeadCount 0}}<span class="pool-badge badge-dead">{{.DeadCount}} dead</span>{{end}}
+            </td>
           </tr>
+          {{if .Keys}}
+          <tr>
+            <td colspan="5" style="padding:0">
+              <div class="key-list">
+                {{range .Keys}}
+                <div class="key-row">
+                  <div>
+                    <span class="key-id">{{.ID}}</span>
+                    {{if .Label}}<span class="key-label">({{.Label}})</span>{{end}}
+                    &nbsp;<span class="pool-badge badge-{{.State}}">{{.State}}</span>
+                    {{if .CooldownUntil}}<span style="font-family:monospace;font-size:10px;color:var(--muted)">until {{.CooldownUntil}}</span>{{end}}
+                    {{if .LastErrorAt}}<span style="font-family:monospace;font-size:10px;color:var(--red)"> err:{{.LastErrorCode}} @ {{.LastErrorAt}}</span>{{end}}
+                  </div>
+                  <span class="cell-key">{{.MaskedSecret}}</span>
+                  <span style="font-family:monospace;font-size:10px;color:var(--muted)">{{.Source}}</span>
+                  <div class="key-actions">
+                    <form method="POST" action="/keys/activate" style="display:inline">
+                      <input type="hidden" name="provider" value="{{$p.Name}}">
+                      <input type="hidden" name="key_id" value="{{.ID}}">
+                      <button type="submit" class="btn-sm btn-activate">activate</button>
+                    </form>
+                    <form method="POST" action="/keys/disable" style="display:inline">
+                      <input type="hidden" name="provider" value="{{$p.Name}}">
+                      <input type="hidden" name="key_id" value="{{.ID}}">
+                      <button type="submit" class="btn-sm btn-disable">disable</button>
+                    </form>
+                    <form method="POST" action="/keys/delete" style="display:inline">
+                      <input type="hidden" name="provider" value="{{$p.Name}}">
+                      <input type="hidden" name="key_id" value="{{.ID}}">
+                      <button type="submit" class="btn-sm btn-delete">delete</button>
+                    </form>
+                  </div>
+                </div>
+                {{end}}
+              </div>
+            </td>
+          </tr>
+          {{end}}
           {{end}}
         </tbody>
       </table>
+
+      <!-- Add Key form -->
+      <form class="add-key-form" method="POST" action="/keys/add">
+        <div>
+          <label>Provider</label>
+          <select name="provider">
+            {{range .Providers}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
+          </select>
+        </div>
+        <div>
+          <label>Label</label>
+          <input type="text" name="label" placeholder="backup-2" style="width:120px">
+        </div>
+        <div>
+          <label>API Key</label>
+          <input type="password" name="secret" placeholder="sk-..." required style="width:240px">
+        </div>
+        <button type="submit" class="btn-primary">+ Add Key</button>
+      </form>
       {{else}}
       <div class="empty-row">No providers configured.</div>
       {{end}}

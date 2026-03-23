@@ -27,6 +27,12 @@ type entry struct {
 	CostUSD      *float64 `json:"cost_usd,omitempty"`
 	Intervention *string  `json:"intervention"`
 	Error        string   `json:"error,omitempty"`
+	// provider_pool event fields
+	Provider      string  `json:"provider,omitempty"`
+	KeyID         string  `json:"key_id,omitempty"`
+	Action        string  `json:"action,omitempty"`
+	Reason        string  `json:"reason,omitempty"`
+	CooldownUntil string  `json:"cooldown_until,omitempty"`
 }
 
 // CostInfo holds token counts and estimated cost for a single LLM request.
@@ -128,6 +134,22 @@ func (l *Logger) LogFeedFetch(clawID, feedName, feedURL string, statusCode int, 
 	}
 	if err != nil {
 		e.Error = err.Error()
+	}
+	l.log(e)
+}
+
+// LogProviderPool emits a structured provider_pool transition event.
+// action is one of: "cooldown", "dead", "activated", "added", "deleted".
+func (l *Logger) LogProviderPool(provider, keyID, action, reason, cooldownUntil string) {
+	e := entry{
+		TS:           time.Now().UTC().Format(time.RFC3339),
+		Type:         "provider_pool",
+		Provider:     provider,
+		KeyID:        keyID,
+		Action:       action,
+		Reason:       reason,
+		CooldownUntil: cooldownUntil,
+		Intervention: nil,
 	}
 	l.log(e)
 }
