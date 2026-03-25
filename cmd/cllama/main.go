@@ -29,6 +29,7 @@ type config struct {
 	ContextRoot string
 	AuthDir     string
 	PodName     string
+	UIToken     string
 }
 
 func main() {
@@ -54,6 +55,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if err := reg.LoadFromFile(); err != nil {
 		return fmt.Errorf("load providers from file: %w", err)
 	}
+	// LoadFromEnv is fallback-only: file-backed providers are authoritative
+	// and will not be overridden by env vars.
 	reg.LoadFromEnv()
 
 	logger := logging.New(stdout)
@@ -67,7 +70,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 	uiServer := &http.Server{
 		Addr:              cfg.UIAddr,
-		Handler:           newUIHandler(reg, acc, cfg.ContextRoot),
+		Handler:           newUIHandler(reg, acc, cfg.ContextRoot, cfg.UIToken),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -116,9 +119,13 @@ func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.L
 	return mux
 }
 
-func newUIHandler(reg *provider.Registry, acc *cost.Accumulator, contextRoot string) http.Handler {
+func newUIHandler(reg *provider.Registry, acc *cost.Accumulator, contextRoot, uiToken string) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/", ui.NewHandler(reg, ui.WithAccumulator(acc), ui.WithContextRoot(contextRoot)))
+	opts := []ui.UIOption{ui.WithAccumulator(acc), ui.WithContextRoot(contextRoot)}
+	if uiToken != "" {
+		opts = append(opts, ui.WithUIToken(uiToken))
+	}
+	mux.Handle("/", ui.NewHandler(reg, opts...))
 	return mux
 }
 
@@ -169,6 +176,7 @@ func configFromEnv() config {
 		ContextRoot: envOr("CLAW_CONTEXT_ROOT", "/claw/context"),
 		AuthDir:     envOr("CLAW_AUTH_DIR", "/claw/auth"),
 		PodName:     os.Getenv("CLAW_POD"),
+		UIToken:     os.Getenv("CLLAMA_UI_TOKEN"),
 	}
 }
 

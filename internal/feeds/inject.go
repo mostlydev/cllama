@@ -7,6 +7,10 @@ import (
 
 // FormatFeedBlock formats a single feed result as a delimited context block.
 func FormatFeedBlock(r FeedResult) string {
+	if !r.Unavailable && r.Content == "" {
+		return ""
+	}
+
 	var b strings.Builder
 
 	if r.Unavailable {
@@ -48,11 +52,14 @@ func FormatAllFeeds(results []FeedResult) string {
 
 	for i, r := range results {
 		block := FormatFeedBlock(r)
+		if block == "" {
+			continue
+		}
 		if totalBytes+len(block) > MaxTotalFeedBytes {
 			fmt.Fprintf(&b, "--- FEED: %s skipped (total feed size cap reached) ---\n", r.Name)
 			continue
 		}
-		if i > 0 {
+		if b.Len() > 0 && i > 0 {
 			b.WriteByte('\n')
 		}
 		b.WriteString(block)

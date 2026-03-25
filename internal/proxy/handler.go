@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mostlydev/cllama/internal/agentctx"
+	"github.com/mostlydev/cllama/internal/alert"
 	"github.com/mostlydev/cllama/internal/cost"
 	"github.com/mostlydev/cllama/internal/feeds"
 	"github.com/mostlydev/cllama/internal/identity"
@@ -29,6 +30,7 @@ type Handler struct {
 	loadContext ContextLoader
 	client      *http.Client
 	logger      *logging.Logger
+	notifier    *alert.Notifier
 	accumulator *cost.Accumulator
 	pricing     *cost.Pricing
 	feedFetcher *feeds.Fetcher
@@ -49,6 +51,13 @@ func WithCostTracking(acc *cost.Accumulator, pricing *cost.Pricing) HandlerOptio
 func WithFeeds(podName string) HandlerOption {
 	return func(h *Handler) {
 		h.feedFetcher = feeds.NewFetcher(podName, nil, h.logger)
+	}
+}
+
+// WithNotifier attaches an alert notifier for pool transition events.
+func WithNotifier(n *alert.Notifier) HandlerOption {
+	return func(h *Handler) {
+		h.notifier = n
 	}
 }
 
@@ -164,39 +173,14 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		return
 	}
 
-	prov, err := h.registry.Get(providerName)
+	// Resolve provider (with format-bridge fallback for vendor-prefixed models).
+	resolvedProvider, resolvedUpstream, err := h.resolveOpenAIProvider(providerName, upstreamModel)
 	if err != nil {
-		// Compatibility: some clients targeting OpenRouter via an OpenAI-compatible
-		// provider config send vendor-prefixed model IDs like "anthropic/claude-*"
-		// instead of "openrouter/anthropic/claude-*". If no first-party provider is
-		// configured for that prefix, route through OpenRouter and preserve the full
-		// vendor/model path as the upstream model.
-		bridge, bridgeErr := h.registry.Get("openrouter")
-		if bridgeErr != nil || strings.EqualFold(providerName, "openrouter") {
-			h.fail(w, http.StatusBadGateway, "unknown provider", agentID, requestedModel, start, err)
-			return
-		}
-		upstreamModel = providerName + "/" + upstreamModel
-		providerName = bridge.Name
-		prov = bridge
+		h.fail(w, http.StatusBadGateway, err.Error(), agentID, requestedModel, start, err)
+		return
 	}
-
-	// Format bridge: if the resolved provider uses Anthropic format but
-	// the incoming request is OpenAI format (/v1/chat/completions), route
-	// through OpenRouter instead (which accepts OpenAI format for all models).
-	if strings.EqualFold(prov.APIFormat, "anthropic") {
-		bridge, bridgeErr := h.registry.Get("openrouter")
-		if bridgeErr != nil {
-			h.fail(w, http.StatusBadGateway,
-				fmt.Sprintf("provider %q uses anthropic format but request is openai format; configure openrouter for format bridging", providerName),
-				agentID, requestedModel, start, bridgeErr)
-			return
-		}
-		// Reconstruct model as provider/model so OpenRouter routes correctly.
-		upstreamModel = providerName + "/" + upstreamModel
-		providerName = bridge.Name
-		prov = bridge
-	}
+	providerName = resolvedProvider
+	upstreamModel = resolvedUpstream
 
 	if h.accumulator != nil && h.pricing != nil && isStreamingChatCompletions(r.URL.Path, payload) {
 		ensureStreamUsage(payload)
@@ -209,25 +193,33 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		return
 	}
 
-	targetURL, err := buildUpstreamURL(prov.BaseURL, r.URL.Path, r.URL.RawQuery)
+	h.dispatchWithRetry(w, r, agentID, providerName, requestedModel, upstreamModel, outBody, start)
+}
+
+// resolveOpenAIProvider maps a parsed provider name to the actual provider name
+// and potentially rewrites the upstream model (format bridge).
+// Returns the final (providerName, upstreamModel) to use.
+func (h *Handler) resolveOpenAIProvider(providerName, upstreamModel string) (string, string, error) {
+	prov, err := h.registry.Get(providerName)
 	if err != nil {
-		h.fail(w, http.StatusBadGateway, "invalid provider URL", agentID, requestedModel, start, err)
-		return
+		// Vendor-prefix bridge: route unknown provider prefix through openrouter.
+		bridge, bridgeErr := h.registry.Get("openrouter")
+		if bridgeErr != nil || strings.EqualFold(providerName, "openrouter") {
+			return "", "", fmt.Errorf("unknown provider %q", providerName)
+		}
+		return bridge.Name, providerName + "/" + upstreamModel, nil
 	}
 
-	outReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(outBody))
-	if err != nil {
-		h.fail(w, http.StatusBadGateway, "failed to create upstream request", agentID, requestedModel, start, err)
-		return
-	}
-	copyRequestHeaders(outReq.Header, r.Header)
-	outReq.Header.Set("Content-Type", "application/json")
-
-	if err := h.setProviderAuth(outReq, prov, agentID, requestedModel, start, w); err != nil {
-		return // error already written
+	// Format bridge: anthropic provider on OpenAI path → route via openrouter.
+	if strings.EqualFold(prov.APIFormat, "anthropic") {
+		bridge, bridgeErr := h.registry.Get("openrouter")
+		if bridgeErr != nil {
+			return "", "", fmt.Errorf("provider %q uses anthropic format but request is openai format; configure openrouter for format bridging", providerName)
+		}
+		return bridge.Name, providerName + "/" + upstreamModel, nil
 	}
 
-	h.proxyAndLog(w, outReq, agentID, providerName, requestedModel, upstreamModel, start)
+	return providerName, upstreamModel, nil
 }
 
 func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, start time.Time) {
@@ -254,81 +246,201 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Anthropic models don't use provider prefix — route directly to "anthropic" provider
-	prov, err := h.registry.Get("anthropic")
-	if err != nil {
-		h.fail(w, http.StatusBadGateway, "anthropic provider not configured", agentID, requestedModel, start, err)
-		return
-	}
-
 	outBody, err := json.Marshal(payload)
 	if err != nil {
 		h.fail(w, http.StatusInternalServerError, "failed to encode upstream body", agentID, requestedModel, start, err)
 		return
 	}
 
-	targetURL, err := buildUpstreamURL(prov.BaseURL, r.URL.Path, r.URL.RawQuery)
-	if err != nil {
-		h.fail(w, http.StatusBadGateway, "invalid provider URL", agentID, requestedModel, start, err)
-		return
-	}
+	h.dispatchWithRetry(w, r, agentID, "anthropic", requestedModel, requestedModel, outBody, start)
+}
 
-	outReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(outBody))
-	if err != nil {
-		h.fail(w, http.StatusBadGateway, "failed to create upstream request", agentID, requestedModel, start, err)
-		return
-	}
-	copyRequestHeaders(outReq.Header, r.Header)
-	outReq.Header.Set("Content-Type", "application/json")
+// dispatchWithRetry selects a key, dispatches the request, and retries on key-level
+// failures (401/403/402/quota-429 → dead, rate-limit-429 → cooldown).
+// 5xx and transport errors do NOT cause key state changes.
+func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID, providerName, requestedModel, upstreamModel string, outBody []byte, start time.Time) {
+	const maxKeyAttempts = 5
 
-	// Forward Anthropic-specific headers
-	for _, hdr := range []string{"Anthropic-Version", "Anthropic-Beta"} {
-		if v := r.Header.Get(hdr); v != "" {
-			outReq.Header.Set(hdr, v)
+	for attempt := 0; attempt < maxKeyAttempts; attempt++ {
+		prov, lease, err := h.registry.SelectKey(providerName)
+		if err != nil {
+			// All keys dead/disabled — give up.
+			if _, ok := err.(*provider.CooldownError); ok {
+				h.fail(w, http.StatusServiceUnavailable, "all provider keys in cooldown", agentID, requestedModel, start, err)
+				return
+			}
+			h.fail(w, http.StatusBadGateway, err.Error(), agentID, requestedModel, start, err)
+			return
+		}
+
+		targetURL, err := buildUpstreamURL(prov.BaseURL, r.URL.Path, r.URL.RawQuery)
+		if err != nil {
+			h.fail(w, http.StatusBadGateway, "invalid provider URL", agentID, requestedModel, start, err)
+			return
+		}
+
+		outReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(outBody))
+		if err != nil {
+			h.fail(w, http.StatusBadGateway, "failed to create upstream request", agentID, requestedModel, start, err)
+			return
+		}
+		copyRequestHeaders(outReq.Header, r.Header)
+		outReq.Header.Set("Content-Type", "application/json")
+
+		// Forward Anthropic-specific headers for the Anthropic path.
+		if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+			for _, hdr := range []string{"Anthropic-Version", "Anthropic-Beta"} {
+				if v := r.Header.Get(hdr); v != "" {
+					outReq.Header.Set(hdr, v)
+				}
+			}
+		}
+
+		if err := applyProviderAuth(outReq, prov); err != nil {
+			h.fail(w, http.StatusBadGateway, "provider auth not configured", agentID, requestedModel, start, err)
+			return
+		}
+
+		h.logger.LogRequest(agentID, requestedModel)
+		resp, err := h.client.Do(outReq)
+		if err != nil {
+			// Transport error — no key state change, return 502.
+			h.fail(w, http.StatusBadGateway, "upstream request failed", agentID, requestedModel, start, err)
+			return
+		}
+
+		classification := classifyResponse(resp)
+
+		switch classification {
+		case classAuth:
+			// 401/403/402 or quota-429: key is permanently dead.
+			resp.Body.Close()
+			reason := fmt.Sprintf("http_%d", resp.StatusCode)
+			_ = h.registry.MarkDead(lease.ProviderName, lease.KeyID, reason, resp.StatusCode)
+			h.logger.LogProviderPool(lease.ProviderName, lease.KeyID, "dead", reason, "")
+			if h.notifier != nil {
+				h.notifier.Notify(alert.PoolEvent{Provider: lease.ProviderName, KeyID: lease.KeyID, Action: "dead", Reason: reason})
+			}
+			_ = h.registry.SaveToFile()
+			continue // try next key
+
+		case classRateLimit:
+			// Rate-limit 429: cooldown.
+			resp.Body.Close()
+			cooldownDur := parseCooldownDuration(resp)
+			until := time.Now().UTC().Add(cooldownDur)
+			_ = h.registry.MarkCooldown(lease.ProviderName, lease.KeyID, "rate_limit", until)
+			cooldownUntil := until.Format(time.RFC3339)
+			h.logger.LogProviderPool(lease.ProviderName, lease.KeyID, "cooldown", "rate_limit", cooldownUntil)
+			if h.notifier != nil {
+				h.notifier.Notify(alert.PoolEvent{
+					Provider:      lease.ProviderName,
+					KeyID:         lease.KeyID,
+					Action:        "cooldown",
+					Reason:        "rate_limit",
+					CooldownUntil: cooldownUntil,
+				})
+			}
+			_ = h.registry.SaveToFile()
+			continue // try next key
+
+		default:
+			// Success or 5xx: stream response back, no key state change.
+			h.streamResponse(w, resp, agentID, providerName, requestedModel, upstreamModel, start)
+			return
 		}
 	}
 
-	if err := h.setProviderAuth(outReq, prov, agentID, requestedModel, start, w); err != nil {
-		return // error already written
-	}
-
-	h.proxyAndLog(w, outReq, agentID, "anthropic", requestedModel, requestedModel, start)
+	h.fail(w, http.StatusBadGateway, "no usable provider key after retries", agentID, requestedModel, start, fmt.Errorf("exhausted %d key attempts", maxKeyAttempts))
 }
 
-// setProviderAuth applies the provider's auth method to the upstream request.
-// Returns an error (and writes the HTTP response) if auth cannot be applied.
-func (h *Handler) setProviderAuth(outReq *http.Request, prov *provider.Provider, agentID, requestedModel string, start time.Time, w http.ResponseWriter) error {
+type responseClass int
+
+const (
+	classOK        responseClass = iota
+	classAuth                    // dead key: 401, 403, 402, quota-429
+	classRateLimit               // cooldown: rate-limit 429
+)
+
+func classifyResponse(resp *http.Response) responseClass {
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusPaymentRequired:
+		return classAuth
+	case http.StatusTooManyRequests:
+		if isQuotaExhausted(resp) {
+			return classAuth
+		}
+		return classRateLimit
+	default:
+		return classOK
+	}
+}
+
+// isQuotaExhausted peeks at the response body to distinguish billing/quota
+// exhaustion from ordinary rate limiting. The body is replaced so the caller
+// can still read it.
+func isQuotaExhausted(resp *http.Response) bool {
+	if resp.Body == nil {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "insufficient_quota") ||
+		strings.Contains(lower, "billing") ||
+		strings.Contains(lower, "exceeded your current quota")
+}
+
+// parseCooldownDuration returns how long to cool down this key.
+// It respects Retry-After if present, with a cap of 60s as a sane default.
+func parseCooldownDuration(resp *http.Response) time.Duration {
+	const defaultCooldown = 10 * time.Second
+	const maxCooldown = 60 * time.Second
+
+	ra := resp.Header.Get("Retry-After")
+	if ra == "" {
+		return defaultCooldown
+	}
+	// Retry-After may be seconds (integer) or an HTTP-date; only parse integer form.
+	var secs int
+	if _, err := fmt.Sscanf(ra, "%d", &secs); err == nil && secs > 0 {
+		d := time.Duration(secs) * time.Second
+		if d > maxCooldown {
+			return maxCooldown
+		}
+		return d
+	}
+	return defaultCooldown
+}
+
+// applyProviderAuth sets the appropriate auth header on the outgoing request.
+func applyProviderAuth(outReq *http.Request, prov *provider.Provider) error {
 	switch strings.ToLower(strings.TrimSpace(prov.Auth)) {
 	case "", "bearer":
 		if strings.TrimSpace(prov.APIKey) == "" {
-			h.fail(w, http.StatusBadGateway, "provider API key not configured", agentID, requestedModel, start, fmt.Errorf("missing API key for %s", prov.Name))
-			return fmt.Errorf("missing API key")
+			return fmt.Errorf("missing API key for %s", prov.Name)
 		}
 		outReq.Header.Set("Authorization", "Bearer "+prov.APIKey)
 	case "x-api-key":
 		if strings.TrimSpace(prov.APIKey) == "" {
-			h.fail(w, http.StatusBadGateway, "provider API key not configured", agentID, requestedModel, start, fmt.Errorf("missing API key for %s", prov.Name))
-			return fmt.Errorf("missing API key")
+			return fmt.Errorf("missing API key for %s", prov.Name)
 		}
 		outReq.Header.Del("Authorization")
 		outReq.Header.Set("X-Api-Key", prov.APIKey)
 	case "none":
 		outReq.Header.Del("Authorization")
 	default:
-		h.fail(w, http.StatusBadGateway, "unsupported provider auth", agentID, requestedModel, start, fmt.Errorf("unsupported auth mode: %s", prov.Auth))
-		return fmt.Errorf("unsupported auth mode")
+		return fmt.Errorf("unsupported auth mode: %s", prov.Auth)
 	}
 	return nil
 }
 
-// proxyAndLog forwards the request upstream, streams the response, and logs.
-func (h *Handler) proxyAndLog(w http.ResponseWriter, outReq *http.Request, agentID, providerName, requestedModel, upstreamModel string, start time.Time) {
-	h.logger.LogRequest(agentID, requestedModel)
-	resp, err := h.client.Do(outReq)
-	if err != nil {
-		h.fail(w, http.StatusBadGateway, "upstream request failed", agentID, requestedModel, start, err)
-		return
-	}
+// streamResponse forwards the upstream response to the client and logs it.
+func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, agentID, providerName, requestedModel, upstreamModel string, start time.Time) {
 	defer resp.Body.Close()
 
 	copyResponseHeaders(w.Header(), resp.Header)

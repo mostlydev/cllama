@@ -107,6 +107,127 @@ func TestUICostsAPIEmptyAccumulator(t *testing.T) {
 	}
 }
 
+// -- bearer auth tests --------------------------------------------------------
+
+func TestUITokenBlocksUnauthenticated(t *testing.T) {
+	reg := provider.NewRegistry(t.TempDir())
+	h := NewHandler(reg, WithUIToken("secret-token"))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 without token, got %d", w.Code)
+	}
+}
+
+func TestUITokenBlocksWrongToken(t *testing.T) {
+	reg := provider.NewRegistry(t.TempDir())
+	h := NewHandler(reg, WithUIToken("secret-token"))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer wrong-token")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 with wrong token, got %d", w.Code)
+	}
+}
+
+func TestUITokenAllowsCorrectToken(t *testing.T) {
+	reg := provider.NewRegistry(t.TempDir())
+	h := NewHandler(reg, WithUIToken("secret-token"))
+	req := httptest.NewRequest(http.MethodGet, "/costs/api", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 with correct token, got %d", w.Code)
+	}
+}
+
+func TestUITokenDisabledAllowsAll(t *testing.T) {
+	reg := provider.NewRegistry(t.TempDir())
+	h := NewHandler(reg) // no WithUIToken → no auth
+	req := httptest.NewRequest(http.MethodGet, "/costs/api", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 without token configured, got %d", w.Code)
+	}
+}
+
+// -- key management POST routes -----------------------------------------------
+
+func TestHandleKeyAddCreatesRuntimeKey(t *testing.T) {
+	dir := t.TempDir()
+	reg := provider.NewRegistry(dir)
+	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: "https://api.openai.com/v1", APIKey: "sk-existing", Auth: "bearer"})
+
+	h := NewHandler(reg)
+	body := strings.NewReader("provider=openai&label=extra&secret=sk-new-runtime")
+	req := httptest.NewRequest(http.MethodPost, "/keys/add", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusSeeOther && w.Code != http.StatusOK {
+		t.Errorf("expected redirect or 200 after add, got %d: %s", w.Code, w.Body.String())
+	}
+
+	all := reg.All()
+	state, ok := all["openai"]
+	if !ok {
+		t.Fatal("openai not in registry")
+	}
+	var found bool
+	for _, k := range state.Keys {
+		if k.Secret == "sk-new-runtime" {
+			found = true
+			if k.Source != "runtime" {
+				t.Errorf("expected source=runtime, got %q", k.Source)
+			}
+		}
+	}
+	if !found {
+		t.Error("new runtime key not found in pool")
+	}
+}
+
+func TestHandleKeyDeleteRemovesKey(t *testing.T) {
+	dir := t.TempDir()
+	reg := provider.NewRegistry(dir)
+	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: "https://api.openai.com/v1", APIKey: "sk-existing", Auth: "bearer"})
+
+	all := reg.All()
+	var keyID string
+	for _, k := range all["openai"].Keys {
+		keyID = k.ID
+	}
+	if keyID == "" {
+		t.Fatal("no keys found to delete")
+	}
+
+	// Add a second key so deleting the first doesn't leave the pool empty of active key.
+	_, _ = reg.AddRuntimeKey("openai", "extra", "sk-extra")
+
+	h := NewHandler(reg)
+	formBody := strings.NewReader("provider=openai&key_id=" + keyID)
+	req := httptest.NewRequest(http.MethodPost, "/keys/delete", formBody)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusSeeOther && w.Code != http.StatusOK {
+		t.Errorf("expected redirect or 200 after delete, got %d: %s", w.Code, w.Body.String())
+	}
+
+	all = reg.All()
+	for _, k := range all["openai"].Keys {
+		if k.ID == keyID {
+			t.Errorf("deleted key %q still present", keyID)
+		}
+	}
+}
+
 func TestDashboardRendersAllSections(t *testing.T) {
 	reg := provider.NewRegistry(t.TempDir())
 	reg.Set("anthropic", &provider.Provider{Name: "anthropic", BaseURL: "https://api.anthropic.com/v1", APIKey: "sk-test-key-1234", Auth: "bearer"})
@@ -130,13 +251,85 @@ func TestDashboardRendersAllSections(t *testing.T) {
 	if !strings.Contains(body, "sk-t...1234") {
 		t.Error("expected masked API key in dashboard")
 	}
-	// Should NOT contain provider form
-	if strings.Contains(body, "method=\"post\"") {
-		t.Error("dashboard should not contain provider management form")
+	// Should contain the Add Provider form
+	if !strings.Contains(body, "/providers/add") {
+		t.Error("expected Add Provider form in dashboard")
 	}
 	// Should contain SSE connection script
 	if !strings.Contains(body, "EventSource") {
 		t.Error("expected EventSource script for live updates")
+	}
+}
+
+// -- /providers/add route tests -----------------------------------------------
+
+func TestHandleProviderAddCreatesProvider(t *testing.T) {
+	dir := t.TempDir()
+	reg := provider.NewRegistry(dir)
+	h := NewHandler(reg)
+
+	body := strings.NewReader("name=mistral&base_url=https://api.mistral.ai/v1&auth=bearer&api_format=openai&key_label=primary&secret=msk-test")
+	req := httptest.NewRequest(http.MethodPost, "/providers/add", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusSeeOther {
+		t.Errorf("expected 303, got %d: %s", w.Code, w.Body.String())
+	}
+
+	all := reg.All()
+	if _, ok := all["mistral"]; !ok {
+		t.Error("mistral provider not found in registry after add")
+	}
+}
+
+func TestHandleProviderAddRejectsBadURL(t *testing.T) {
+	dir := t.TempDir()
+	reg := provider.NewRegistry(dir)
+	h := NewHandler(reg)
+
+	body := strings.NewReader("name=badprov&base_url=not-a-url&auth=bearer&api_format=openai&secret=somekey")
+	req := httptest.NewRequest(http.MethodPost, "/providers/add", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for bad URL, got %d", w.Code)
+	}
+}
+
+func TestHandleProviderAddRejectsEmptySecret(t *testing.T) {
+	dir := t.TempDir()
+	reg := provider.NewRegistry(dir)
+	h := NewHandler(reg)
+
+	body := strings.NewReader("name=mistral&base_url=https://api.mistral.ai/v1&auth=bearer&api_format=openai&secret=")
+	req := httptest.NewRequest(http.MethodPost, "/providers/add", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for empty secret, got %d", w.Code)
+	}
+}
+
+func TestHandleProviderAddRejectsExistingProvider(t *testing.T) {
+	dir := t.TempDir()
+	reg := provider.NewRegistry(dir)
+	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: "https://api.openai.com/v1", APIKey: "sk-existing", Auth: "bearer"})
+	h := NewHandler(reg)
+
+	body := strings.NewReader("name=openai&base_url=https://api.openai.com/v1&auth=bearer&api_format=openai&secret=sk-new")
+	req := httptest.NewRequest(http.MethodPost, "/providers/add", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for existing provider, got %d", w.Code)
 	}
 }
 
