@@ -600,6 +600,47 @@
       {{end}}
     </section>
 
+    <!-- ── Add Provider Section ─────────────────────── -->
+    <section class="panel fade-in">
+      <div class="panel-header">
+        <h2 class="panel-title">Add Provider</h2>
+      </div>
+      <form class="add-key-form" method="post" action="/providers/add">
+        <div>
+          <label>Name</label>
+          <input type="text" name="name" placeholder="mistral" required style="width:120px">
+        </div>
+        <div>
+          <label>Base URL</label>
+          <input type="text" name="base_url" placeholder="https://api.mistral.ai/v1" required style="width:280px">
+        </div>
+        <div>
+          <label>Auth</label>
+          <select name="auth">
+            <option value="bearer" selected>bearer</option>
+            <option value="x-api-key">x-api-key</option>
+            <option value="none">none</option>
+          </select>
+        </div>
+        <div>
+          <label>API Format</label>
+          <select name="api_format">
+            <option value="openai" selected>openai</option>
+            <option value="anthropic">anthropic</option>
+          </select>
+        </div>
+        <div>
+          <label>Key Label</label>
+          <input type="text" name="key_label" placeholder="primary" style="width:100px">
+        </div>
+        <div>
+          <label>API Key</label>
+          <input type="password" name="secret" placeholder="API key" required style="width:240px">
+        </div>
+        <button type="submit" class="btn-primary">+ Add Provider</button>
+      </form>
+    </section>
+
     <!-- ── Agents Section ───────────────────────────── -->
     <section class="panel fade-in">
       <div class="panel-header">

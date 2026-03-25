@@ -43,6 +43,7 @@ type ProviderState struct {
 	Auth        string     `json:"auth,omitempty"`
 	APIFormat   string     `json:"api_format,omitempty"`
 	ActiveKeyID string     `json:"active_key_id,omitempty"`
+	Source      string     `json:"source,omitempty"` // "seed" | "runtime"
 	Keys        []KeyEntry `json:"keys"`
 }
 
@@ -165,6 +166,7 @@ func (r *Registry) loadV1Locked(data []byte) error {
 			BaseURL:   p.BaseURL,
 			Auth:      p.Auth,
 			APIFormat: p.APIFormat,
+			Source:    "seed",
 		}
 		if state.BaseURL == "" {
 			state.BaseURL = knownProviders[n]
@@ -234,7 +236,7 @@ func (r *Registry) LoadFromEnv() {
 		}
 		p, ok := r.providers[provName]
 		if !ok {
-			p = &ProviderState{Auth: defaultAuth(provName), APIFormat: defaultAPIFormat(provName)}
+			p = &ProviderState{Auth: defaultAuth(provName), APIFormat: defaultAPIFormat(provName), Source: "seed"}
 		}
 		p.BaseURL = v
 		r.providers[provName] = p
@@ -297,6 +299,7 @@ func (r *Registry) LoadFromEnv() {
 				BaseURL:   knownProviders[provName],
 				Auth:      defaultAuth(provName),
 				APIFormat: defaultAPIFormat(provName),
+				Source:    "seed",
 			}
 		}
 		p.Keys = keys
@@ -496,6 +499,55 @@ func (r *Registry) AddRuntimeKey(providerName, label, secret string) (string, er
 		AddedAt: time.Now().UTC().Format(time.RFC3339),
 	})
 	return id, nil
+}
+
+// AddRuntimeProvider creates a new provider at runtime with a single ready key.
+// Returns an error if a provider with that name already exists (seed or runtime).
+// To add more keys to an existing provider, use AddRuntimeKey.
+func (r *Registry) AddRuntimeProvider(name, baseURL, auth, apiFormat, label, secret string) error {
+	n := normalizeName(name)
+	if n == "" {
+		return fmt.Errorf("provider name must not be empty")
+	}
+
+	r.mu.Lock()
+	if _, exists := r.providers[n]; exists {
+		r.mu.Unlock()
+		return fmt.Errorf("provider %q already exists; use /keys/add to add keys to it", n)
+	}
+
+	if auth == "" {
+		auth = "bearer"
+	}
+	if apiFormat == "" {
+		apiFormat = "openai"
+	}
+	if label == "" {
+		label = "primary"
+	}
+
+	keyID := "runtime:" + n + ":" + randomHex(4)
+	keyEntry := KeyEntry{
+		ID:      keyID,
+		Label:   label,
+		Secret:  secret,
+		Source:  "runtime",
+		State:   KeyStateReady,
+		AddedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	state := &ProviderState{
+		BaseURL:     baseURL,
+		Auth:        auth,
+		APIFormat:   apiFormat,
+		Source:      "runtime",
+		ActiveKeyID: keyID,
+		Keys:        []KeyEntry{keyEntry},
+	}
+	r.providers[n] = state
+	r.mu.Unlock()
+
+	return r.SaveToFile()
 }
 
 // DisableKey marks a key as disabled (operator-disabled, not retried).

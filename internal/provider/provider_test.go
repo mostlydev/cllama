@@ -451,3 +451,94 @@ func TestSaveIsAtomic(t *testing.T) {
 		}
 	}
 }
+
+// -- AddRuntimeProvider -------------------------------------------------------
+
+func TestAddRuntimeProviderCreatesProvider(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRegistry(dir)
+
+	err := r.AddRuntimeProvider("mistral", "https://api.mistral.ai/v1", "bearer", "openai", "primary", "msk-secret")
+	if err != nil {
+		t.Fatalf("AddRuntimeProvider: %v", err)
+	}
+
+	p, err := r.Get("mistral")
+	if err != nil {
+		t.Fatalf("Get after AddRuntimeProvider: %v", err)
+	}
+	if p.BaseURL != "https://api.mistral.ai/v1" {
+		t.Errorf("unexpected BaseURL: %q", p.BaseURL)
+	}
+	if p.APIKey != "msk-secret" {
+		t.Errorf("unexpected APIKey: %q", p.APIKey)
+	}
+}
+
+func TestAddRuntimeProviderRejectsExistingProvider(t *testing.T) {
+	dir := t.TempDir()
+	seedV2(t, dir, readyKey("seed:OPENAI_API_KEY", "primary", "sk-seed"))
+
+	r := NewRegistry(dir)
+	_ = r.LoadFromFile()
+
+	err := r.AddRuntimeProvider("openai", "https://api.openai.com/v1", "bearer", "openai", "primary", "sk-new")
+	if err == nil {
+		t.Error("expected error when adding a provider that already exists as seed; got nil")
+	}
+}
+
+func TestAddRuntimeProviderRejectsExistingRuntimeProvider(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRegistry(dir)
+
+	if err := r.AddRuntimeProvider("mistral", "https://api.mistral.ai/v1", "", "", "", "msk-first"); err != nil {
+		t.Fatalf("first AddRuntimeProvider: %v", err)
+	}
+
+	err := r.AddRuntimeProvider("mistral", "https://api.mistral.ai/v1", "", "", "", "msk-second")
+	if err == nil {
+		t.Error("expected error on duplicate AddRuntimeProvider; got nil")
+	}
+}
+
+func TestAddRuntimeProviderSavesToFile(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRegistry(dir)
+
+	if err := r.AddRuntimeProvider("mistral", "https://api.mistral.ai/v1", "bearer", "openai", "primary", "msk-save"); err != nil {
+		t.Fatalf("AddRuntimeProvider: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "providers.json"))
+	if err != nil {
+		t.Fatalf("read providers.json: %v", err)
+	}
+
+	var probe struct {
+		Version   int `json:"version"`
+		Providers map[string]struct {
+			Source string `json:"source"`
+			Keys   []struct {
+				Source string `json:"source"`
+			} `json:"keys"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		t.Fatalf("parse providers.json: %v", err)
+	}
+
+	prov, ok := probe.Providers["mistral"]
+	if !ok {
+		t.Fatal("mistral not found in saved providers.json")
+	}
+	if prov.Source != "runtime" {
+		t.Errorf("provider source = %q, want runtime", prov.Source)
+	}
+	if len(prov.Keys) == 0 {
+		t.Fatal("no keys saved for mistral")
+	}
+	if prov.Keys[0].Source != "runtime" {
+		t.Errorf("key source = %q, want runtime", prov.Keys[0].Source)
+	}
+}

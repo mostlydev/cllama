@@ -251,13 +251,85 @@ func TestDashboardRendersAllSections(t *testing.T) {
 	if !strings.Contains(body, "sk-t...1234") {
 		t.Error("expected masked API key in dashboard")
 	}
-	// Should NOT contain provider form
-	if strings.Contains(body, "method=\"post\"") {
-		t.Error("dashboard should not contain provider management form")
+	// Should contain the Add Provider form
+	if !strings.Contains(body, "/providers/add") {
+		t.Error("expected Add Provider form in dashboard")
 	}
 	// Should contain SSE connection script
 	if !strings.Contains(body, "EventSource") {
 		t.Error("expected EventSource script for live updates")
+	}
+}
+
+// -- /providers/add route tests -----------------------------------------------
+
+func TestHandleProviderAddCreatesProvider(t *testing.T) {
+	dir := t.TempDir()
+	reg := provider.NewRegistry(dir)
+	h := NewHandler(reg)
+
+	body := strings.NewReader("name=mistral&base_url=https://api.mistral.ai/v1&auth=bearer&api_format=openai&key_label=primary&secret=msk-test")
+	req := httptest.NewRequest(http.MethodPost, "/providers/add", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusSeeOther {
+		t.Errorf("expected 303, got %d: %s", w.Code, w.Body.String())
+	}
+
+	all := reg.All()
+	if _, ok := all["mistral"]; !ok {
+		t.Error("mistral provider not found in registry after add")
+	}
+}
+
+func TestHandleProviderAddRejectsBadURL(t *testing.T) {
+	dir := t.TempDir()
+	reg := provider.NewRegistry(dir)
+	h := NewHandler(reg)
+
+	body := strings.NewReader("name=badprov&base_url=not-a-url&auth=bearer&api_format=openai&secret=somekey")
+	req := httptest.NewRequest(http.MethodPost, "/providers/add", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for bad URL, got %d", w.Code)
+	}
+}
+
+func TestHandleProviderAddRejectsEmptySecret(t *testing.T) {
+	dir := t.TempDir()
+	reg := provider.NewRegistry(dir)
+	h := NewHandler(reg)
+
+	body := strings.NewReader("name=mistral&base_url=https://api.mistral.ai/v1&auth=bearer&api_format=openai&secret=")
+	req := httptest.NewRequest(http.MethodPost, "/providers/add", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for empty secret, got %d", w.Code)
+	}
+}
+
+func TestHandleProviderAddRejectsExistingProvider(t *testing.T) {
+	dir := t.TempDir()
+	reg := provider.NewRegistry(dir)
+	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: "https://api.openai.com/v1", APIKey: "sk-existing", Auth: "bearer"})
+	h := NewHandler(reg)
+
+	body := strings.NewReader("name=openai&base_url=https://api.openai.com/v1&auth=bearer&api_format=openai&secret=sk-new")
+	req := httptest.NewRequest(http.MethodPost, "/providers/add", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for existing provider, got %d", w.Code)
 	}
 }
 

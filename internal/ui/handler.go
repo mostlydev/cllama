@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -120,6 +121,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleSSE(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/costs/api":
 		h.handleCostsAPI(w)
+	case r.Method == http.MethodPost && r.URL.Path == "/providers/add":
+		h.handleProviderAdd(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/keys/add":
 		h.handleKeyAdd(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/keys/activate":
@@ -235,6 +238,56 @@ type dashboardModel struct {
 	TokensIn  int     `json:"tokensIn"`
 	TokensOut int     `json:"tokensOut"`
 	CostUSD   float64 `json:"costUSD"`
+}
+
+// -- provider management handlers --
+
+func (h *Handler) handleProviderAdd(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	baseURLStr := strings.TrimSpace(r.FormValue("base_url"))
+	parsed, err := url.Parse(baseURLStr)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		http.Error(w, "base_url must be a valid http or https URL with a non-empty host", http.StatusBadRequest)
+		return
+	}
+	auth := strings.TrimSpace(r.FormValue("auth"))
+	switch auth {
+	case "bearer", "x-api-key", "none":
+		// valid
+	default:
+		http.Error(w, "auth must be one of: bearer, x-api-key, none", http.StatusBadRequest)
+		return
+	}
+	apiFormat := strings.TrimSpace(r.FormValue("api_format"))
+	switch apiFormat {
+	case "openai", "anthropic":
+		// valid
+	default:
+		http.Error(w, "api_format must be one of: openai, anthropic", http.StatusBadRequest)
+		return
+	}
+	keyLabel := strings.TrimSpace(r.FormValue("key_label"))
+	if keyLabel == "" {
+		keyLabel = "primary"
+	}
+	secret := strings.TrimSpace(r.FormValue("secret"))
+	if secret == "" {
+		http.Error(w, "secret is required", http.StatusBadRequest)
+		return
+	}
+	if err := h.registry.AddRuntimeProvider(name, baseURLStr, auth, apiFormat, keyLabel, secret); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 // -- key management handlers --
