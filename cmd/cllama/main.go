@@ -20,6 +20,7 @@ import (
 	"github.com/mostlydev/cllama/internal/logging"
 	"github.com/mostlydev/cllama/internal/provider"
 	"github.com/mostlydev/cllama/internal/proxy"
+	"github.com/mostlydev/cllama/internal/sessionhistory"
 	"github.com/mostlydev/cllama/internal/ui"
 )
 
@@ -64,9 +65,14 @@ func run(args []string, stdout, stderr io.Writer) error {
 	pricing := cost.DefaultPricing()
 	acc := cost.NewAccumulator()
 
+	var recorder *sessionhistory.Recorder
+	if cfg.SessionHistoryDir != "" {
+		recorder = sessionhistory.New(cfg.SessionHistoryDir)
+	}
+
 	apiServer := &http.Server{
 		Addr:              cfg.APIAddr,
-		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, cfg.SessionHistoryDir),
+		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, recorder),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	uiServer := &http.Server{
@@ -99,17 +105,23 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("shutdown ui server: %w", err)
 	}
 
+	if recorder != nil {
+		if err := recorder.Close(); err != nil {
+			fmt.Fprintf(stderr, "close session recorder: %v\n", err)
+		}
+	}
+
 	return nil
 }
 
-func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, sessionHistoryDir string) http.Handler {
+func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder) http.Handler {
 	mux := http.NewServeMux()
 	opts := []proxy.HandlerOption{proxy.WithCostTracking(acc, pricing)}
 	if podName != "" {
 		opts = append(opts, proxy.WithFeeds(podName))
 	}
-	if sessionHistoryDir != "" {
-		opts = append(opts, proxy.WithSessionHistory(sessionHistoryDir))
+	if recorder != nil {
+		opts = append(opts, proxy.WithSessionRecorder(recorder))
 	}
 	proxyHandler := proxy.NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
 		return agentctx.Load(contextRoot, agentID)

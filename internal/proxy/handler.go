@@ -73,6 +73,14 @@ func WithSessionHistory(dir string) HandlerOption {
 	}
 }
 
+// WithSessionRecorder attaches an already-constructed session recorder to the handler.
+// Use this when the caller needs to retain the recorder for explicit Close on shutdown.
+func WithSessionRecorder(r *sessionhistory.Recorder) HandlerOption {
+	return func(h *Handler) {
+		h.sessionRecorder = r
+	}
+}
+
 func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger *logging.Logger, opts ...HandlerOption) *Handler {
 	if registry == nil {
 		registry = provider.NewRegistry("")
@@ -501,7 +509,7 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 		} else {
 			responsePayload = sessionhistory.Payload{Format: "json", JSON: json.RawMessage(captured)}
 		}
-		_ = h.sessionRecorder.Record(agentID, sessionhistory.Entry{
+		if err := h.sessionRecorder.Record(agentID, sessionhistory.Entry{
 			Version:           1,
 			ClawID:            agentID,
 			TS:                start.UTC().Format(time.RFC3339),
@@ -519,7 +527,9 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 				CompletionTokens: usage.CompletionTokens,
 				ReportedCostUSD:  usage.ReportedCostUSD,
 			},
-		})
+		}); err != nil {
+			h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("session history write: %w", err))
+		}
 	}
 
 	latency := time.Since(start).Milliseconds()
