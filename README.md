@@ -252,6 +252,7 @@ One file per agent. Each line is one entry, appended on every successful upstrea
 | `request_effective` | Request body as forwarded to the upstream (after credential swap and model rewrite). |
 | `response` | `{format, json?, text?}` — `format` is `"json"` or `"sse"`. JSON responses include `json` (parsed body); SSE responses include `text` (raw event stream). |
 | `usage` | `{prompt_tokens, completion_tokens}` extracted from the response. |
+| `usage.reported_cost_usd` | float | Provider-reported cost in USD; `omitempty` |
 
 ### Clawdapus wiring
 
