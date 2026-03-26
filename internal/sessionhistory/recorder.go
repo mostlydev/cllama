@@ -93,6 +93,27 @@ func (r *Recorder) Record(agentID string, e Entry) error {
 	return err
 }
 
+// Close closes all open file handles held by the recorder. It collects the
+// first error encountered but continues closing remaining files. Calling Close
+// on an already-closed or no-op recorder is safe and returns nil.
+func (r *Recorder) Close() error {
+	if r.baseDir == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var firstErr error
+	for _, of := range r.files {
+		of.mu.Lock()
+		if err := of.f.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		of.mu.Unlock()
+	}
+	r.files = nil
+	return firstErr
+}
+
 // openFor returns (creating if necessary) the openFile handle for agentID.
 // The recorder-level mutex serialises the open/create path; once the handle
 // exists subsequent writes lock only the per-file mutex.

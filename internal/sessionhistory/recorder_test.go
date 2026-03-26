@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -41,12 +42,8 @@ func TestRecorder_WritesOneJSONEntry(t *testing.T) {
 	}
 
 	histFile := filepath.Join(dir, "agent-abc", "history.jsonl")
-	data, err := os.ReadFile(histFile)
-	if err != nil {
-		t.Fatalf("history file not created: %v", err)
-	}
 
-	lines := nonEmptyLines(string(data))
+	lines := nonEmptyLines(t, histFile)
 	if len(lines) != 1 {
 		t.Fatalf("expected 1 line, got %d", len(lines))
 	}
@@ -93,12 +90,8 @@ func TestRecorder_AppendsMultipleTurns(t *testing.T) {
 	}
 
 	histFile := filepath.Join(dir, "agent-xyz", "history.jsonl")
-	data, err := os.ReadFile(histFile)
-	if err != nil {
-		t.Fatalf("history file not found: %v", err)
-	}
 
-	lines := nonEmptyLines(string(data))
+	lines := nonEmptyLines(t, histFile)
 	if len(lines) != 3 {
 		t.Fatalf("expected 3 lines, got %d", len(lines))
 	}
@@ -139,12 +132,8 @@ func TestRecorder_ConcurrentWritesSafe(t *testing.T) {
 	wg.Wait()
 
 	histFile := filepath.Join(dir, "agent-concurrent", "history.jsonl")
-	data, err := os.ReadFile(histFile)
-	if err != nil {
-		t.Fatalf("history file not found: %v", err)
-	}
 
-	lines := nonEmptyLines(string(data))
+	lines := nonEmptyLines(t, histFile)
 	if len(lines) != goroutines {
 		t.Fatalf("expected %d lines, got %d", goroutines, len(lines))
 	}
@@ -177,12 +166,8 @@ func TestRecorder_SSEPayloadNoMarshalFailure(t *testing.T) {
 	}
 
 	histFile := filepath.Join(dir, "agent-sse", "history.jsonl")
-	data, err := os.ReadFile(histFile)
-	if err != nil {
-		t.Fatalf("history file not found: %v", err)
-	}
 
-	lines := nonEmptyLines(string(data))
+	lines := nonEmptyLines(t, histFile)
 	if len(lines) != 1 {
 		t.Fatalf("expected 1 line, got %d", len(lines))
 	}
@@ -221,31 +206,49 @@ func TestRecorder_NoOpWhenBaseDirEmpty(t *testing.T) {
 	}
 }
 
-// nonEmptyLines splits s by newline and returns only non-empty lines.
-func nonEmptyLines(s string) []string {
+func TestRecorder_Close(t *testing.T) {
+	dir := t.TempDir()
+	r := New(dir)
+
+	entry := Entry{
+		Version: 1,
+		TS:      time.Now().UTC().Format(time.RFC3339),
+		ClawID:  "agent-close",
+		Response: Payload{
+			Format: "json",
+			JSON:   json.RawMessage(`{}`),
+		},
+	}
+	if err := r.Record("agent-close", entry); err != nil {
+		t.Fatalf("unexpected error recording entry: %v", err)
+	}
+
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close() returned error: %v", err)
+	}
+
+	// Second Close must be a no-op (nil files map).
+	if err := r.Close(); err != nil {
+		t.Fatalf("second Close() returned error: %v", err)
+	}
+}
+
+// nonEmptyLines reads path and returns its non-empty lines.
+func nonEmptyLines(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	sc := bufio.NewScanner(strings.NewReader(string(data)))
 	var lines []string
-	sc := bufio.NewScanner(newStringReader(s))
 	for sc.Scan() {
-		line := sc.Text()
-		if line != "" {
+		if line := sc.Text(); line != "" {
 			lines = append(lines, line)
 		}
 	}
-	return lines
-}
-
-type stringReader struct {
-	s   string
-	pos int
-}
-
-func newStringReader(s string) *stringReader { return &stringReader{s: s} }
-
-func (r *stringReader) Read(p []byte) (int, error) {
-	if r.pos >= len(r.s) {
-		return 0, os.ErrClosed
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scanner: %v", err)
 	}
-	n := copy(p, r.s[r.pos:])
-	r.pos += n
-	return n, nil
+	return lines
 }
