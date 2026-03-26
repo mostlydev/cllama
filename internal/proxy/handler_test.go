@@ -1042,6 +1042,9 @@ func TestHandlerRecordsSessionHistoryJSON(t *testing.T) {
 	if resp["format"] != "json" {
 		t.Errorf("expected response.format=json, got %v", resp["format"])
 	}
+	if entry["ts"] == "" {
+		t.Error("expected TS to be populated")
+	}
 }
 
 func TestHandlerRecordsSessionHistorySSE(t *testing.T) {

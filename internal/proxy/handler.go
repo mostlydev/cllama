@@ -504,6 +504,7 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 		_ = h.sessionRecorder.Record(agentID, sessionhistory.Entry{
 			Version:           1,
 			ClawID:            agentID,
+			TS:                start.UTC().Format(time.RFC3339),
 			Path:              requestPath,
 			RequestedModel:    requestedModel,
 			EffectiveProvider: providerName,
