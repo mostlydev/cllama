@@ -24,12 +24,13 @@ import (
 )
 
 type config struct {
-	APIAddr     string
-	UIAddr      string
-	ContextRoot string
-	AuthDir     string
-	PodName     string
-	UIToken     string
+	APIAddr            string
+	UIAddr             string
+	ContextRoot        string
+	AuthDir            string
+	PodName            string
+	UIToken            string
+	SessionHistoryDir  string
 }
 
 func main() {
@@ -65,7 +66,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 	apiServer := &http.Server{
 		Addr:              cfg.APIAddr,
-		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName),
+		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, cfg.SessionHistoryDir),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	uiServer := &http.Server{
@@ -101,11 +102,14 @@ func run(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string) http.Handler {
+func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, sessionHistoryDir string) http.Handler {
 	mux := http.NewServeMux()
 	opts := []proxy.HandlerOption{proxy.WithCostTracking(acc, pricing)}
 	if podName != "" {
 		opts = append(opts, proxy.WithFeeds(podName))
+	}
+	if sessionHistoryDir != "" {
+		opts = append(opts, proxy.WithSessionHistory(sessionHistoryDir))
 	}
 	proxyHandler := proxy.NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
 		return agentctx.Load(contextRoot, agentID)
@@ -175,8 +179,9 @@ func configFromEnv() config {
 		UIAddr:      envOr("UI_ADDR", ":8081"),
 		ContextRoot: envOr("CLAW_CONTEXT_ROOT", "/claw/context"),
 		AuthDir:     envOr("CLAW_AUTH_DIR", "/claw/auth"),
-		PodName:     os.Getenv("CLAW_POD"),
-		UIToken:     os.Getenv("CLLAMA_UI_TOKEN"),
+		PodName:           os.Getenv("CLAW_POD"),
+		UIToken:           os.Getenv("CLLAMA_UI_TOKEN"),
+		SessionHistoryDir: os.Getenv("CLAW_SESSION_HISTORY_DIR"),
 	}
 }
 

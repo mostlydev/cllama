@@ -75,7 +75,7 @@ func TestDualServerIntegrationSmoke(t *testing.T) {
 	}
 	pricing := cost.DefaultPricing()
 	acc := cost.NewAccumulator()
-	apiHandler := newAPIHandler(contextRoot, reg, logging.New(io.Discard), acc, pricing, "test-pod")
+	apiHandler := newAPIHandler(contextRoot, reg, logging.New(io.Discard), acc, pricing, "test-pod", "")
 	uiHandler := newUIHandler(reg, acc, contextRoot, "")
 
 	apiServer := &http.Server{Handler: apiHandler}
@@ -143,6 +143,23 @@ func TestDualServerIntegrationSmoke(t *testing.T) {
 	uiBody, _ := io.ReadAll(uiResp.Body)
 	if !bytes.Contains(uiBody, []byte("openai")) {
 		t.Fatalf("expected provider list in UI body: %s", string(uiBody))
+	}
+}
+
+func TestConfigFromEnvSessionHistoryDir(t *testing.T) {
+	os.Setenv("CLAW_SESSION_HISTORY_DIR", "/claw/session-history")
+	defer os.Unsetenv("CLAW_SESSION_HISTORY_DIR")
+	cfg := configFromEnv()
+	if cfg.SessionHistoryDir != "/claw/session-history" {
+		t.Errorf("SessionHistoryDir = %q; want /claw/session-history", cfg.SessionHistoryDir)
+	}
+}
+
+func TestConfigFromEnvSessionHistoryDirDefault(t *testing.T) {
+	os.Unsetenv("CLAW_SESSION_HISTORY_DIR")
+	cfg := configFromEnv()
+	if cfg.SessionHistoryDir != "" {
+		t.Errorf("SessionHistoryDir should be empty when unset; got %q", cfg.SessionHistoryDir)
 	}
 }
 
