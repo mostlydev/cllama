@@ -147,8 +147,7 @@ func TestDualServerIntegrationSmoke(t *testing.T) {
 }
 
 func TestConfigFromEnvSessionHistoryDir(t *testing.T) {
-	os.Setenv("CLAW_SESSION_HISTORY_DIR", "/claw/session-history")
-	defer os.Unsetenv("CLAW_SESSION_HISTORY_DIR")
+	t.Setenv("CLAW_SESSION_HISTORY_DIR", "/claw/session-history")
 	cfg := configFromEnv()
 	if cfg.SessionHistoryDir != "/claw/session-history" {
 		t.Errorf("SessionHistoryDir = %q; want /claw/session-history", cfg.SessionHistoryDir)
@@ -156,7 +155,7 @@ func TestConfigFromEnvSessionHistoryDir(t *testing.T) {
 }
 
 func TestConfigFromEnvSessionHistoryDirDefault(t *testing.T) {
-	os.Unsetenv("CLAW_SESSION_HISTORY_DIR")
+	t.Setenv("CLAW_SESSION_HISTORY_DIR", "")
 	cfg := configFromEnv()
 	if cfg.SessionHistoryDir != "" {
 		t.Errorf("SessionHistoryDir should be empty when unset; got %q", cfg.SessionHistoryDir)
