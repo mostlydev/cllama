@@ -14,6 +14,8 @@ type CostEntry struct {
 	TotalOutputTokens int
 	TotalCostUSD      float64
 	RequestCount      int
+	PricedRequests    int
+	UnpricedRequests  int
 }
 
 type bucketKey struct {
@@ -33,6 +35,10 @@ func NewAccumulator() *Accumulator {
 }
 
 func (a *Accumulator) Record(agentID, provider, model string, inputTokens, outputTokens int, costUSD float64) {
+	a.RecordWithStatus(agentID, provider, model, inputTokens, outputTokens, costUSD, true)
+}
+
+func (a *Accumulator) RecordWithStatus(agentID, provider, model string, inputTokens, outputTokens int, costUSD float64, costKnown bool) {
 	key := bucketKey{AgentID: agentID, Provider: provider, Model: model}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -45,6 +51,11 @@ func (a *Accumulator) Record(agentID, provider, model string, inputTokens, outpu
 	e.TotalOutputTokens += outputTokens
 	e.TotalCostUSD += costUSD
 	e.RequestCount++
+	if costKnown {
+		e.PricedRequests++
+	} else {
+		e.UnpricedRequests++
+	}
 }
 
 // ByAgent returns all cost entries for a given agent, sorted by model.
@@ -86,6 +97,26 @@ func (a *Accumulator) TotalCost() float64 {
 	var total float64
 	for _, e := range a.buckets {
 		total += e.TotalCostUSD
+	}
+	return total
+}
+
+func (a *Accumulator) TotalRequests() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	total := 0
+	for _, e := range a.buckets {
+		total += e.RequestCount
+	}
+	return total
+}
+
+func (a *Accumulator) TotalUnpricedRequests() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	total := 0
+	for _, e := range a.buckets {
+		total += e.UnpricedRequests
 	}
 	return total
 }

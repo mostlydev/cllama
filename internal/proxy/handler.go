@@ -159,6 +159,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	if feedBlock := h.fetchFeeds(r.Context(), agentID, agentCtx); feedBlock != "" {
 		feeds.InjectOpenAI(payload, feedBlock)
 	}
+	feeds.InjectOpenAI(payload, currentTimeLine(agentCtx, time.Now()))
 
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
@@ -238,6 +239,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	if feedBlock := h.fetchFeeds(r.Context(), agentID, agentCtx); feedBlock != "" {
 		feeds.InjectAnthropic(payload, feedBlock)
 	}
+	feeds.InjectAnthropic(payload, currentTimeLine(agentCtx, time.Now()))
 
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
@@ -454,7 +456,7 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 	}
 
 	var costInfo *logging.CostInfo
-	if h.accumulator != nil && h.pricing != nil {
+	if h.accumulator != nil {
 		captured := responseBuf.Bytes()
 		var usage cost.Usage
 		if isSSE(resp.Header) {
@@ -462,18 +464,18 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 		} else {
 			usage, _ = cost.ExtractUsage(captured)
 		}
-		if usage.PromptTokens > 0 || usage.CompletionTokens > 0 {
-			rate, ok := h.pricing.Lookup(providerName, upstreamModel)
-			costUSD := 0.0
-			if ok {
-				costUSD = rate.Compute(usage.PromptTokens, usage.CompletionTokens)
+		if usage.PromptTokens > 0 || usage.CompletionTokens > 0 || usage.ReportedCostUSD != nil {
+			costUSD, costKnown := h.resolveCost(providerName, upstreamModel, usage)
+			h.accumulator.RecordWithStatus(agentID, providerName, upstreamModel,
+				usage.PromptTokens, usage.CompletionTokens, costUSD, costKnown)
+			var loggedCostUSD *float64
+			if costKnown {
+				loggedCostUSD = &costUSD
 			}
-			h.accumulator.Record(agentID, providerName, upstreamModel,
-				usage.PromptTokens, usage.CompletionTokens, costUSD)
 			costInfo = &logging.CostInfo{
 				InputTokens:  usage.PromptTokens,
 				OutputTokens: usage.CompletionTokens,
-				CostUSD:      costUSD,
+				CostUSD:      loggedCostUSD,
 			}
 		}
 	}
@@ -565,6 +567,29 @@ func buildUpstreamURL(baseURL, incomingPath, rawQuery string) (string, error) {
 	u.Path = strings.TrimRight(u.Path, "/") + suffix
 	u.RawQuery = rawQuery
 	return u.String(), nil
+}
+
+func (h *Handler) resolveCost(providerName, upstreamModel string, usage cost.Usage) (float64, bool) {
+	if usage.ReportedCostUSD != nil && providerReportedCostIsUSD(providerName) {
+		return *usage.ReportedCostUSD, true
+	}
+	if h.pricing == nil {
+		return 0, false
+	}
+	rate, ok := h.pricing.Lookup(providerName, upstreamModel)
+	if !ok {
+		return 0, false
+	}
+	return rate.Compute(usage.PromptTokens, usage.CompletionTokens), true
+}
+
+func providerReportedCostIsUSD(providerName string) bool {
+	switch strings.ToLower(strings.TrimSpace(providerName)) {
+	case "openrouter":
+		return true
+	default:
+		return false
+	}
 }
 
 func copyRequestHeaders(dst, src http.Header) {

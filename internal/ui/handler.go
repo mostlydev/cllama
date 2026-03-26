@@ -54,15 +54,15 @@ type Handler struct {
 }
 
 type providerRow struct {
-	Name         string    `json:"name"`
-	BaseURL      string    `json:"baseURL"`
-	Auth         string    `json:"auth"`
-	MaskedKey    string    `json:"maskedKey"`
-	ActiveKeyID  string    `json:"activeKeyID"`
-	ReadyCount   int       `json:"readyCount"`
+	Name          string   `json:"name"`
+	BaseURL       string   `json:"baseURL"`
+	Auth          string   `json:"auth"`
+	MaskedKey     string   `json:"maskedKey"`
+	ActiveKeyID   string   `json:"activeKeyID"`
+	ReadyCount    int      `json:"readyCount"`
 	CooldownCount int      `json:"cooldownCount"`
-	DeadCount    int       `json:"deadCount"`
-	Keys         []keyRow  `json:"keys"`
+	DeadCount     int      `json:"deadCount"`
+	Keys          []keyRow `json:"keys"`
 }
 
 type keyRow struct {
@@ -79,23 +79,29 @@ type keyRow struct {
 // -- costs API types --
 
 type costsAPIResponse struct {
-	TotalCostUSD float64                     `json:"total_cost_usd"`
-	Agents       map[string]agentAPIResponse `json:"agents"`
+	TotalCostUSD     float64                     `json:"total_cost_usd"`
+	TotalRequests    int                         `json:"total_requests"`
+	UnpricedRequests int                         `json:"unpriced_requests"`
+	Agents           map[string]agentAPIResponse `json:"agents"`
 }
 
 type agentAPIResponse struct {
-	TotalCostUSD  float64            `json:"total_cost_usd"`
-	TotalRequests int                `json:"total_requests"`
-	Models        []modelAPIResponse `json:"models"`
+	TotalCostUSD     float64            `json:"total_cost_usd"`
+	TotalRequests    int                `json:"total_requests"`
+	UnpricedRequests int                `json:"unpriced_requests"`
+	Models           []modelAPIResponse `json:"models"`
 }
 
 type modelAPIResponse struct {
-	Provider    string  `json:"provider"`
-	Model       string  `json:"model"`
-	InputTokens int     `json:"input_tokens"`
-	OutputTokens int    `json:"output_tokens"`
-	CostUSD     float64 `json:"cost_usd"`
-	Requests    int     `json:"requests"`
+	Provider         string  `json:"provider"`
+	Model            string  `json:"model"`
+	InputTokens      int     `json:"input_tokens"`
+	OutputTokens     int     `json:"output_tokens"`
+	CostUSD          float64 `json:"cost_usd"`
+	Requests         int     `json:"requests"`
+	PricedRequests   int     `json:"priced_requests"`
+	UnpricedRequests int     `json:"unpriced_requests"`
+	PricingStatus    string  `json:"pricing_status"`
 }
 
 func NewHandler(reg *provider.Registry, opts ...UIOption) http.Handler {
@@ -189,19 +195,25 @@ func (h *Handler) buildCostsAPIResponse() costsAPIResponse {
 	}
 
 	resp.TotalCostUSD = h.accumulator.TotalCost()
+	resp.TotalRequests = h.accumulator.TotalRequests()
+	resp.UnpricedRequests = h.accumulator.TotalUnpricedRequests()
 	grouped := h.accumulator.All()
 	for id, entries := range grouped {
 		agent := agentAPIResponse{}
 		for _, e := range entries {
 			agent.TotalRequests += e.RequestCount
 			agent.TotalCostUSD += e.TotalCostUSD
+			agent.UnpricedRequests += e.UnpricedRequests
 			agent.Models = append(agent.Models, modelAPIResponse{
-				Provider:     e.Provider,
-				Model:        e.Model,
-				InputTokens:  e.TotalInputTokens,
-				OutputTokens: e.TotalOutputTokens,
-				CostUSD:      e.TotalCostUSD,
-				Requests:     e.RequestCount,
+				Provider:         e.Provider,
+				Model:            e.Model,
+				InputTokens:      e.TotalInputTokens,
+				OutputTokens:     e.TotalOutputTokens,
+				CostUSD:          e.TotalCostUSD,
+				Requests:         e.RequestCount,
+				PricedRequests:   e.PricedRequests,
+				UnpricedRequests: e.UnpricedRequests,
+				PricingStatus:    pricingStatusForEntry(e),
 			})
 		}
 		resp.Agents[id] = agent
@@ -212,12 +224,14 @@ func (h *Handler) buildCostsAPIResponse() costsAPIResponse {
 // -- SSE dashboard state types --
 
 type dashboardState struct {
-	PodName      string           `json:"podName,omitempty"`
-	TotalCostUSD float64          `json:"totalCostUSD"`
-	TotalReqs    int              `json:"totalRequests"`
-	TotalTokens  int              `json:"totalTokens"`
-	Providers    []providerRow    `json:"providers"`
-	Agents       []dashboardAgent `json:"agents"`
+	PodName          string           `json:"podName,omitempty"`
+	TotalCostUSD     float64          `json:"totalCostUSD"`
+	TotalReqs        int              `json:"totalRequests"`
+	TotalTokens      int              `json:"totalTokens"`
+	UnpricedRequests int              `json:"unpricedRequests"`
+	Providers        []providerRow    `json:"providers"`
+	PricingGaps      []dashboardGap   `json:"pricingGaps"`
+	Agents           []dashboardAgent `json:"agents"`
 }
 
 type dashboardAgent struct {
@@ -232,12 +246,26 @@ type dashboardAgent struct {
 }
 
 type dashboardModel struct {
-	Provider  string  `json:"provider"`
-	Model     string  `json:"model"`
-	Requests  int     `json:"requests"`
-	TokensIn  int     `json:"tokensIn"`
-	TokensOut int     `json:"tokensOut"`
-	CostUSD   float64 `json:"costUSD"`
+	Provider         string  `json:"provider"`
+	Model            string  `json:"model"`
+	Requests         int     `json:"requests"`
+	TokensIn         int     `json:"tokensIn"`
+	TokensOut        int     `json:"tokensOut"`
+	CostUSD          float64 `json:"costUSD"`
+	PricedRequests   int     `json:"pricedRequests"`
+	UnpricedRequests int     `json:"unpricedRequests"`
+	PricingStatus    string  `json:"pricingStatus"`
+}
+
+type dashboardGap struct {
+	AgentID          string `json:"agentId"`
+	Provider         string `json:"provider"`
+	Model            string `json:"model"`
+	Requests         int    `json:"requests"`
+	TokensIn         int    `json:"tokensIn"`
+	TokensOut        int    `json:"tokensOut"`
+	UnpricedRequests int    `json:"unpricedRequests"`
+	PricingStatus    string `json:"pricingStatus"`
 }
 
 // -- provider management handlers --
@@ -376,8 +404,9 @@ func redirectWithMsg(w http.ResponseWriter, r *http.Request, _ string) {
 
 func (h *Handler) buildDashboardState() dashboardState {
 	state := dashboardState{
-		Providers: []providerRow{},
-		Agents:    []dashboardAgent{},
+		Providers:   []providerRow{},
+		PricingGaps: []dashboardGap{},
+		Agents:      []dashboardAgent{},
 	}
 
 	// 1. Providers from registry (sorted by name, masked keys)
@@ -441,13 +470,28 @@ func (h *Handler) buildDashboardState() dashboardState {
 						da.TotalTokensIn += e.TotalInputTokens
 						da.TotalTokensOut += e.TotalOutputTokens
 						da.Models = append(da.Models, dashboardModel{
-							Provider:  e.Provider,
-							Model:     e.Model,
-							Requests:  e.RequestCount,
-							TokensIn:  e.TotalInputTokens,
-							TokensOut: e.TotalOutputTokens,
-							CostUSD:   e.TotalCostUSD,
+							Provider:         e.Provider,
+							Model:            e.Model,
+							Requests:         e.RequestCount,
+							TokensIn:         e.TotalInputTokens,
+							TokensOut:        e.TotalOutputTokens,
+							CostUSD:          e.TotalCostUSD,
+							PricedRequests:   e.PricedRequests,
+							UnpricedRequests: e.UnpricedRequests,
+							PricingStatus:    pricingStatusForEntry(e),
 						})
+						if e.UnpricedRequests > 0 {
+							state.PricingGaps = append(state.PricingGaps, dashboardGap{
+								AgentID:          a.AgentID,
+								Provider:         e.Provider,
+								Model:            e.Model,
+								Requests:         e.RequestCount,
+								TokensIn:         e.TotalInputTokens,
+								TokensOut:        e.TotalOutputTokens,
+								UnpricedRequests: e.UnpricedRequests,
+								PricingStatus:    pricingStatusForEntry(e),
+							})
+						}
 					}
 				}
 				state.Agents = append(state.Agents, da)
@@ -478,13 +522,28 @@ func (h *Handler) buildDashboardState() dashboardState {
 				da.TotalTokensIn += e.TotalInputTokens
 				da.TotalTokensOut += e.TotalOutputTokens
 				da.Models = append(da.Models, dashboardModel{
-					Provider:  e.Provider,
-					Model:     e.Model,
-					Requests:  e.RequestCount,
-					TokensIn:  e.TotalInputTokens,
-					TokensOut: e.TotalOutputTokens,
-					CostUSD:   e.TotalCostUSD,
+					Provider:         e.Provider,
+					Model:            e.Model,
+					Requests:         e.RequestCount,
+					TokensIn:         e.TotalInputTokens,
+					TokensOut:        e.TotalOutputTokens,
+					CostUSD:          e.TotalCostUSD,
+					PricedRequests:   e.PricedRequests,
+					UnpricedRequests: e.UnpricedRequests,
+					PricingStatus:    pricingStatusForEntry(e),
 				})
+				if e.UnpricedRequests > 0 {
+					state.PricingGaps = append(state.PricingGaps, dashboardGap{
+						AgentID:          id,
+						Provider:         e.Provider,
+						Model:            e.Model,
+						Requests:         e.RequestCount,
+						TokensIn:         e.TotalInputTokens,
+						TokensOut:        e.TotalOutputTokens,
+						UnpricedRequests: e.UnpricedRequests,
+						PricingStatus:    pricingStatusForEntry(e),
+					})
+				}
 			}
 			state.Agents = append(state.Agents, da)
 		}
@@ -493,6 +552,7 @@ func (h *Handler) buildDashboardState() dashboardState {
 	// 4. Compute totals
 	if h.accumulator != nil {
 		state.TotalCostUSD = h.accumulator.TotalCost()
+		state.UnpricedRequests = h.accumulator.TotalUnpricedRequests()
 	}
 	for _, a := range state.Agents {
 		state.TotalReqs += a.TotalRequests
@@ -502,6 +562,14 @@ func (h *Handler) buildDashboardState() dashboardState {
 	// 5. Sort agents by ID
 	sort.Slice(state.Agents, func(i, j int) bool {
 		return state.Agents[i].AgentID < state.Agents[j].AgentID
+	})
+	sort.Slice(state.PricingGaps, func(i, j int) bool {
+		if state.PricingGaps[i].UnpricedRequests == state.PricingGaps[j].UnpricedRequests {
+			left := state.PricingGaps[i].AgentID + "/" + state.PricingGaps[i].Provider + "/" + state.PricingGaps[i].Model
+			right := state.PricingGaps[j].AgentID + "/" + state.PricingGaps[j].Provider + "/" + state.PricingGaps[j].Model
+			return left < right
+		}
+		return state.PricingGaps[i].UnpricedRequests > state.PricingGaps[j].UnpricedRequests
 	})
 
 	return state
@@ -567,6 +635,17 @@ func maskActiveKey(state *provider.ProviderState) string {
 		}
 	}
 	return ""
+}
+
+func pricingStatusForEntry(entry cost.CostEntry) string {
+	switch {
+	case entry.UnpricedRequests == 0:
+		return "priced"
+	case entry.PricedRequests == 0:
+		return "unpriced"
+	default:
+		return "partial"
+	}
 }
 
 func maskKey(key string) string {

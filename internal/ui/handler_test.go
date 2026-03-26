@@ -61,6 +61,12 @@ func TestUICostsAPIReturnsJSON(t *testing.T) {
 	if _, ok := result["total_cost_usd"]; !ok {
 		t.Error("expected total_cost_usd field")
 	}
+	if _, ok := result["total_requests"]; !ok {
+		t.Error("expected total_requests field")
+	}
+	if _, ok := result["unpriced_requests"]; !ok {
+		t.Error("expected unpriced_requests field")
+	}
 	if _, ok := result["agents"]; !ok {
 		t.Error("expected agents field")
 	}
@@ -101,6 +107,9 @@ func TestUICostsAPIEmptyAccumulator(t *testing.T) {
 	}
 	if result.TotalCostUSD != 0 {
 		t.Errorf("expected 0 total cost, got %f", result.TotalCostUSD)
+	}
+	if result.TotalRequests != 0 {
+		t.Errorf("expected 0 total requests, got %d", result.TotalRequests)
 	}
 	if len(result.Agents) != 0 {
 		t.Errorf("expected empty agents map, got %d entries", len(result.Agents))
@@ -255,6 +264,9 @@ func TestDashboardRendersAllSections(t *testing.T) {
 	if !strings.Contains(body, "/providers/add") {
 		t.Error("expected Add Provider form in dashboard")
 	}
+	if !strings.Contains(body, "Pricing Coverage") {
+		t.Error("expected pricing coverage section in dashboard")
+	}
 	// Should contain SSE connection script
 	if !strings.Contains(body, "EventSource") {
 		t.Error("expected EventSource script for live updates")
@@ -330,6 +342,32 @@ func TestHandleProviderAddRejectsExistingProvider(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for existing provider, got %d", w.Code)
+	}
+}
+
+func TestDashboardSurfacesUnpricedRequests(t *testing.T) {
+	reg := provider.NewRegistry(t.TempDir())
+	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: "https://api.openai.com/v1", APIKey: "sk-test", Auth: "bearer"})
+	acc := cost.NewAccumulator()
+	acc.RecordWithStatus("tiverton", "openai", "unknown-model", 240, 90, 0, false)
+
+	h := NewHandler(reg, WithAccumulator(acc))
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "Requests Missing Pricing") {
+		t.Fatal("expected pricing coverage summary")
+	}
+	if !strings.Contains(body, "unknown-model") {
+		t.Fatal("expected unpriced model in coverage table")
+	}
+	if !strings.Contains(body, "unpriced") {
+		t.Fatal("expected unpriced status in dashboard")
 	}
 }
 

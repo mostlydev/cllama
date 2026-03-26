@@ -98,6 +98,9 @@
       color: var(--muted);
       font-variant-numeric: tabular-nums;
     }
+    .topbar-stat.topbar-alert {
+      color: var(--amber);
+    }
     .topbar-spend {
       font-family: "Geist Mono", monospace;
       font-size: 13px;
@@ -343,6 +346,100 @@
       font-size: 13px;
     }
 
+    /* ── pricing coverage ───────────────────────────── */
+    .coverage-wrap {
+      padding: 18px;
+    }
+    .coverage-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .coverage-card {
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 14px;
+    }
+    .coverage-card.warn {
+      border-color: rgba(240,165,0,0.35);
+      box-shadow: inset 0 0 0 1px rgba(240,165,0,0.08);
+    }
+    .coverage-value {
+      font-family: "Geist Mono", monospace;
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--ink-bright);
+      font-variant-numeric: tabular-nums;
+      margin-bottom: 4px;
+    }
+    .coverage-card.warn .coverage-value {
+      color: var(--amber);
+    }
+    .coverage-label {
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .coverage-note {
+      margin: 0 0 14px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .gap-table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .gap-table td, .gap-table th {
+      padding: 11px 14px;
+      border-bottom: 1px solid var(--line);
+      font-size: 12px;
+      vertical-align: top;
+    }
+    .gap-table tr:last-child td {
+      border-bottom: none;
+    }
+    .gap-model {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .gap-model strong {
+      font-family: "Geist Mono", monospace;
+      color: var(--ink-bright);
+      font-size: 12px;
+    }
+    .gap-model span {
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .gap-agent {
+      font-family: "Geist Mono", monospace;
+      color: var(--cyan);
+      font-size: 12px;
+    }
+    .gap-metric {
+      font-family: "Geist Mono", monospace;
+      color: var(--ink);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .gap-empty {
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
     /* ── agent cards ─────────────────────────────────── */
     .agent-grid {
       display: grid;
@@ -439,6 +536,16 @@
       border: 1px solid var(--line);
       color: var(--ink);
     }
+    .model-tag.unpriced {
+      border-color: rgba(240,165,0,0.35);
+      color: var(--amber);
+      background: rgba(240,165,0,0.08);
+    }
+    .model-tag.partial {
+      border-color: rgba(167,139,250,0.35);
+      color: var(--purple);
+      background: rgba(167,139,250,0.08);
+    }
     .no-models {
       font-family: "Geist Mono", monospace;
       font-size: 11px;
@@ -481,6 +588,7 @@
     /* ── responsive ──────────────────────────────────── */
     @media (max-width: 720px) {
       .agent-grid { grid-template-columns: 1fr; }
+      .coverage-grid { grid-template-columns: 1fr 1fr; }
       .topbar-center { display: none; }
       .topbar-stat { display: none; }
       .topbar-spend { font-size: 11px; }
@@ -495,6 +603,7 @@
     <div class="topbar-right">
       <span class="topbar-stat" data-total-requests>{{.TotalReqs}} reqs</span>
       <span class="topbar-stat" data-total-tokens>{{.TotalTokens}} tok</span>
+      <span class="topbar-stat{{if gt .UnpricedRequests 0}} topbar-alert{{end}}" data-unpriced-requests>{{.UnpricedRequests}} unpriced</span>
       <span class="topbar-spend" data-total-cost>${{printf "%.4f" .TotalCostUSD}}</span>
       <div class="live-indicator">
         <span class="live-dot"></span>
@@ -641,6 +750,70 @@
       </form>
     </section>
 
+    <!-- ── Pricing Coverage Section ─────────────────── -->
+    <section class="panel fade-in">
+      <div class="panel-header">
+        <h2 class="panel-title">Pricing Coverage</h2>
+        <span class="panel-count">{{len .PricingGaps}} gaps</span>
+      </div>
+      <div class="coverage-wrap">
+        <div class="coverage-grid">
+          <div class="coverage-card">
+            <div class="coverage-value">${{printf "%.4f" .TotalCostUSD}}</div>
+            <div class="coverage-label">Known Spend</div>
+          </div>
+          <div class="coverage-card">
+            <div class="coverage-value">{{.TotalReqs}}</div>
+            <div class="coverage-label">Observed Requests</div>
+          </div>
+          <div class="coverage-card{{if gt .UnpricedRequests 0}} warn{{end}}">
+            <div class="coverage-value">{{.UnpricedRequests}}</div>
+            <div class="coverage-label">Requests Missing Pricing</div>
+          </div>
+          <div class="coverage-card">
+            <div class="coverage-value">{{len .Agents}}</div>
+            <div class="coverage-label">Tracked Agents</div>
+          </div>
+        </div>
+
+        <p class="coverage-note">
+          Provider-reported cost is preferred when available. Requests without pricing coverage still count tokens and request volume; they are listed below instead of being silently flattened into zero.
+        </p>
+
+        {{if .PricingGaps}}
+        <table class="gap-table">
+          <thead>
+            <tr>
+              <th>Agent</th>
+              <th>Model</th>
+              <th>Requests</th>
+              <th>Tokens</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {{range .PricingGaps}}
+            <tr>
+              <td><span class="gap-agent">{{.AgentID}}</span></td>
+              <td>
+                <div class="gap-model">
+                  <strong>{{.Provider}}/{{.Model}}</strong>
+                  <span>{{.UnpricedRequests}} request(s) currently missing price coverage</span>
+                </div>
+              </td>
+              <td><span class="gap-metric">{{.Requests}}</span></td>
+              <td><span class="gap-metric">{{.TokensIn}} in / {{.TokensOut}} out</span></td>
+              <td><span class="pool-badge {{if eq .PricingStatus "partial"}}badge-disabled{{else}}badge-cooldown{{end}}">{{.PricingStatus}}</span></td>
+            </tr>
+            {{end}}
+          </tbody>
+        </table>
+        {{else}}
+        <div class="gap-empty">All observed requests currently have pricing coverage.</div>
+        {{end}}
+      </div>
+    </section>
+
     <!-- ── Agents Section ───────────────────────────── -->
     <section class="panel fade-in">
       <div class="panel-header">
@@ -678,7 +851,7 @@
           <div class="agent-models">
             <div class="agent-models-label">Models Used</div>
             {{if .Models}}
-              {{range .Models}}<span class="model-tag">{{.Provider}}/{{.Model}}</span>{{end}}
+              {{range .Models}}<span class="model-tag {{if eq .PricingStatus "unpriced"}}unpriced{{else if eq .PricingStatus "partial"}}partial{{end}}">{{.Provider}}/{{.Model}}{{if ne .PricingStatus "priced"}} · {{.PricingStatus}}{{end}}</span>{{end}}
             {{else}}
               <span class="no-models">no requests yet</span>
             {{end}}
@@ -706,6 +879,12 @@
       if (reqsEl) reqsEl.textContent = state.totalRequests + ' reqs';
       var toksEl = el('[data-total-tokens]');
       if (toksEl) toksEl.textContent = state.totalTokens + ' tok';
+      var unpricedEl = el('[data-unpriced-requests]');
+      if (unpricedEl) {
+        unpricedEl.textContent = state.unpricedRequests + ' unpriced';
+        if (state.unpricedRequests > 0) unpricedEl.classList.add('topbar-alert');
+        else unpricedEl.classList.remove('topbar-alert');
+      }
       // Update agent cards
       (state.agents || []).forEach(function(a) {
         var card = document.querySelector('[data-agent="' + a.agentId + '"]');

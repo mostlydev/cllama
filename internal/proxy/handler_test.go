@@ -235,6 +235,98 @@ func TestHandlerRecordsCostFromSSE(t *testing.T) {
 	}
 }
 
+func TestHandlerRecordsAnthropicJSONCost(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"id":"msg_01",
+			"type":"message",
+			"usage":{"input_tokens":180,"output_tokens":60}
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	acc := cost.NewAccumulator()
+	pricing := cost.DefaultPricing()
+	h := NewHandler(reg, stubContextLoaderWithToken("nano-bot", "nano-bot:dummy456"), logging.New(io.Discard),
+		WithCostTracking(acc, pricing))
+
+	body := `{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	entries := acc.ByAgent("nano-bot")
+	if len(entries) != 1 {
+		t.Fatalf("expected one cost entry, got %d", len(entries))
+	}
+	if entries[0].TotalInputTokens != 180 || entries[0].TotalOutputTokens != 60 {
+		t.Fatalf("unexpected token counts: %+v", entries[0])
+	}
+	if entries[0].TotalCostUSD <= 0 {
+		t.Fatalf("expected positive cost, got %+v", entries[0])
+	}
+	if entries[0].PricedRequests != 1 || entries[0].UnpricedRequests != 0 {
+		t.Fatalf("unexpected pricing coverage counts: %+v", entries[0])
+	}
+}
+
+func TestHandlerRecordsAnthropicSSECost(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("event: message_start\n"))
+		w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":140}}}\n\n"))
+		w.Write([]byte("event: message_delta\n"))
+		w.Write([]byte("data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":45}}\n\n"))
+		w.Write([]byte("event: message_stop\n"))
+		w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	acc := cost.NewAccumulator()
+	pricing := cost.DefaultPricing()
+	h := NewHandler(reg, stubContextLoaderWithToken("nano-bot", "nano-bot:dummy456"), logging.New(io.Discard),
+		WithCostTracking(acc, pricing))
+
+	body := `{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	entries := acc.ByAgent("nano-bot")
+	if len(entries) != 1 {
+		t.Fatalf("expected one cost entry, got %d", len(entries))
+	}
+	if entries[0].TotalInputTokens != 140 || entries[0].TotalOutputTokens != 45 {
+		t.Fatalf("unexpected token counts: %+v", entries[0])
+	}
+	if entries[0].TotalCostUSD <= 0 {
+		t.Fatalf("expected positive cost, got %+v", entries[0])
+	}
+}
+
 func TestHandlerEnablesUsageForStreamingChatCompletions(t *testing.T) {
 	var sawIncludeUsage bool
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -347,6 +439,93 @@ func TestHandlerRecordsCostFromGzipJSONResponse(t *testing.T) {
 	}
 }
 
+func TestHandlerUsesProviderReportedCostWhenAvailable(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"id":"chatcmpl-1",
+			"usage":{"prompt_tokens":100,"completion_tokens":25,"cost":0.1234}
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: backend.URL, APIKey: "sk-real", Auth: "bearer",
+	})
+
+	acc := cost.NewAccumulator()
+	pricing := cost.DefaultPricing()
+	h := NewHandler(reg, stubContextLoaderWithToken("pc-roll", "pc-roll:dummy123"), logging.New(io.Discard),
+		WithCostTracking(acc, pricing))
+
+	body := `{"model":"openrouter/google/nonexistent-model","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer pc-roll:dummy123")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	entries := acc.ByAgent("pc-roll")
+	if len(entries) != 1 {
+		t.Fatalf("expected one cost entry, got %d", len(entries))
+	}
+	if entries[0].TotalCostUSD != 0.1234 {
+		t.Fatalf("expected provider-reported cost 0.1234, got %+v", entries[0])
+	}
+	if entries[0].PricedRequests != 1 || entries[0].UnpricedRequests != 0 {
+		t.Fatalf("unexpected pricing coverage counts: %+v", entries[0])
+	}
+}
+
+func TestHandlerMarksUnknownPricingWithoutDroppingUsage(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"id":"chatcmpl-1",
+			"usage":{"prompt_tokens":240,"completion_tokens":90,"total_tokens":330}
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL, APIKey: "sk-real", Auth: "bearer",
+	})
+
+	acc := cost.NewAccumulator()
+	pricing := cost.DefaultPricing()
+	h := NewHandler(reg, stubContextLoaderWithToken("pc-roll", "pc-roll:dummy123"), logging.New(io.Discard),
+		WithCostTracking(acc, pricing))
+
+	body := `{"model":"openai/nonexistent-model","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer pc-roll:dummy123")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	entries := acc.ByAgent("pc-roll")
+	if len(entries) != 1 {
+		t.Fatalf("expected one cost entry, got %d", len(entries))
+	}
+	if entries[0].TotalInputTokens != 240 || entries[0].TotalOutputTokens != 90 {
+		t.Fatalf("unexpected token counts: %+v", entries[0])
+	}
+	if entries[0].TotalCostUSD != 0 {
+		t.Fatalf("expected zero known cost for unknown pricing, got %+v", entries[0])
+	}
+	if entries[0].PricedRequests != 0 || entries[0].UnpricedRequests != 1 {
+		t.Fatalf("unexpected pricing coverage counts: %+v", entries[0])
+	}
+}
+
 func TestHandlerForwardsAnthropicMessages(t *testing.T) {
 	var gotAPIKey string
 	var gotVersion string
@@ -449,7 +628,7 @@ func TestHandlerInjectsFeedsIntoOpenAI(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# I"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"weston:secret","pod":"test-pod"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"weston:secret","pod":"test-pod","timezone":"America/New_York"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -496,6 +675,9 @@ func TestHandlerInjectsFeedsIntoOpenAI(t *testing.T) {
 	}
 	first := messages[0].(map[string]any)
 	content, _ := first["content"].(string)
+	if !strings.HasPrefix(content, "Current time: ") {
+		t.Errorf("expected current time at top of system content, got: %s", content)
+	}
 	if !strings.Contains(content, "Wallet: $5,000") {
 		t.Errorf("expected feed content in first message, got: %s", content)
 	}
@@ -525,7 +707,7 @@ func TestHandlerInjectsFeedsIntoAnthropic(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# I"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"nano-bot:secret456"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"nano-bot:secret456","timezone":"America/New_York"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -568,6 +750,9 @@ func TestHandlerInjectsFeedsIntoAnthropic(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	sys, _ := payload["system"].(string)
+	if !strings.HasPrefix(sys, "Current time: ") {
+		t.Errorf("expected current time at top of system content, got: %q", sys)
+	}
 	if !strings.Contains(sys, "Fleet nominal") {
 		t.Errorf("expected feed in system field, got: %q", sys)
 	}
@@ -585,7 +770,7 @@ func TestHandlerNoFeedsStillWorks(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# I"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"bare-agent:secret"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"bare-agent:secret","timezone":"UTC"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -627,8 +812,16 @@ func TestHandlerNoFeedsStillWorks(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	messages, _ := payload["messages"].([]any)
-	if len(messages) != 1 {
-		t.Errorf("expected 1 message (no feeds), got %d", len(messages))
+	if len(messages) != 2 {
+		t.Errorf("expected 2 messages (time + user), got %d", len(messages))
+	}
+	first := messages[0].(map[string]any)
+	if first["role"] != "system" {
+		t.Fatalf("expected first message to be system, got %q", first["role"])
+	}
+	content, _ := first["content"].(string)
+	if !strings.HasPrefix(content, "Current time: ") {
+		t.Errorf("expected current time system message, got: %q", content)
 	}
 }
 
@@ -743,10 +936,10 @@ func TestHandlerMarksDeadOn429QuotaExhausted(t *testing.T) {
 
 func TestClassifyResponse(t *testing.T) {
 	cases := []struct {
-		name     string
-		status   int
-		body     string
-		want     responseClass
+		name   string
+		status int
+		body   string
+		want   responseClass
 	}{
 		{"401 → auth", 401, "", classAuth},
 		{"403 → auth", 403, "", classAuth},

@@ -24,6 +24,9 @@ func TestAccumulatorRecordAndQuery(t *testing.T) {
 	if entry.RequestCount != 2 {
 		t.Errorf("expected 2 requests, got %d", entry.RequestCount)
 	}
+	if entry.PricedRequests != 2 || entry.UnpricedRequests != 0 {
+		t.Errorf("expected priced=2 unpriced=0, got priced=%d unpriced=%d", entry.PricedRequests, entry.UnpricedRequests)
+	}
 }
 
 func TestAccumulatorAllAgents(t *testing.T) {
@@ -44,5 +47,28 @@ func TestAccumulatorTotalCost(t *testing.T) {
 	total := a.TotalCost()
 	if total < 0.002 || total > 0.004 {
 		t.Errorf("expected ~0.003, got %f", total)
+	}
+}
+
+func TestAccumulatorTracksUnpricedRequests(t *testing.T) {
+	a := NewAccumulator()
+	a.RecordWithStatus("tiverton", "openrouter", "unknown/model", 500, 100, 0, false)
+
+	summary := a.ByAgent("tiverton")
+	if len(summary) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(summary))
+	}
+	entry := summary[0]
+	if entry.PricedRequests != 0 {
+		t.Errorf("expected 0 priced requests, got %d", entry.PricedRequests)
+	}
+	if entry.UnpricedRequests != 1 {
+		t.Errorf("expected 1 unpriced request, got %d", entry.UnpricedRequests)
+	}
+	if got := a.TotalUnpricedRequests(); got != 1 {
+		t.Errorf("expected total unpriced requests=1, got %d", got)
+	}
+	if got := a.TotalRequests(); got != 1 {
+		t.Errorf("expected total requests=1, got %d", got)
 	}
 }

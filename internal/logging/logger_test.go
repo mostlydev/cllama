@@ -52,8 +52,9 @@ func TestLogResponseIncludesLatency(t *testing.T) {
 func TestLogResponseIncludesCostFields(t *testing.T) {
 	var buf bytes.Buffer
 	l := New(&buf)
+	costUSD := 0.0105
 	l.LogResponseWithCost("tiverton", "anthropic/claude-sonnet-4", 200, 1250,
-		&CostInfo{InputTokens: 100, OutputTokens: 50, CostUSD: 0.0105})
+		&CostInfo{InputTokens: 100, OutputTokens: 50, CostUSD: &costUSD})
 
 	var entry map[string]interface{}
 	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
@@ -81,6 +82,24 @@ func TestLogResponseWithoutCost(t *testing.T) {
 	}
 	if _, ok := entry["tokens_in"]; ok {
 		t.Error("expected no tokens_in when CostInfo is nil")
+	}
+}
+
+func TestLogResponseWithUsageButUnknownCost(t *testing.T) {
+	var buf bytes.Buffer
+	l := New(&buf)
+	l.LogResponseWithCost("tiverton", "anthropic/claude-sonnet-4", 200, 500,
+		&CostInfo{InputTokens: 321, OutputTokens: 89})
+
+	var entry map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if entry["tokens_in"].(float64) != 321 {
+		t.Errorf("expected tokens_in=321, got %v", entry["tokens_in"])
+	}
+	if _, ok := entry["cost_usd"]; ok {
+		t.Error("expected cost_usd to be omitted when unknown")
 	}
 }
 

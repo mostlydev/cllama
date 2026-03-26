@@ -28,18 +28,18 @@ type entry struct {
 	Intervention *string  `json:"intervention"`
 	Error        string   `json:"error,omitempty"`
 	// provider_pool event fields
-	Provider      string  `json:"provider,omitempty"`
-	KeyID         string  `json:"key_id,omitempty"`
-	Action        string  `json:"action,omitempty"`
-	Reason        string  `json:"reason,omitempty"`
-	CooldownUntil string  `json:"cooldown_until,omitempty"`
+	Provider      string `json:"provider,omitempty"`
+	KeyID         string `json:"key_id,omitempty"`
+	Action        string `json:"action,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+	CooldownUntil string `json:"cooldown_until,omitempty"`
 }
 
 // CostInfo holds token counts and estimated cost for a single LLM request.
 type CostInfo struct {
 	InputTokens  int
 	OutputTokens int
-	CostUSD      float64
+	CostUSD      *float64
 }
 
 func New(w io.Writer) *Logger {
@@ -103,7 +103,9 @@ func (l *Logger) LogResponseWithCost(clawID, model string, statusCode int, laten
 	if ci != nil {
 		e.TokensIn = ptrInt(ci.InputTokens)
 		e.TokensOut = ptrInt(ci.OutputTokens)
-		e.CostUSD = ptrF64(ci.CostUSD)
+		if ci.CostUSD != nil {
+			e.CostUSD = ci.CostUSD
+		}
 	}
 	l.log(e)
 }
@@ -142,14 +144,14 @@ func (l *Logger) LogFeedFetch(clawID, feedName, feedURL string, statusCode int, 
 // action is one of: "cooldown", "dead", "activated", "added", "deleted".
 func (l *Logger) LogProviderPool(provider, keyID, action, reason, cooldownUntil string) {
 	e := entry{
-		TS:           time.Now().UTC().Format(time.RFC3339),
-		Type:         "provider_pool",
-		Provider:     provider,
-		KeyID:        keyID,
-		Action:       action,
-		Reason:       reason,
+		TS:            time.Now().UTC().Format(time.RFC3339),
+		Type:          "provider_pool",
+		Provider:      provider,
+		KeyID:         keyID,
+		Action:        action,
+		Reason:        reason,
 		CooldownUntil: cooldownUntil,
-		Intervention: nil,
+		Intervention:  nil,
 	}
 	l.log(e)
 }
