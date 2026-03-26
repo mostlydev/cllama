@@ -101,6 +101,7 @@ docker run -p 8080:8080 -p 8081:8081 \
 | `CLAW_CONTEXT_ROOT` | `/claw/context` | Per-agent context mount |
 | `CLAW_AUTH_DIR` | `/claw/auth` | Provider credentials |
 | `CLAW_POD` | | Pod name (dashboard display) |
+| `CLAW_SESSION_HISTORY_DIR` | `/claw/session-history` | Per-agent JSONL session history base dir. When set, cllama appends one entry per successful 2xx upstream completion to `<dir>/<agent-id>/history.jsonl`. |
 | `OPENAI_API_KEY` | | Provider key override |
 | `ANTHROPIC_API_KEY` | | Provider key override |
 | `OPENROUTER_API_KEY` | | Provider key override |
@@ -215,6 +216,48 @@ Every request/response pair emits a structured JSON log line to stdout:
 `intervention` is always `null` in passthrough mode. Policy proxies will populate it with the rule that triggered an amendment, drop, or reroute — the raw material for drift scoring.
 
 These logs feed `docker compose logs`, fleet telemetry pipelines, and `claw audit`.
+
+---
+
+## Session History
+
+When `CLAW_SESSION_HISTORY_DIR` is set, cllama writes a durable JSONL session history for each agent. This is separate from the structured audit logs emitted to stdout.
+
+### Layout
+
+```
+/claw/session-history/
+├── tiverton/
+│   └── history.jsonl
+├── westin/
+│   └── history.jsonl
+```
+
+One file per agent. Each line is one entry, appended on every successful upstream completion (HTTP 2xx). Non-2xx responses are not recorded here — they appear only in the stdout audit log.
+
+### Entry fields
+
+| Field | Description |
+|---|---|
+| `version` | Schema version (`1`). |
+| `ts` | RFC3339 timestamp of when the response was received. |
+| `claw_id` | Agent ID. |
+| `path` | Request path (e.g., `/v1/chat/completions`). |
+| `requested_model` | Model string as sent by the agent. |
+| `effective_provider` | Provider name after routing. |
+| `effective_model` | Model forwarded to the upstream. |
+| `status_code` | HTTP status code from upstream. |
+| `stream` | Whether the response was streamed (SSE). |
+| `request_original` | Request body as received from the agent. |
+| `request_effective` | Request body as forwarded to the upstream (after credential swap and model rewrite). |
+| `response` | `{format, json?, text?}` — `format` is `"json"` or `"sse"`. JSON responses include `json` (parsed body); SSE responses include `text` (raw event stream). |
+| `usage` | `{prompt_tokens, completion_tokens}` extracted from the response. |
+
+### Clawdapus wiring
+
+When orchestrated by Clawdapus, `claw up` automatically bind-mounts `.claw-session-history/` (relative to the pod file) into the cllama container at `/claw/session-history` whenever cllama is enabled for any service in the pod. No manual volume configuration is required.
+
+Session history is infrastructure-owned. Agents do not write to it and have no read API against it in Phase 1. The JSONL files are accessible to operators via the host filesystem for offline analysis and auditing.
 
 ---
 
