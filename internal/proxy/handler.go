@@ -19,6 +19,7 @@ import (
 	"github.com/mostlydev/cllama/internal/identity"
 	"github.com/mostlydev/cllama/internal/logging"
 	"github.com/mostlydev/cllama/internal/provider"
+	"github.com/mostlydev/cllama/internal/sessionhistory"
 )
 
 // ContextLoader resolves per-agent context by ID.
@@ -26,14 +27,15 @@ type ContextLoader func(agentID string) (*agentctx.AgentContext, error)
 
 // Handler proxies OpenAI-compatible chat requests to upstream providers.
 type Handler struct {
-	registry    *provider.Registry
-	loadContext ContextLoader
-	client      *http.Client
-	logger      *logging.Logger
-	notifier    *alert.Notifier
-	accumulator *cost.Accumulator
-	pricing     *cost.Pricing
-	feedFetcher *feeds.Fetcher
+	registry        *provider.Registry
+	loadContext     ContextLoader
+	client          *http.Client
+	logger          *logging.Logger
+	notifier        *alert.Notifier
+	accumulator     *cost.Accumulator
+	pricing         *cost.Pricing
+	feedFetcher     *feeds.Fetcher
+	sessionRecorder *sessionhistory.Recorder
 }
 
 // HandlerOption configures optional Handler behaviour.
@@ -58,6 +60,16 @@ func WithFeeds(podName string) HandlerOption {
 func WithNotifier(n *alert.Notifier) HandlerOption {
 	return func(h *Handler) {
 		h.notifier = n
+	}
+}
+
+// WithSessionHistory enables session recording to dir. If dir is empty, this
+// option is a no-op.
+func WithSessionHistory(dir string) HandlerOption {
+	return func(h *Handler) {
+		if dir != "" {
+			h.sessionRecorder = sessionhistory.New(dir)
+		}
 	}
 }
 
@@ -194,7 +206,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		return
 	}
 
-	h.dispatchWithRetry(w, r, agentID, providerName, requestedModel, upstreamModel, outBody, start)
+	h.dispatchWithRetry(w, r, agentID, providerName, requestedModel, upstreamModel, outBody, inBody, start)
 }
 
 // resolveOpenAIProvider maps a parsed provider name to the actual provider name
@@ -254,13 +266,13 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	h.dispatchWithRetry(w, r, agentID, "anthropic", requestedModel, requestedModel, outBody, start)
+	h.dispatchWithRetry(w, r, agentID, "anthropic", requestedModel, requestedModel, outBody, inBody, start)
 }
 
 // dispatchWithRetry selects a key, dispatches the request, and retries on key-level
 // failures (401/403/402/quota-429 → dead, rate-limit-429 → cooldown).
 // 5xx and transport errors do NOT cause key state changes.
-func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID, providerName, requestedModel, upstreamModel string, outBody []byte, start time.Time) {
+func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID, providerName, requestedModel, upstreamModel string, outBody []byte, requestOriginal []byte, start time.Time) {
 	const maxKeyAttempts = 5
 
 	for attempt := 0; attempt < maxKeyAttempts; attempt++ {
@@ -348,7 +360,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 
 		default:
 			// Success or 5xx: stream response back, no key state change.
-			h.streamResponse(w, resp, agentID, providerName, requestedModel, upstreamModel, start)
+			h.streamResponse(w, resp, agentID, providerName, requestedModel, upstreamModel, r.URL.Path, requestOriginal, outBody, start)
 			return
 		}
 	}
@@ -442,7 +454,7 @@ func applyProviderAuth(outReq *http.Request, prov *provider.Provider) error {
 }
 
 // streamResponse forwards the upstream response to the client and logs it.
-func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, agentID, providerName, requestedModel, upstreamModel string, start time.Time) {
+func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, agentID, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time) {
 	defer resp.Body.Close()
 
 	copyResponseHeaders(w.Header(), resp.Header)
@@ -455,29 +467,58 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 		return
 	}
 
-	var costInfo *logging.CostInfo
-	if h.accumulator != nil {
-		captured := responseBuf.Bytes()
-		var usage cost.Usage
+	captured := responseBuf.Bytes()
+
+	var usage cost.Usage
+	if h.accumulator != nil || h.sessionRecorder != nil {
 		if isSSE(resp.Header) {
 			usage, _ = cost.ExtractUsageFromSSE(captured)
 		} else {
 			usage, _ = cost.ExtractUsage(captured)
 		}
-		if usage.PromptTokens > 0 || usage.CompletionTokens > 0 || usage.ReportedCostUSD != nil {
-			costUSD, costKnown := h.resolveCost(providerName, upstreamModel, usage)
-			h.accumulator.RecordWithStatus(agentID, providerName, upstreamModel,
-				usage.PromptTokens, usage.CompletionTokens, costUSD, costKnown)
-			var loggedCostUSD *float64
-			if costKnown {
-				loggedCostUSD = &costUSD
-			}
-			costInfo = &logging.CostInfo{
-				InputTokens:  usage.PromptTokens,
-				OutputTokens: usage.CompletionTokens,
-				CostUSD:      loggedCostUSD,
-			}
+	}
+
+	var costInfo *logging.CostInfo
+	if h.accumulator != nil && (usage.PromptTokens > 0 || usage.CompletionTokens > 0 || usage.ReportedCostUSD != nil) {
+		costUSD, costKnown := h.resolveCost(providerName, upstreamModel, usage)
+		h.accumulator.RecordWithStatus(agentID, providerName, upstreamModel,
+			usage.PromptTokens, usage.CompletionTokens, costUSD, costKnown)
+		var loggedCostUSD *float64
+		if costKnown {
+			loggedCostUSD = &costUSD
 		}
+		costInfo = &logging.CostInfo{
+			InputTokens:  usage.PromptTokens,
+			OutputTokens: usage.CompletionTokens,
+			CostUSD:      loggedCostUSD,
+		}
+	}
+
+	if h.sessionRecorder != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		var responsePayload sessionhistory.Payload
+		if isSSE(resp.Header) {
+			responsePayload = sessionhistory.Payload{Format: "sse", Text: string(captured)}
+		} else {
+			responsePayload = sessionhistory.Payload{Format: "json", JSON: json.RawMessage(captured)}
+		}
+		_ = h.sessionRecorder.Record(agentID, sessionhistory.Entry{
+			Version:           1,
+			ClawID:            agentID,
+			Path:              requestPath,
+			RequestedModel:    requestedModel,
+			EffectiveProvider: providerName,
+			EffectiveModel:    upstreamModel,
+			StatusCode:        resp.StatusCode,
+			Stream:            isSSE(resp.Header),
+			RequestOriginal:   json.RawMessage(requestOriginal),
+			RequestEffective:  json.RawMessage(requestEffective),
+			Response:          responsePayload,
+			Usage: sessionhistory.Usage{
+				PromptTokens:     usage.PromptTokens,
+				CompletionTokens: usage.CompletionTokens,
+				ReportedCostUSD:  usage.ReportedCostUSD,
+			},
+		})
 	}
 
 	latency := time.Since(start).Milliseconds()

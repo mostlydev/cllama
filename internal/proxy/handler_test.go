@@ -988,6 +988,147 @@ func TestParseCooldownDuration(t *testing.T) {
 	}
 }
 
+func TestHandlerRecordsSessionHistoryJSON(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithToken("tiverton", "tiverton:dummy123"), logging.New(io.Discard),
+		WithSessionHistory(histDir))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	histFile := filepath.Join(histDir, "tiverton", "history.jsonl")
+	data, err := os.ReadFile(histFile)
+	if err != nil {
+		t.Fatalf("expected history file to exist: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("history file is empty")
+	}
+
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(data, "\n"), &entry); err != nil {
+		t.Fatalf("unmarshal history entry: %v", err)
+	}
+	if entry["claw_id"] != "tiverton" {
+		t.Errorf("expected claw_id=tiverton, got %v", entry["claw_id"])
+	}
+	if entry["requested_model"] != "openai/gpt-4o" {
+		t.Errorf("expected requested_model=openai/gpt-4o, got %v", entry["requested_model"])
+	}
+	resp, _ := entry["response"].(map[string]any)
+	if resp == nil {
+		t.Fatal("expected response field in entry")
+	}
+	if resp["format"] != "json" {
+		t.Errorf("expected response.format=json, got %v", resp["format"])
+	}
+}
+
+func TestHandlerRecordsSessionHistorySSE(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithToken("tiverton", "tiverton:dummy123"), logging.New(io.Discard),
+		WithSessionHistory(histDir))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	histFile := filepath.Join(histDir, "tiverton", "history.jsonl")
+	data, err := os.ReadFile(histFile)
+	if err != nil {
+		t.Fatalf("expected history file to exist: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("history file is empty")
+	}
+
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(data, "\n"), &entry); err != nil {
+		t.Fatalf("unmarshal history entry: %v", err)
+	}
+	resp, _ := entry["response"].(map[string]any)
+	if resp == nil {
+		t.Fatal("expected response field in entry")
+	}
+	if resp["format"] != "sse" {
+		t.Errorf("expected response.format=sse, got %v", resp["format"])
+	}
+	text, _ := resp["text"].(string)
+	if text == "" {
+		t.Errorf("expected non-empty response.text for SSE entry")
+	}
+}
+
+func TestHandlerSkipsSessionHistoryOnUpstreamError(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"internal error"}}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithToken("tiverton", "tiverton:dummy123"), logging.New(io.Discard),
+		WithSessionHistory(histDir))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	histFile := filepath.Join(histDir, "tiverton", "history.jsonl")
+	if _, err := os.Stat(histFile); err == nil {
+		t.Fatal("expected no history file created for upstream 500 response")
+	}
+}
+
 func stubContextLoaderWithToken(agentID, token string) ContextLoader {
 	return func(id string) (*agentctx.AgentContext, error) {
 		if id != agentID {
