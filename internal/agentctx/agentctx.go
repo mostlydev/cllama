@@ -14,6 +14,7 @@ type AgentContext struct {
 	AgentsMD    []byte
 	ClawdapusMD []byte
 	Metadata    map[string]any
+	ModelPolicy *ModelPolicy
 }
 
 // Load reads an agent's context files from contextRoot/<agentID>/.
@@ -39,6 +40,12 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 	if err := json.Unmarshal(metaRaw, &meta); err != nil {
 		return nil, fmt.Errorf("load agent context %q: parse metadata: %w", agentID, err)
 	}
+	var typed struct {
+		ModelPolicy *ModelPolicy `json:"model_policy"`
+	}
+	if err := json.Unmarshal(metaRaw, &typed); err != nil {
+		return nil, fmt.Errorf("load agent context %q: parse typed metadata: %w", agentID, err)
+	}
 
 	return &AgentContext{
 		AgentID:     agentID,
@@ -46,6 +53,7 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 		AgentsMD:    agentsMD,
 		ClawdapusMD: clawdapusMD,
 		Metadata:    meta,
+		ModelPolicy: typed.ModelPolicy,
 	}, nil
 }
 
@@ -65,6 +73,31 @@ func (a *AgentContext) MetadataString(key string) string {
 	}
 	v, _ := a.Metadata[key].(string)
 	return v
+}
+
+func (a *AgentContext) HasPolicy() bool {
+	return a != nil && a.ModelPolicy.HasPolicy()
+}
+
+func (a *AgentContext) DefaultModel() string {
+	if a == nil || a.ModelPolicy == nil {
+		return ""
+	}
+	return a.ModelPolicy.DefaultModel()
+}
+
+func (a *AgentContext) AllowedModelRefs() []string {
+	if a == nil || a.ModelPolicy == nil {
+		return nil
+	}
+	return a.ModelPolicy.AllowedModelRefs()
+}
+
+func (a *AgentContext) FailoverRefs() []string {
+	if a == nil || a.ModelPolicy == nil {
+		return nil
+	}
+	return a.ModelPolicy.FailoverRefs()
 }
 
 // FeedsPath returns the path to the agent's feeds.json manifest.
