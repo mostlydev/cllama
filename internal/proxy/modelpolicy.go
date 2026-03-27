@@ -53,11 +53,22 @@ func (h *Handler) resolveAnthropicExecution(agentCtx *agentctx.AgentContext, req
 		if requestedModel == "" {
 			return modelResolution{}, fmt.Errorf("missing model")
 		}
+		upstreamModel := requestedModel
+		if strings.Contains(requestedModel, "/") {
+			providerName, strippedModel, err := splitModel(requestedModel)
+			if err != nil {
+				return modelResolution{}, err
+			}
+			if providerName != "anthropic" {
+				return modelResolution{}, fmt.Errorf("model must target anthropic on /v1/messages")
+			}
+			upstreamModel = strippedModel
+		}
 		return modelResolution{
 			ChosenRef: requestedModel,
 			Candidates: []dispatchCandidate{{
 				ProviderName:  "anthropic",
-				UpstreamModel: requestedModel,
+				UpstreamModel: upstreamModel,
 			}},
 		}, nil
 	}
@@ -292,6 +303,9 @@ func candidateRefsFromPolicy(policy *agentctx.ModelPolicy, chosenRef string) []s
 		return []string{chosenRef}
 	}
 	failover := policy.FailoverRefs()
+	if len(failover) == 0 {
+		return []string{chosenRef}
+	}
 	for i, ref := range failover {
 		if ref == chosenRef {
 			out := make([]string, 0, len(failover)-i)
@@ -299,5 +313,12 @@ func candidateRefsFromPolicy(policy *agentctx.ModelPolicy, chosenRef string) []s
 			return out
 		}
 	}
-	return []string{chosenRef}
+	out := []string{chosenRef}
+	for _, ref := range failover {
+		if ref == chosenRef {
+			continue
+		}
+		out = append(out, ref)
+	}
+	return out
 }

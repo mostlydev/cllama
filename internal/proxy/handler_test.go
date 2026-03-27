@@ -135,6 +135,7 @@ func TestHandlerFallsBackToOpenRouterForVendorPrefixedModel(t *testing.T) {
 }
 
 func TestHandlerNormalizesBareModelAgainstPolicy(t *testing.T) {
+	var logs bytes.Buffer
 	var gotBody []byte
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var err error
@@ -158,7 +159,7 @@ func TestHandlerNormalizesBareModelAgainstPolicy(t *testing.T) {
 			{Slot: "primary", Ref: "xai/grok-4.1-fast"},
 		},
 	}
-	h := NewHandler(reg, stubContextLoaderWithPolicy("weston", "weston:dummy123", policy), nil)
+	h := NewHandler(reg, stubContextLoaderWithPolicy("weston", "weston:dummy123", policy), logging.New(&logs))
 	body := `{"model":"grok-4.1-fast","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer weston:dummy123")
@@ -177,9 +178,11 @@ func TestHandlerNormalizesBareModelAgainstPolicy(t *testing.T) {
 	if payload["model"] != "grok-4.1-fast" {
 		t.Fatalf("expected normalized upstream model grok-4.1-fast, got %#v", payload["model"])
 	}
+	assertInterventionLogged(t, logs.Bytes(), "bare_model_normalized")
 }
 
 func TestHandlerFailsoverToDeclaredFallbackAndRebuildsBodyPerCandidate(t *testing.T) {
+	var logs bytes.Buffer
 	primaryBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "5")
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -214,7 +217,7 @@ func TestHandlerFailsoverToDeclaredFallbackAndRebuildsBodyPerCandidate(t *testin
 			{Slot: "fallback", Ref: "openrouter/anthropic/claude-haiku-4-5"},
 		},
 	}
-	h := NewHandler(reg, stubContextLoaderWithPolicy("weston", "weston:dummy123", policy), nil)
+	h := NewHandler(reg, stubContextLoaderWithPolicy("weston", "weston:dummy123", policy), logging.New(&logs))
 	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer weston:dummy123")
@@ -233,6 +236,7 @@ func TestHandlerFailsoverToDeclaredFallbackAndRebuildsBodyPerCandidate(t *testin
 	if payload["model"] != "anthropic/claude-haiku-4-5" {
 		t.Fatalf("expected fallback model in rebuilt body, got %#v", payload["model"])
 	}
+	assertInterventionLogged(t, logs.Bytes(), "provider_exhausted_failover")
 }
 
 func TestHandlerAnthropicPolicyClampsMissingModelToPrimary(t *testing.T) {
@@ -281,6 +285,46 @@ func TestHandlerAnthropicPolicyClampsMissingModelToPrimary(t *testing.T) {
 	}
 }
 
+func TestHandlerAnthropicNoPolicyStripsProviderPrefix(t *testing.T) {
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_01","type":"message","content":[{"type":"text","text":"hello"}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithToken("nano-bot", "nano-bot:dummy456"), nil)
+	body := `{"model":"anthropic/claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("x-api-key", "nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal backend body: %v", err)
+	}
+	if payload["model"] != "claude-sonnet-4-20250514" {
+		t.Fatalf("expected stripped anthropic model, got %#v", payload["model"])
+	}
+}
+
 func TestHandlerAnthropicPolicyRejectsUnsupportedProviderBridge(t *testing.T) {
 	reg := provider.NewRegistry("")
 	reg.Set("anthropic", &provider.Provider{
@@ -308,6 +352,101 @@ func TestHandlerAnthropicPolicyRejectsUnsupportedProviderBridge(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "anthropic-compatible") {
 		t.Fatalf("expected clear anthropic compatibility error, got %s", w.Body.String())
+	}
+}
+
+func TestHandlerMissingModelClampsToDefaultAndLogsIntervention(t *testing.T) {
+	var logs bytes.Buffer
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "openai/gpt-4o"},
+		},
+	}
+	h := NewHandler(reg, stubContextLoaderWithPolicy("weston", "weston:dummy123", policy), logging.New(&logs))
+	body := `{"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer weston:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal backend body: %v", err)
+	}
+	if payload["model"] != "gpt-4o" {
+		t.Fatalf("expected default upstream model gpt-4o, got %#v", payload["model"])
+	}
+	assertInterventionLogged(t, logs.Bytes(), "missing")
+}
+
+func TestHandlerDoesNotAdvanceCandidatesOnUpstream500(t *testing.T) {
+	var fallbackCalls int
+	primaryBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"upstream exploded"}}`))
+	}))
+	defer primaryBackend.Close()
+
+	fallbackBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-2","choices":[{"message":{"content":"fallback"}}]}`))
+	}))
+	defer fallbackBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: primaryBackend.URL + "/v1", APIKey: "sk-openai", Auth: "bearer",
+	})
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: fallbackBackend.URL + "/v1", APIKey: "sk-or", Auth: "bearer",
+	})
+
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "openai/gpt-4o"},
+			{Slot: "fallback", Ref: "openrouter/anthropic/claude-haiku-4-5"},
+		},
+	}
+	h := NewHandler(reg, stubContextLoaderWithPolicy("weston", "weston:dummy123", policy), nil)
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer weston:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected upstream 500 to pass through, got %d: %s", w.Code, w.Body.String())
+	}
+	if fallbackCalls != 0 {
+		t.Fatalf("expected no fallback calls on upstream 500, got %d", fallbackCalls)
 	}
 }
 
@@ -1378,4 +1517,32 @@ func stubContextLoaderWithPolicy(agentID, token string, policy *agentctx.ModelPo
 			ModelPolicy: policy,
 		}, nil
 	}
+}
+
+func assertInterventionLogged(t *testing.T, raw []byte, reason string) {
+	t.Helper()
+	entries := parseLogEntries(t, raw)
+	for _, entry := range entries {
+		if entry["type"] == "intervention" && entry["intervention"] == reason {
+			return
+		}
+	}
+	t.Fatalf("expected intervention %q in logs, got %v", reason, entries)
+}
+
+func parseLogEntries(t *testing.T, raw []byte) []map[string]any {
+	t.Helper()
+	lines := bytes.Split(bytes.TrimSpace(raw), []byte("\n"))
+	entries := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			t.Fatalf("unmarshal log entry: %v\nraw: %s", err, string(line))
+		}
+		entries = append(entries, entry)
+	}
+	return entries
 }
