@@ -607,6 +607,42 @@ func TestHandlerAnthropicRejectsUnknownAgent(t *testing.T) {
 	}
 }
 
+func TestHandlerAnthropicAcceptsIncomingXAPIKeyAgentAuth(t *testing.T) {
+	var gotAuth, gotAPIKey string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotAPIKey = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_01","type":"message","content":[{"type":"text","text":"hello"}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithToken("nano-bot", "nano-bot:dummy456"), nil)
+	body := `{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("x-api-key", "nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if gotAPIKey != "sk-ant-real" {
+		t.Errorf("expected backend x-api-key=sk-ant-real, got %q", gotAPIKey)
+	}
+	if gotAuth != "" {
+		t.Errorf("expected no backend Authorization header for anthropic auth, got %q", gotAuth)
+	}
+}
+
 func TestHandlerInjectsFeedsIntoOpenAI(t *testing.T) {
 	feedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("Wallet: $5,000 cash | $20,000 invested"))

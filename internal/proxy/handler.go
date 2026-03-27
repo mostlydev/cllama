@@ -138,7 +138,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	agentID, secret, err := identity.ParseBearer(r.Header.Get("Authorization"))
+	agentAuth := r.Header.Get("Authorization")
+	if strings.TrimSpace(agentAuth) == "" {
+		if xAPIKey := strings.TrimSpace(r.Header.Get("x-api-key")); xAPIKey != "" {
+			agentAuth = "Bearer " + xAPIKey
+		}
+	}
+	agentID, secret, err := identity.ParseBearer(agentAuth)
 	if err != nil {
 		h.fail(w, http.StatusUnauthorized, "invalid bearer token", "", "", start, err)
 		return
