@@ -38,6 +38,9 @@ func TestLoadReadsAllFiles(t *testing.T) {
 	if ctx.MetadataToken() != "tiverton:secret" {
 		t.Errorf("wrong token: %q", ctx.MetadataToken())
 	}
+	if ctx.HasPolicy() {
+		t.Fatal("expected no model policy")
+	}
 }
 
 func TestLoadMissingDirErrors(t *testing.T) {
@@ -74,5 +77,55 @@ func TestAgentContextFeedsPath(t *testing.T) {
 	expected := filepath.Join(agentDir, "feeds.json")
 	if ctx.FeedsPath() != expected {
 		t.Errorf("expected %q, got %q", expected, ctx.FeedsPath())
+	}
+}
+
+func TestLoadParsesModelPolicyAccessors(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "logan")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{
+		"token":"logan:secret",
+		"model_policy":{
+			"mode":"clamp",
+			"allowed":[
+				{"slot":"primary","ref":"xai/grok-4.1-fast"},
+				{"slot":"fallback","ref":"anthropic/claude-haiku-4-5"},
+				{"slot":"analysis","ref":"openai/gpt-4o-mini"}
+			]
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(meta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "logan")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ctx.HasPolicy() {
+		t.Fatal("expected model policy to be present")
+	}
+	if ctx.DefaultModel() != "xai/grok-4.1-fast" {
+		t.Fatalf("unexpected default model: %q", ctx.DefaultModel())
+	}
+	allowed := ctx.AllowedModelRefs()
+	if len(allowed) != 3 {
+		t.Fatalf("expected 3 allowed refs, got %d", len(allowed))
+	}
+	failover := ctx.FailoverRefs()
+	if len(failover) != 2 {
+		t.Fatalf("expected 2 failover refs, got %d", len(failover))
+	}
+	if failover[0] != "xai/grok-4.1-fast" || failover[1] != "anthropic/claude-haiku-4-5" {
+		t.Fatalf("unexpected failover refs: %#v", failover)
 	}
 }

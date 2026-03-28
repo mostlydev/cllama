@@ -35,16 +35,16 @@ func seedV2(t *testing.T, dir string, keys ...map[string]any) {
 
 func readyKey(id, label, secret string) map[string]any {
 	return map[string]any{
-		"id":               id,
-		"label":            label,
-		"secret":           secret,
-		"source":           "seed",
-		"state":            "ready",
-		"cooldown_until":   "",
-		"last_error_code":  0,
+		"id":                id,
+		"label":             label,
+		"secret":            secret,
+		"source":            "seed",
+		"state":             "ready",
+		"cooldown_until":    "",
+		"last_error_code":   0,
 		"last_error_reason": "",
-		"last_error_at":    "",
-		"added_at":         "2026-03-23T12:00:00Z",
+		"last_error_at":     "",
+		"added_at":          "2026-03-23T12:00:00Z",
 	}
 }
 
@@ -52,6 +52,7 @@ func readyKey(id, label, secret string) map[string]any {
 
 func TestLoadFromEnvSetsDefaultFields(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "sk-test-openai")
+	t.Setenv("XAI_API_KEY", "xai-test")
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
 
 	r := NewRegistry("")
@@ -86,6 +87,23 @@ func TestLoadFromEnvSetsDefaultFields(t *testing.T) {
 	}
 	if p2.APIFormat != "anthropic" {
 		t.Errorf("expected anthropic api_format=anthropic, got %q", p2.APIFormat)
+	}
+
+	px, err := r.Get("xai")
+	if err != nil {
+		t.Fatalf("xai: %v", err)
+	}
+	if px.APIKey != "xai-test" {
+		t.Errorf("expected xai key, got %q", px.APIKey)
+	}
+	if px.BaseURL != "https://api.x.ai/v1" {
+		t.Errorf("unexpected xai base URL: %q", px.BaseURL)
+	}
+	if px.Auth != "bearer" {
+		t.Errorf("expected xai auth=bearer, got %q", px.Auth)
+	}
+	if px.APIFormat != "openai" {
+		t.Errorf("expected xai api_format=openai, got %q", px.APIFormat)
 	}
 }
 

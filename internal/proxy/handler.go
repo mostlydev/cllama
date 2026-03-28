@@ -189,38 +189,24 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
-	if requestedModel == "" {
-		h.fail(w, http.StatusBadRequest, "missing model field", agentID, "", start, fmt.Errorf("missing model"))
-		return
-	}
-
-	providerName, upstreamModel, err := splitModel(requestedModel)
+	resolution, err := h.resolveOpenAIExecution(agentCtx, requestedModel)
 	if err != nil {
-		h.fail(w, http.StatusBadRequest, err.Error(), agentID, requestedModel, start, err)
+		status := http.StatusBadGateway
+		if err.Error() == "missing model" {
+			status = http.StatusBadRequest
+		}
+		h.fail(w, status, err.Error(), agentID, requestedModel, start, err)
 		return
 	}
-
-	// Resolve provider (with format-bridge fallback for vendor-prefixed models).
-	resolvedProvider, resolvedUpstream, err := h.resolveOpenAIProvider(providerName, upstreamModel)
-	if err != nil {
-		h.fail(w, http.StatusBadGateway, err.Error(), agentID, requestedModel, start, err)
-		return
-	}
-	providerName = resolvedProvider
-	upstreamModel = resolvedUpstream
 
 	if h.accumulator != nil && h.pricing != nil && isStreamingChatCompletions(r.URL.Path, payload) {
 		ensureStreamUsage(payload)
 	}
-
-	payload["model"] = upstreamModel
-	outBody, err := json.Marshal(payload)
-	if err != nil {
-		h.fail(w, http.StatusInternalServerError, "failed to encode upstream body", agentID, requestedModel, start, err)
-		return
+	if resolution.Intervention != "" {
+		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}
 
-	h.dispatchWithRetry(w, r, agentID, providerName, requestedModel, upstreamModel, outBody, inBody, start)
+	h.dispatchCandidates(w, r, agentID, requestedModel, payload, resolution.Candidates, inBody, start)
 }
 
 // resolveOpenAIProvider maps a parsed provider name to the actual provider name
@@ -269,48 +255,75 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
-	if requestedModel == "" {
-		h.fail(w, http.StatusBadRequest, "missing model field", agentID, "", start, fmt.Errorf("missing model"))
-		return
-	}
-
-	outBody, err := json.Marshal(payload)
+	resolution, err := h.resolveAnthropicExecution(agentCtx, requestedModel)
 	if err != nil {
-		h.fail(w, http.StatusInternalServerError, "failed to encode upstream body", agentID, requestedModel, start, err)
+		status := http.StatusBadGateway
+		if err.Error() == "missing model" {
+			status = http.StatusBadRequest
+		}
+		h.fail(w, status, err.Error(), agentID, requestedModel, start, err)
 		return
 	}
+	if resolution.Intervention != "" {
+		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
+	}
 
-	h.dispatchWithRetry(w, r, agentID, "anthropic", requestedModel, requestedModel, outBody, inBody, start)
+	h.dispatchCandidates(w, r, agentID, requestedModel, payload, resolution.Candidates, inBody, start)
+}
+
+func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, agentID, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, start time.Time) {
+	sawCooldown := false
+	for i, candidate := range candidates {
+		payload["model"] = candidate.UpstreamModel
+		outBody, err := json.Marshal(payload)
+		if err != nil {
+			h.fail(w, http.StatusInternalServerError, "failed to encode upstream body", agentID, requestedModel, start, err)
+			return
+		}
+		tryNextCandidate, candidateCooldown := h.dispatchWithRetry(w, r, agentID, requestedModel, candidate, outBody, requestOriginal, start)
+		if !tryNextCandidate {
+			return
+		}
+		sawCooldown = sawCooldown || candidateCooldown
+		if i+1 < len(candidates) {
+			h.logger.LogIntervention(agentID, requestedModel, "provider_exhausted_failover")
+		}
+	}
+
+	if sawCooldown {
+		h.fail(w, http.StatusServiceUnavailable, "all declared provider keys in cooldown", agentID, requestedModel, start, fmt.Errorf("all declared providers cooling down"))
+		return
+	}
+	h.fail(w, http.StatusBadGateway, "no usable declared provider key after retries", agentID, requestedModel, start, fmt.Errorf("exhausted declared model candidates"))
 }
 
 // dispatchWithRetry selects a key, dispatches the request, and retries on key-level
 // failures (401/403/402/quota-429 → dead, rate-limit-429 → cooldown).
 // 5xx and transport errors do NOT cause key state changes.
-func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID, providerName, requestedModel, upstreamModel string, outBody []byte, requestOriginal []byte, start time.Time) {
+// It returns (advanceToNextCandidate, candidateSawCooldown).
+func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID, requestedModel string, candidate dispatchCandidate, outBody []byte, requestOriginal []byte, start time.Time) (bool, bool) {
 	const maxKeyAttempts = 5
+	sawCooldown := false
 
 	for attempt := 0; attempt < maxKeyAttempts; attempt++ {
-		prov, lease, err := h.registry.SelectKey(providerName)
+		prov, lease, err := h.registry.SelectKey(candidate.ProviderName)
 		if err != nil {
-			// All keys dead/disabled — give up.
 			if _, ok := err.(*provider.CooldownError); ok {
-				h.fail(w, http.StatusServiceUnavailable, "all provider keys in cooldown", agentID, requestedModel, start, err)
-				return
+				return true, true
 			}
-			h.fail(w, http.StatusBadGateway, err.Error(), agentID, requestedModel, start, err)
-			return
+			return true, sawCooldown
 		}
 
 		targetURL, err := buildUpstreamURL(prov.BaseURL, r.URL.Path, r.URL.RawQuery)
 		if err != nil {
 			h.fail(w, http.StatusBadGateway, "invalid provider URL", agentID, requestedModel, start, err)
-			return
+			return false, sawCooldown
 		}
 
 		outReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(outBody))
 		if err != nil {
 			h.fail(w, http.StatusBadGateway, "failed to create upstream request", agentID, requestedModel, start, err)
-			return
+			return false, sawCooldown
 		}
 		copyRequestHeaders(outReq.Header, r.Header)
 		outReq.Header.Set("Content-Type", "application/json")
@@ -326,7 +339,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 
 		if err := applyProviderAuth(outReq, prov); err != nil {
 			h.fail(w, http.StatusBadGateway, "provider auth not configured", agentID, requestedModel, start, err)
-			return
+			return false, sawCooldown
 		}
 
 		h.logger.LogRequest(agentID, requestedModel)
@@ -334,7 +347,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		if err != nil {
 			// Transport error — no key state change, return 502.
 			h.fail(w, http.StatusBadGateway, "upstream request failed", agentID, requestedModel, start, err)
-			return
+			return false, sawCooldown
 		}
 
 		classification := classifyResponse(resp)
@@ -359,6 +372,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			until := time.Now().UTC().Add(cooldownDur)
 			_ = h.registry.MarkCooldown(lease.ProviderName, lease.KeyID, "rate_limit", until)
 			cooldownUntil := until.Format(time.RFC3339)
+			sawCooldown = true
 			h.logger.LogProviderPool(lease.ProviderName, lease.KeyID, "cooldown", "rate_limit", cooldownUntil)
 			if h.notifier != nil {
 				h.notifier.Notify(alert.PoolEvent{
@@ -374,12 +388,12 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 
 		default:
 			// Success or 5xx: stream response back, no key state change.
-			h.streamResponse(w, resp, agentID, providerName, requestedModel, upstreamModel, r.URL.Path, requestOriginal, outBody, start)
-			return
+			h.streamResponse(w, resp, agentID, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start)
+			return false, sawCooldown
 		}
 	}
 
-	h.fail(w, http.StatusBadGateway, "no usable provider key after retries", agentID, requestedModel, start, fmt.Errorf("exhausted %d key attempts", maxKeyAttempts))
+	return true, sawCooldown
 }
 
 type responseClass int

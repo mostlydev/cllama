@@ -74,6 +74,7 @@ type Registry struct {
 
 var knownProviders = map[string]string{
 	"openai":     "https://api.openai.com/v1",
+	"xai":        "https://api.x.ai/v1",
 	"anthropic":  "https://api.anthropic.com/v1",
 	"openrouter": "https://openrouter.ai/api/v1",
 	"ollama":     "http://ollama:11434/v1",
@@ -85,6 +86,8 @@ var envKeyMap = map[string]string{
 	"OPENAI_API_KEY":       "openai",
 	"OPENAI_API_KEY_1":     "openai",
 	"OPENAI_API_KEY_2":     "openai",
+	"XAI_API_KEY":          "xai",
+	"XAI_API_KEY_1":        "xai",
 	"ANTHROPIC_API_KEY":    "anthropic",
 	"ANTHROPIC_API_KEY_1":  "anthropic",
 	"OPENROUTER_API_KEY":   "openrouter",
@@ -93,6 +96,7 @@ var envKeyMap = map[string]string{
 
 var envBaseURLMap = map[string]string{
 	"OPENAI_BASE_URL":     "openai",
+	"XAI_BASE_URL":        "xai",
 	"ANTHROPIC_BASE_URL":  "anthropic",
 	"OPENROUTER_BASE_URL": "openrouter",
 	"OLLAMA_BASE_URL":     "ollama",
@@ -244,15 +248,19 @@ func (r *Registry) LoadFromEnv() {
 
 	// Ordered list of env key vars per provider, in priority order.
 	type envKeyDef struct {
-		envVar  string
-		keyID   string // deterministic seed ID
-		label   string
+		envVar string
+		keyID  string // deterministic seed ID
+		label  string
 	}
 	envKeysByProvider := map[string][]envKeyDef{
 		"openai": {
 			{"OPENAI_API_KEY", "seed:OPENAI_API_KEY", "primary"},
 			{"OPENAI_API_KEY_1", "seed:OPENAI_API_KEY_1", "backup-1"},
 			{"OPENAI_API_KEY_2", "seed:OPENAI_API_KEY_2", "backup-2"},
+		},
+		"xai": {
+			{"XAI_API_KEY", "seed:XAI_API_KEY", "primary"},
+			{"XAI_API_KEY_1", "seed:XAI_API_KEY_1", "backup-1"},
 		},
 		"anthropic": {
 			{"ANTHROPIC_API_KEY", "seed:ANTHROPIC_API_KEY", "primary"},
