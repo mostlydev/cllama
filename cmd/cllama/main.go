@@ -25,13 +25,13 @@ import (
 )
 
 type config struct {
-	APIAddr            string
-	UIAddr             string
-	ContextRoot        string
-	AuthDir            string
-	PodName            string
-	UIToken            string
-	SessionHistoryDir  string
+	APIAddr           string
+	UIAddr            string
+	ContextRoot       string
+	AuthDir           string
+	PodName           string
+	UIToken           string
+	SessionHistoryDir string
 }
 
 func main() {
@@ -72,7 +72,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 	apiServer := &http.Server{
 		Addr:              cfg.APIAddr,
-		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, recorder),
+		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, recorder, cfg.UIToken),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	uiServer := &http.Server{
@@ -114,7 +114,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder) http.Handler {
+func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder, adminToken string) http.Handler {
 	mux := http.NewServeMux()
 	opts := []proxy.HandlerOption{proxy.WithCostTracking(acc, pricing)}
 	if podName != "" {
@@ -123,11 +123,15 @@ func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.L
 	if recorder != nil {
 		opts = append(opts, proxy.WithSessionRecorder(recorder))
 	}
+	if adminToken != "" {
+		opts = append(opts, proxy.WithAdminToken(adminToken))
+	}
 	proxyHandler := proxy.NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
 		return agentctx.Load(contextRoot, agentID)
 	}, logger, opts...)
 	mux.Handle("POST /v1/chat/completions", proxyHandler)
 	mux.Handle("POST /v1/messages", proxyHandler)
+	mux.HandleFunc("GET /history/{agentID}", proxyHandler.HandleHistory)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
@@ -187,10 +191,10 @@ func healthcheckURL(addr string) string {
 
 func configFromEnv() config {
 	return config{
-		APIAddr:     envOr("LISTEN_ADDR", ":8080"),
-		UIAddr:      envOr("UI_ADDR", ":8081"),
-		ContextRoot: envOr("CLAW_CONTEXT_ROOT", "/claw/context"),
-		AuthDir:     envOr("CLAW_AUTH_DIR", "/claw/auth"),
+		APIAddr:           envOr("LISTEN_ADDR", ":8080"),
+		UIAddr:            envOr("UI_ADDR", ":8081"),
+		ContextRoot:       envOr("CLAW_CONTEXT_ROOT", "/claw/context"),
+		AuthDir:           envOr("CLAW_AUTH_DIR", "/claw/auth"),
 		PodName:           os.Getenv("CLAW_POD"),
 		UIToken:           os.Getenv("CLLAMA_UI_TOKEN"),
 		SessionHistoryDir: os.Getenv("CLAW_SESSION_HISTORY_DIR"),

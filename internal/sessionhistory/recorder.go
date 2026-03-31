@@ -68,6 +68,14 @@ func New(baseDir string) *Recorder {
 	}
 }
 
+// BaseDir returns the recorder's configured history root.
+func (r *Recorder) BaseDir() string {
+	if r == nil {
+		return ""
+	}
+	return r.baseDir
+}
+
 // Record marshals e as a single JSON line and appends it to
 // <baseDir>/<agentID>/history.jsonl. If the recorder was created with an
 // empty baseDir the call succeeds immediately without any I/O.

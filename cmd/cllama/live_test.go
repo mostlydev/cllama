@@ -32,10 +32,10 @@ import (
 // Run: go test -tags dashboard -v -run TestLiveDashboard ./cmd/cllama/...
 //
 // Dashboard: http://127.0.0.1:9081/
-//     - Providers  → /
-//     - Pod        → /pod
-//     - Costs      → /costs
-//     - Costs JSON → /costs/api
+//   - Providers  → /
+//   - Pod        → /pod
+//   - Costs      → /costs
+//   - Costs JSON → /costs/api
 func TestLiveDashboard(t *testing.T) {
 	// ── Mock LLM backend ─────────────────────────────────────────────────
 	var reqCount atomic.Int64
@@ -143,8 +143,8 @@ func TestLiveDashboard(t *testing.T) {
 	acc := cost.NewAccumulator()
 	logger := logging.New(os.Stdout)
 
-	apiHandler := newAPIHandler(contextRoot, reg, logger, acc, pricing)
-	uiHandler := newUIHandler(reg, acc, contextRoot)
+	apiHandler := newAPIHandler(contextRoot, reg, logger, acc, pricing, "", nil, "")
+	uiHandler := newUIHandler(reg, acc, contextRoot, "")
 
 	// ── Listen on fixed ports ────────────────────────────────────────────
 	apiLn, err := net.Listen("tcp", "127.0.0.1:9080")

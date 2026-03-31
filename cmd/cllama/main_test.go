@@ -17,6 +17,7 @@ import (
 	"github.com/mostlydev/cllama/internal/cost"
 	"github.com/mostlydev/cllama/internal/logging"
 	"github.com/mostlydev/cllama/internal/provider"
+	"github.com/mostlydev/cllama/internal/sessionhistory"
 )
 
 func TestDualServerIntegrationSmoke(t *testing.T) {
@@ -75,7 +76,7 @@ func TestDualServerIntegrationSmoke(t *testing.T) {
 	}
 	pricing := cost.DefaultPricing()
 	acc := cost.NewAccumulator()
-	apiHandler := newAPIHandler(contextRoot, reg, logging.New(io.Discard), acc, pricing, "test-pod", nil)
+	apiHandler := newAPIHandler(contextRoot, reg, logging.New(io.Discard), acc, pricing, "test-pod", nil, "")
 	uiHandler := newUIHandler(reg, acc, contextRoot, "")
 
 	apiServer := &http.Server{Handler: apiHandler}
@@ -151,6 +152,118 @@ func TestConfigFromEnvSessionHistoryDir(t *testing.T) {
 	cfg := configFromEnv()
 	if cfg.SessionHistoryDir != "/claw/session-history" {
 		t.Errorf("SessionHistoryDir = %q; want /claw/session-history", cfg.SessionHistoryDir)
+	}
+}
+
+func TestAPIHistoryEndpointAllowsAgentAndServiceAuth(t *testing.T) {
+	contextRoot := t.TempDir()
+	agentDir := filepath.Join(contextRoot, "tiverton")
+	if err := os.MkdirAll(filepath.Join(agentDir, "service-auth"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"AGENTS.md":     "# contract",
+		"CLAWDAPUS.md":  "# infra",
+		"metadata.json": `{"token":"tiverton:dummy123"}`,
+	} {
+		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "service-auth", "team-memory.json"), []byte(`{"service":"team-memory","auth_type":"bearer","token":"memory-token"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	histDir := t.TempDir()
+	recorder := sessionhistory.New(histDir)
+	base := time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 2; i++ {
+		if err := recorder.Record("tiverton", sessionhistory.Entry{
+			Version: 1,
+			TS:      base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+			ClawID:  "tiverton",
+			Response: sessionhistory.Payload{
+				Format: "json",
+				JSON:   json.RawMessage(`{}`),
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	apiHandler := newAPIHandler(contextRoot, provider.NewRegistry(""), logging.New(io.Discard), cost.NewAccumulator(), cost.DefaultPricing(), "", recorder, "")
+
+	req := httptest.NewRequest(http.MethodGet, "/history/tiverton?limit=1", nil)
+	req.Header.Set("Authorization", "Bearer memory-token")
+	rec := httptest.NewRecorder()
+	apiHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for service auth, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	lines := strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected one ndjson line, got %q", rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/history/tiverton?after=2026-03-31T12:00:00Z", nil)
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	rec = httptest.NewRecorder()
+	apiHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for agent auth, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	lines = strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected one filtered ndjson line, got %q", rec.Body.String())
+	}
+}
+
+func TestAPIHistoryEndpointAllowsAdminTokenAndRejectsWrongBearer(t *testing.T) {
+	contextRoot := t.TempDir()
+	agentDir := filepath.Join(contextRoot, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"AGENTS.md":     "# contract",
+		"CLAWDAPUS.md":  "# infra",
+		"metadata.json": `{"token":"tiverton:dummy123"}`,
+	} {
+		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	histDir := t.TempDir()
+	recorder := sessionhistory.New(histDir)
+	if err := recorder.Record("tiverton", sessionhistory.Entry{
+		Version: 1,
+		TS:      time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC).Format(time.RFC3339),
+		ClawID:  "tiverton",
+		Response: sessionhistory.Payload{
+			Format: "json",
+			JSON:   json.RawMessage(`{}`),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	apiHandler := newAPIHandler(contextRoot, provider.NewRegistry(""), logging.New(io.Discard), cost.NewAccumulator(), cost.DefaultPricing(), "", recorder, "ui-secret")
+
+	req := httptest.NewRequest(http.MethodGet, "/history/tiverton", nil)
+	req.Header.Set("Authorization", "Bearer wrong-token")
+	rec := httptest.NewRecorder()
+	apiHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for wrong token, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/history/tiverton", nil)
+	req.Header.Set("Authorization", "Bearer ui-secret")
+	rec = httptest.NewRecorder()
+	apiHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for admin token, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 

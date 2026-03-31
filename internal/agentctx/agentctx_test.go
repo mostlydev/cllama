@@ -129,3 +129,34 @@ func TestLoadParsesModelPolicyAccessors(t *testing.T) {
 		t.Fatalf("unexpected failover refs: %#v", failover)
 	}
 }
+
+func TestLoadReadsServiceAuthEntries(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "tiverton")
+	if err := os.MkdirAll(filepath.Join(agentDir, "service-auth"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"tiverton:secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "service-auth", "team-memory.json"), []byte(`{"service":"team-memory","auth_type":"bearer","token":"memory-token"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "tiverton")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(ctx.ServiceAuth) != 1 {
+		t.Fatalf("expected 1 service auth entry, got %+v", ctx.ServiceAuth)
+	}
+	if ctx.ServiceAuth[0].Service != "team-memory" || ctx.ServiceAuth[0].Token != "memory-token" {
+		t.Fatalf("unexpected service auth entry: %+v", ctx.ServiceAuth[0])
+	}
+}

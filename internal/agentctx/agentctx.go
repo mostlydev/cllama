@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // AgentContext holds the per-agent mounted contract and metadata files.
@@ -14,7 +15,15 @@ type AgentContext struct {
 	AgentsMD    []byte
 	ClawdapusMD []byte
 	Metadata    map[string]any
+	ServiceAuth []ServiceAuthEntry
 	ModelPolicy *ModelPolicy
+}
+
+type ServiceAuthEntry struct {
+	Service   string `json:"service"`
+	AuthType  string `json:"auth_type"`
+	Token     string `json:"token,omitempty"`
+	Principal string `json:"principal,omitempty"`
 }
 
 // Load reads an agent's context files from contextRoot/<agentID>/.
@@ -46,6 +55,10 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 	if err := json.Unmarshal(metaRaw, &typed); err != nil {
 		return nil, fmt.Errorf("load agent context %q: parse typed metadata: %w", agentID, err)
 	}
+	serviceAuth, err := loadServiceAuth(dir)
+	if err != nil {
+		return nil, fmt.Errorf("load agent context %q: service-auth: %w", agentID, err)
+	}
 
 	return &AgentContext{
 		AgentID:     agentID,
@@ -53,6 +66,7 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 		AgentsMD:    agentsMD,
 		ClawdapusMD: clawdapusMD,
 		Metadata:    meta,
+		ServiceAuth: serviceAuth,
 		ModelPolicy: typed.ModelPolicy,
 	}, nil
 }
@@ -106,6 +120,38 @@ func (a *AgentContext) FeedsPath() string {
 		return ""
 	}
 	return filepath.Join(a.ContextDir, "feeds.json")
+}
+
+func loadServiceAuth(dir string) ([]ServiceAuthEntry, error) {
+	authDir := filepath.Join(dir, "service-auth")
+	entries, err := os.ReadDir(authDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+
+	auth := make([]ServiceAuthEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(authDir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		var parsed ServiceAuthEntry
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			return nil, err
+		}
+		auth = append(auth, parsed)
+	}
+	return auth, nil
 }
 
 // AgentSummary is a lightweight view of an agent for listing purposes.

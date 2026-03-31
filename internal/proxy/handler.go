@@ -36,6 +36,7 @@ type Handler struct {
 	pricing         *cost.Pricing
 	feedFetcher     *feeds.Fetcher
 	sessionRecorder *sessionhistory.Recorder
+	adminToken      string
 }
 
 // HandlerOption configures optional Handler behaviour.
@@ -78,6 +79,14 @@ func WithSessionHistory(dir string) HandlerOption {
 func WithSessionRecorder(r *sessionhistory.Recorder) HandlerOption {
 	return func(h *Handler) {
 		h.sessionRecorder = r
+	}
+}
+
+// WithAdminToken enables an operator-scoped bearer token for non-chat API
+// routes such as history export.
+func WithAdminToken(token string) HandlerOption {
+	return func(h *Handler) {
+		h.adminToken = strings.TrimSpace(token)
 	}
 }
 
