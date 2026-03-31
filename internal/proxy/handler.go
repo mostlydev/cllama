@@ -191,14 +191,13 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		h.fail(w, http.StatusBadRequest, "invalid JSON body", agentID, "", start, err)
 		return
 	}
-	h.recallOpenAIMemory(r.Context(), agentID, agentCtx, payload)
+	requestedModel, _ := payload["model"].(string)
+	requestedModel = strings.TrimSpace(requestedModel)
+	h.recallOpenAIMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
 	if feedBlock := h.fetchFeeds(r.Context(), agentID, agentCtx); feedBlock != "" {
 		feeds.InjectOpenAI(payload, feedBlock)
 	}
 	feeds.InjectOpenAI(payload, currentTimeLine(agentCtx, time.Now()))
-
-	requestedModel, _ := payload["model"].(string)
-	requestedModel = strings.TrimSpace(requestedModel)
 	resolution, err := h.resolveOpenAIExecution(agentCtx, requestedModel)
 	if err != nil {
 		status := http.StatusBadGateway
@@ -258,14 +257,13 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		h.fail(w, http.StatusBadRequest, "invalid JSON body", agentID, "", start, err)
 		return
 	}
-	h.recallAnthropicMemory(r.Context(), agentID, agentCtx, payload)
+	requestedModel, _ := payload["model"].(string)
+	requestedModel = strings.TrimSpace(requestedModel)
+	h.recallAnthropicMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
 	if feedBlock := h.fetchFeeds(r.Context(), agentID, agentCtx); feedBlock != "" {
 		feeds.InjectAnthropic(payload, feedBlock)
 	}
 	feeds.InjectAnthropic(payload, currentTimeLine(agentCtx, time.Now()))
-
-	requestedModel, _ := payload["model"].(string)
-	requestedModel = strings.TrimSpace(requestedModel)
 	resolution, err := h.resolveAnthropicExecution(agentCtx, requestedModel)
 	if err != nil {
 		status := http.StatusBadGateway

@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -72,14 +71,14 @@ func (h *Handler) HandleHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) authorizeHistoryRequest(token string, targetCtx *agentctx.AgentContext) error {
-	if h.adminToken != "" && secureEqual(token, h.adminToken) {
+	if h.adminToken != "" && constantTimeEqual(token, h.adminToken) {
 		return nil
 	}
-	if secureEqual(token, targetCtx.MetadataToken()) {
+	if constantTimeEqual(token, targetCtx.MetadataToken()) {
 		return nil
 	}
 	for _, entry := range targetCtx.ServiceAuth {
-		if entry.Service == historyReplayAuthService && entry.AuthType == "bearer" && entry.Token != "" && secureEqual(token, entry.Token) {
+		if entry.Service == historyReplayAuthService && entry.AuthType == "bearer" && entry.Token != "" && constantTimeEqual(token, entry.Token) {
 			return nil
 		}
 	}
@@ -125,11 +124,4 @@ func parseHistoryLimit(raw string) (int, error) {
 		limit = sessionhistory.MaxReadLimit
 	}
 	return limit, nil
-}
-
-func secureEqual(a, b string) bool {
-	if a == "" || b == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }

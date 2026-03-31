@@ -48,15 +48,15 @@ type memoryBlock struct {
 	TS     string  `json:"ts,omitempty"`
 }
 
-func (h *Handler) recallOpenAIMemory(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, payload map[string]any) {
+func (h *Handler) recallOpenAIMemory(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any) {
 	block, err := h.recallMemory(reqCtx, agentID, agentCtx, memoryRecallRequest{
 		AgentID:  agentID,
 		Pod:      agentCtx.MetadataString("pod"),
 		Messages: payload["messages"],
-		Metadata: memoryMetadata(agentCtx, "openai"),
+		Metadata: memoryMetadata(agentCtx, "openai", requestedModel),
 	})
 	if err != nil {
-		h.logger.LogError(agentID, "", 0, 0, fmt.Errorf("memory recall: %w", err))
+		h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("memory recall: %w", err))
 		return
 	}
 	if block != "" {
@@ -64,16 +64,16 @@ func (h *Handler) recallOpenAIMemory(reqCtx context.Context, agentID string, age
 	}
 }
 
-func (h *Handler) recallAnthropicMemory(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, payload map[string]any) {
+func (h *Handler) recallAnthropicMemory(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any) {
 	block, err := h.recallMemory(reqCtx, agentID, agentCtx, memoryRecallRequest{
 		AgentID:  agentID,
 		Pod:      agentCtx.MetadataString("pod"),
 		Messages: payload["messages"],
 		System:   payload["system"],
-		Metadata: memoryMetadata(agentCtx, "anthropic"),
+		Metadata: memoryMetadata(agentCtx, "anthropic", requestedModel),
 	})
 	if err != nil {
-		h.logger.LogError(agentID, "", 0, 0, fmt.Errorf("memory recall: %w", err))
+		h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("memory recall: %w", err))
 		return
 	}
 	if block != "" {
@@ -107,7 +107,7 @@ func (h *Handler) recallMemory(reqCtx context.Context, agentID string, agentCtx 
 		return "", err
 	}
 	if len(body) > maxMemoryBlockBytes {
-		body = body[:maxMemoryBlockBytes]
+		return "", fmt.Errorf("recall response exceeds %d bytes", maxMemoryBlockBytes)
 	}
 
 	var decoded memoryRecallResponse
@@ -128,7 +128,7 @@ func (h *Handler) retainMemory(agentID string, agentCtx *agentctx.AgentContext, 
 		resp, err := doMemoryJSONRequest(ctx, h.client, http.MethodPost, agentCtx.Memory.BaseURL+agentCtx.Memory.Retain.Path, agentCtx.Memory.Auth, memoryRetainRequest{
 			AgentID:  agentID,
 			Pod:      agentCtx.MetadataString("pod"),
-			Metadata: memoryMetadata(agentCtx, "retain"),
+			Metadata: memoryMetadata(agentCtx, "retain", entry.RequestedModel),
 			Entry:    entry,
 		})
 		if err == nil && resp != nil {
@@ -200,13 +200,20 @@ func formatMemoryBlocks(service string, memories []memoryBlock) string {
 	return b.String()
 }
 
-func memoryMetadata(agentCtx *agentctx.AgentContext, path string) map[string]any {
+func memoryMetadata(agentCtx *agentctx.AgentContext, path, requestedModel string) map[string]any {
 	if agentCtx == nil {
 		return nil
 	}
-	return map[string]any{
+	meta := map[string]any{
 		"service": agentCtx.MetadataString("service"),
 		"type":    agentCtx.MetadataString("type"),
 		"path":    path,
 	}
+	if timezone := agentCtx.MetadataString("timezone"); timezone != "" {
+		meta["timezone"] = timezone
+	}
+	if requestedModel != "" {
+		meta["requested_model"] = requestedModel
+	}
+	return meta
 }

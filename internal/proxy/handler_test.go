@@ -1486,6 +1486,7 @@ func TestHandlerSkipsSessionHistoryOnUpstreamError(t *testing.T) {
 
 func TestHandlerInjectsMemoryRecallIntoOpenAIRequests(t *testing.T) {
 	var gotBody []byte
+	var recallPayload map[string]any
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var err error
 		gotBody, err = io.ReadAll(r.Body)
@@ -1500,6 +1501,9 @@ func TestHandlerInjectsMemoryRecallIntoOpenAIRequests(t *testing.T) {
 	memorySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/recall" {
 			t.Fatalf("unexpected memory path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&recallPayload); err != nil {
+			t.Fatalf("decode recall payload: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"memories":[{"text":"User prefers concise answers","kind":"profile","source":"profile-store"}]}`))
@@ -1518,10 +1522,11 @@ func TestHandlerInjectsMemoryRecallIntoOpenAIRequests(t *testing.T) {
 		return &agentctx.AgentContext{
 			AgentID: "tiverton",
 			Metadata: map[string]any{
-				"token":   "tiverton:dummy123",
-				"pod":     "ops",
-				"service": "tiverton",
-				"type":    "openclaw",
+				"token":    "tiverton:dummy123",
+				"pod":      "ops",
+				"service":  "tiverton",
+				"type":     "openclaw",
+				"timezone": "America/New_York",
 			},
 			Memory: &agentctx.MemoryManifest{
 				Version: 1,
@@ -1558,6 +1563,16 @@ func TestHandlerInjectsMemoryRecallIntoOpenAIRequests(t *testing.T) {
 	content := first["content"].(string)
 	if !strings.Contains(content, "User prefers concise answers") {
 		t.Fatalf("expected recalled memory in injected content, got %q", content)
+	}
+	metadata, _ := recallPayload["metadata"].(map[string]any)
+	if metadata == nil {
+		t.Fatalf("expected recall metadata, got %+v", recallPayload)
+	}
+	if metadata["timezone"] != "America/New_York" {
+		t.Fatalf("expected recall timezone metadata, got %+v", metadata)
+	}
+	if metadata["requested_model"] != "openai/gpt-4o" {
+		t.Fatalf("expected requested_model metadata, got %+v", metadata)
 	}
 }
 
@@ -1631,6 +1646,69 @@ func TestHandlerRetainsMemoryAfterSuccessfulTurn(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for retain request")
+	}
+}
+
+func TestHandlerLogsOversizedMemoryRecallResponseClearly(t *testing.T) {
+	var logs bytes.Buffer
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	memorySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"memories":[{"text":"`+strings.Repeat("x", maxMemoryBlockBytes)+`"}]}`)
+	}))
+	defer memorySrv.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, func(id string) (*agentctx.AgentContext, error) {
+		if id != "tiverton" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID: "tiverton",
+			Metadata: map[string]any{
+				"token": "tiverton:dummy123",
+			},
+			Memory: &agentctx.MemoryManifest{
+				Version: 1,
+				Service: "team-memory",
+				BaseURL: memorySrv.URL,
+				Recall:  &agentctx.MemoryOp{Path: "/recall", TimeoutMS: 300},
+			},
+		}, nil
+	}, logging.New(&logs))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	entries := parseLogEntries(t, logs.Bytes())
+	found := false
+	for _, entry := range entries {
+		if entry["type"] == "error" {
+			if errText, _ := entry["error"].(string); strings.Contains(errText, "recall response exceeds") {
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected oversized recall error log, got %v", entries)
 	}
 }
 
