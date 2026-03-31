@@ -12,6 +12,8 @@ import (
 	"github.com/mostlydev/cllama/internal/sessionhistory"
 )
 
+const historyReplayAuthService = "cllama-history"
+
 func (h *Handler) HandleHistory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -77,7 +79,7 @@ func (h *Handler) authorizeHistoryRequest(token string, targetCtx *agentctx.Agen
 		return nil
 	}
 	for _, entry := range targetCtx.ServiceAuth {
-		if entry.AuthType == "bearer" && entry.Token != "" && secureEqual(token, entry.Token) {
+		if entry.Service == historyReplayAuthService && entry.AuthType == "bearer" && entry.Token != "" && secureEqual(token, entry.Token) {
 			return nil
 		}
 	}

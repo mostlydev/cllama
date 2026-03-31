@@ -155,7 +155,7 @@ func TestConfigFromEnvSessionHistoryDir(t *testing.T) {
 	}
 }
 
-func TestAPIHistoryEndpointAllowsAgentAndServiceAuth(t *testing.T) {
+func TestAPIHistoryEndpointAllowsAgentAndDedicatedReplayAuth(t *testing.T) {
 	contextRoot := t.TempDir()
 	agentDir := filepath.Join(contextRoot, "tiverton")
 	if err := os.MkdirAll(filepath.Join(agentDir, "service-auth"), 0o700); err != nil {
@@ -169,6 +169,9 @@ func TestAPIHistoryEndpointAllowsAgentAndServiceAuth(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "service-auth", "cllama-history.json"), []byte(`{"service":"cllama-history","auth_type":"bearer","token":"history-token","principal":"team-memory"}`), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(agentDir, "service-auth", "team-memory.json"), []byte(`{"service":"team-memory","auth_type":"bearer","token":"memory-token"}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -194,15 +197,23 @@ func TestAPIHistoryEndpointAllowsAgentAndServiceAuth(t *testing.T) {
 	apiHandler := newAPIHandler(contextRoot, provider.NewRegistry(""), logging.New(io.Discard), cost.NewAccumulator(), cost.DefaultPricing(), "", recorder, "")
 
 	req := httptest.NewRequest(http.MethodGet, "/history/tiverton?limit=1", nil)
-	req.Header.Set("Authorization", "Bearer memory-token")
+	req.Header.Set("Authorization", "Bearer history-token")
 	rec := httptest.NewRecorder()
 	apiHandler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 for service auth, got %d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 200 for replay auth, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	lines := strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
 	if len(lines) != 1 {
 		t.Fatalf("expected one ndjson line, got %q", rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/history/tiverton?limit=1", nil)
+	req.Header.Set("Authorization", "Bearer memory-token")
+	rec = httptest.NewRecorder()
+	apiHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-replay service auth, got %d body=%s", rec.Code, rec.Body.String())
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/history/tiverton?after=2026-03-31T12:00:00Z", nil)
