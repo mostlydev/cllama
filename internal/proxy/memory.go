@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/mostlydev/cllama/internal/agentctx"
 	"github.com/mostlydev/cllama/internal/feeds"
+	"github.com/mostlydev/cllama/internal/logging"
 	"github.com/mostlydev/cllama/internal/sessionhistory"
 )
 
@@ -19,6 +21,11 @@ const (
 	defaultRecallTimeout = 300 * time.Millisecond
 	defaultRetainTimeout = 2 * time.Second
 	maxMemoryBlockBytes  = 16 * 1024
+
+	memoryStatusSkipped   = "skipped"
+	memoryStatusSucceeded = "succeeded"
+	memoryStatusFailed    = "failed"
+	memoryStatusTimedOut  = "timed_out"
 )
 
 type memoryRecallRequest struct {
@@ -49,7 +56,7 @@ type memoryBlock struct {
 }
 
 func (h *Handler) recallOpenAIMemory(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any) {
-	block, err := h.recallMemory(reqCtx, agentID, agentCtx, memoryRecallRequest{
+	block, err := h.recallMemory(reqCtx, agentID, agentCtx, requestedModel, memoryRecallRequest{
 		AgentID:  agentID,
 		Pod:      agentCtx.MetadataString("pod"),
 		Messages: payload["messages"],
@@ -65,7 +72,7 @@ func (h *Handler) recallOpenAIMemory(reqCtx context.Context, agentID string, age
 }
 
 func (h *Handler) recallAnthropicMemory(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any) {
-	block, err := h.recallMemory(reqCtx, agentID, agentCtx, memoryRecallRequest{
+	block, err := h.recallMemory(reqCtx, agentID, agentCtx, requestedModel, memoryRecallRequest{
 		AgentID:  agentID,
 		Pod:      agentCtx.MetadataString("pod"),
 		Messages: payload["messages"],
@@ -81,8 +88,16 @@ func (h *Handler) recallAnthropicMemory(reqCtx context.Context, agentID string, 
 	}
 }
 
-func (h *Handler) recallMemory(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, payload memoryRecallRequest) (string, error) {
+func (h *Handler) recallMemory(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload memoryRecallRequest) (string, error) {
 	if agentCtx == nil || agentCtx.Memory == nil || agentCtx.Memory.Recall == nil {
+		if agentCtx != nil && agentCtx.Memory != nil {
+			h.logger.LogMemoryOp(agentID, requestedModel, logging.MemoryOpInfo{
+				Service:   agentCtx.Memory.Service,
+				Operation: "recall",
+				Status:    memoryStatusSkipped,
+				LatencyMS: 0,
+			})
+		}
 		return "", nil
 	}
 
@@ -90,39 +105,104 @@ func (h *Handler) recallMemory(reqCtx context.Context, agentID string, agentCtx 
 	if agentCtx.Memory.Recall.TimeoutMS > 0 {
 		timeout = time.Duration(agentCtx.Memory.Recall.TimeoutMS) * time.Millisecond
 	}
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(reqCtx, timeout)
 	defer cancel()
 
 	resp, err := doMemoryJSONRequest(ctx, h.client, http.MethodPost, agentCtx.Memory.BaseURL+agentCtx.Memory.Recall.Path, agentCtx.Memory.Auth, payload)
 	if err != nil {
+		h.logger.LogMemoryOp(agentID, requestedModel, logging.MemoryOpInfo{
+			Service:   agentCtx.Memory.Service,
+			Operation: "recall",
+			Status:    memoryErrorStatus(err),
+			LatencyMS: time.Since(start).Milliseconds(),
+			Error:     err,
+		})
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("recall returned status %d", resp.StatusCode)
+		err := fmt.Errorf("recall returned status %d", resp.StatusCode)
+		h.logger.LogMemoryOp(agentID, requestedModel, logging.MemoryOpInfo{
+			Service:    agentCtx.Memory.Service,
+			Operation:  "recall",
+			Status:     memoryStatusFailed,
+			StatusCode: resp.StatusCode,
+			LatencyMS:  time.Since(start).Milliseconds(),
+			Error:      err,
+		})
+		return "", err
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxMemoryBlockBytes+1))
 	if err != nil {
+		h.logger.LogMemoryOp(agentID, requestedModel, logging.MemoryOpInfo{
+			Service:    agentCtx.Memory.Service,
+			Operation:  "recall",
+			Status:     memoryStatusFailed,
+			StatusCode: resp.StatusCode,
+			LatencyMS:  time.Since(start).Milliseconds(),
+			Error:      err,
+		})
 		return "", err
 	}
 	if len(body) > maxMemoryBlockBytes {
-		return "", fmt.Errorf("recall response exceeds %d bytes", maxMemoryBlockBytes)
+		err := fmt.Errorf("recall response exceeds %d bytes", maxMemoryBlockBytes)
+		h.logger.LogMemoryOp(agentID, requestedModel, logging.MemoryOpInfo{
+			Service:    agentCtx.Memory.Service,
+			Operation:  "recall",
+			Status:     memoryStatusFailed,
+			StatusCode: resp.StatusCode,
+			LatencyMS:  time.Since(start).Milliseconds(),
+			Error:      err,
+		})
+		return "", err
 	}
 
 	var decoded memoryRecallResponse
 	if err := json.Unmarshal(body, &decoded); err != nil {
-		return "", fmt.Errorf("parse recall response: %w", err)
+		err := fmt.Errorf("parse recall response: %w", err)
+		h.logger.LogMemoryOp(agentID, requestedModel, logging.MemoryOpInfo{
+			Service:    agentCtx.Memory.Service,
+			Operation:  "recall",
+			Status:     memoryStatusFailed,
+			StatusCode: resp.StatusCode,
+			LatencyMS:  time.Since(start).Milliseconds(),
+			Error:      err,
+		})
+		return "", err
 	}
-	return formatMemoryBlocks(agentCtx.Memory.Service, decoded.Memories), nil
+
+	block := formatMemoryBlocks(agentCtx.Memory.Service, decoded.Memories)
+	blocks := len(decoded.Memories)
+	injectedBytes := len(block)
+	h.logger.LogMemoryOp(agentID, requestedModel, logging.MemoryOpInfo{
+		Service:       agentCtx.Memory.Service,
+		Operation:     "recall",
+		Status:        memoryStatusSucceeded,
+		StatusCode:    resp.StatusCode,
+		LatencyMS:     time.Since(start).Milliseconds(),
+		Blocks:        &blocks,
+		InjectedBytes: &injectedBytes,
+	})
+	return block, nil
 }
 
 func (h *Handler) retainMemory(agentID string, agentCtx *agentctx.AgentContext, entry sessionhistory.Entry) {
 	if agentCtx == nil || agentCtx.Memory == nil || agentCtx.Memory.Retain == nil {
+		if agentCtx != nil && agentCtx.Memory != nil {
+			h.logger.LogMemoryOp(agentID, entry.RequestedModel, logging.MemoryOpInfo{
+				Service:   agentCtx.Memory.Service,
+				Operation: "retain",
+				Status:    memoryStatusSkipped,
+				LatencyMS: 0,
+			})
+		}
 		return
 	}
 
 	go func() {
+		start := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), defaultRetainTimeout)
 		defer cancel()
 		resp, err := doMemoryJSONRequest(ctx, h.client, http.MethodPost, agentCtx.Memory.BaseURL+agentCtx.Memory.Retain.Path, agentCtx.Memory.Auth, memoryRetainRequest{
@@ -137,9 +217,30 @@ func (h *Handler) retainMemory(agentID string, agentCtx *agentctx.AgentContext, 
 				err = fmt.Errorf("retain returned status %d", resp.StatusCode)
 			}
 		}
+		latency := time.Since(start).Milliseconds()
 		if err != nil {
+			statusCode := 0
+			if resp != nil {
+				statusCode = resp.StatusCode
+			}
+			h.logger.LogMemoryOp(agentID, entry.RequestedModel, logging.MemoryOpInfo{
+				Service:    agentCtx.Memory.Service,
+				Operation:  "retain",
+				Status:     memoryErrorStatus(err),
+				StatusCode: statusCode,
+				LatencyMS:  latency,
+				Error:      err,
+			})
 			h.logger.LogError(agentID, entry.RequestedModel, 0, 0, fmt.Errorf("memory retain: %w", err))
+			return
 		}
+		h.logger.LogMemoryOp(agentID, entry.RequestedModel, logging.MemoryOpInfo{
+			Service:    agentCtx.Memory.Service,
+			Operation:  "retain",
+			Status:     memoryStatusSucceeded,
+			StatusCode: resp.StatusCode,
+			LatencyMS:  latency,
+		})
 	}()
 }
 
@@ -216,4 +317,11 @@ func memoryMetadata(agentCtx *agentctx.AgentContext, path, requestedModel string
 		meta["requested_model"] = requestedModel
 	}
 	return meta
+}
+
+func memoryErrorStatus(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return memoryStatusTimedOut
+	}
+	return memoryStatusFailed
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1485,6 +1486,7 @@ func TestHandlerSkipsSessionHistoryOnUpstreamError(t *testing.T) {
 }
 
 func TestHandlerInjectsMemoryRecallIntoOpenAIRequests(t *testing.T) {
+	var logs lockedBuffer
 	var gotBody []byte
 	var recallPayload map[string]any
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1535,7 +1537,7 @@ func TestHandlerInjectsMemoryRecallIntoOpenAIRequests(t *testing.T) {
 				Recall:  &agentctx.MemoryOp{Path: "/recall", TimeoutMS: 300},
 			},
 		}, nil
-	}, nil)
+	}, logging.New(&logs))
 
 	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
@@ -1574,9 +1576,22 @@ func TestHandlerInjectsMemoryRecallIntoOpenAIRequests(t *testing.T) {
 	if metadata["requested_model"] != "openai/gpt-4o" {
 		t.Fatalf("expected requested_model metadata, got %+v", metadata)
 	}
+	recallLog := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "memory_op" && entry["memory_op"] == "recall" && entry["memory_status"] == "succeeded"
+	})
+	if recallLog["memory_service"] != "team-memory" {
+		t.Fatalf("expected recall telemetry memory_service=team-memory, got %+v", recallLog)
+	}
+	if recallLog["memory_blocks"].(float64) != 1 {
+		t.Fatalf("expected recall telemetry memory_blocks=1, got %+v", recallLog)
+	}
+	if recallLog["memory_bytes"].(float64) <= 0 {
+		t.Fatalf("expected recall telemetry memory_bytes > 0, got %+v", recallLog)
+	}
 }
 
 func TestHandlerRetainsMemoryAfterSuccessfulTurn(t *testing.T) {
+	var logs lockedBuffer
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
@@ -1621,7 +1636,7 @@ func TestHandlerRetainsMemoryAfterSuccessfulTurn(t *testing.T) {
 				Retain:  &agentctx.MemoryOp{Path: "/retain"},
 			},
 		}, nil
-	}, nil)
+	}, logging.New(&logs))
 
 	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
@@ -1646,6 +1661,15 @@ func TestHandlerRetainsMemoryAfterSuccessfulTurn(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for retain request")
+	}
+	retainLog := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "memory_op" && entry["memory_op"] == "retain" && entry["memory_status"] == "succeeded"
+	})
+	if retainLog["memory_service"] != "team-memory" {
+		t.Fatalf("expected retain telemetry memory_service=team-memory, got %+v", retainLog)
+	}
+	if retainLog["status_code"].(float64) != http.StatusNoContent {
+		t.Fatalf("expected retain telemetry status_code=%d, got %+v", http.StatusNoContent, retainLog)
 	}
 }
 
@@ -1745,6 +1769,39 @@ func stubContextLoaderWithPolicy(agentID, token string, policy *agentctx.ModelPo
 			ModelPolicy: policy,
 		}, nil
 	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
+func waitForLogEntry(t *testing.T, logs *lockedBuffer, predicate func(map[string]any) bool) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		entries := parseLogEntries(t, logs.Bytes())
+		for _, entry := range entries {
+			if predicate(entry) {
+				return entry
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for log entry")
+	return nil
 }
 
 func assertInterventionLogged(t *testing.T, raw []byte, reason string) {

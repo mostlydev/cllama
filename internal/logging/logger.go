@@ -27,6 +27,13 @@ type entry struct {
 	CostUSD      *float64 `json:"cost_usd,omitempty"`
 	Intervention *string  `json:"intervention"`
 	Error        string   `json:"error,omitempty"`
+	// memory_op event fields
+	MemoryService *string `json:"memory_service,omitempty"`
+	MemoryOp      *string `json:"memory_op,omitempty"`
+	MemoryStatus  *string `json:"memory_status,omitempty"`
+	MemoryBlocks  *int    `json:"memory_blocks,omitempty"`
+	MemoryBytes   *int    `json:"memory_bytes,omitempty"`
+	MemoryRemoved *int    `json:"memory_removed,omitempty"`
 	// provider_pool event fields
 	Provider      string `json:"provider,omitempty"`
 	KeyID         string `json:"key_id,omitempty"`
@@ -40,6 +47,19 @@ type CostInfo struct {
 	InputTokens  int
 	OutputTokens int
 	CostUSD      *float64
+}
+
+// MemoryOpInfo holds structured telemetry for memory recall/retain hooks.
+type MemoryOpInfo struct {
+	Service       string
+	Operation     string
+	Status        string
+	StatusCode    int
+	LatencyMS     int64
+	Blocks        *int
+	InjectedBytes *int
+	PolicyRemoved *int
+	Error         error
 }
 
 func New(w io.Writer) *Logger {
@@ -140,6 +160,30 @@ func (l *Logger) LogFeedFetch(clawID, feedName, feedURL string, statusCode int, 
 	l.log(e)
 }
 
+func (l *Logger) LogMemoryOp(clawID, model string, info MemoryOpInfo) {
+	e := entry{
+		TS:            time.Now().UTC().Format(time.RFC3339),
+		ClawID:        clawID,
+		Type:          "memory_op",
+		Model:         model,
+		LatencyMS:     ptrI64(info.LatencyMS),
+		Intervention:  nil,
+		MemoryService: ptrString(info.Service),
+		MemoryOp:      ptrString(info.Operation),
+		MemoryStatus:  ptrString(info.Status),
+		MemoryBlocks:  info.Blocks,
+		MemoryBytes:   info.InjectedBytes,
+		MemoryRemoved: info.PolicyRemoved,
+	}
+	if info.StatusCode > 0 {
+		e.StatusCode = ptrInt(info.StatusCode)
+	}
+	if info.Error != nil {
+		e.Error = info.Error.Error()
+	}
+	l.log(e)
+}
+
 // LogProviderPool emits a structured provider_pool transition event.
 // action is one of: "cooldown", "dead", "activated", "added", "deleted".
 func (l *Logger) LogProviderPool(provider, keyID, action, reason, cooldownUntil string) {
@@ -174,5 +218,12 @@ func ptrI64(v int64) *int64 {
 }
 
 func ptrF64(v float64) *float64 {
+	return &v
+}
+
+func ptrString(v string) *string {
+	if v == "" {
+		return nil
+	}
 	return &v
 }

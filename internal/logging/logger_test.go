@@ -125,3 +125,45 @@ func TestLogFeedFetchIncludesFeedFields(t *testing.T) {
 		t.Errorf("expected status_code=200, got %v", entry["status_code"])
 	}
 }
+
+func TestLogMemoryOpIncludesStructuredFields(t *testing.T) {
+	var buf bytes.Buffer
+	l := New(&buf)
+	blocks := 2
+	injectedBytes := 144
+	l.LogMemoryOp("weston", "openai/gpt-4o", MemoryOpInfo{
+		Service:       "team-memory",
+		Operation:     "recall",
+		Status:        "succeeded",
+		StatusCode:    200,
+		LatencyMS:     37,
+		Blocks:        &blocks,
+		InjectedBytes: &injectedBytes,
+	})
+
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if entry["type"] != "memory_op" {
+		t.Fatalf("expected type=memory_op, got %v", entry["type"])
+	}
+	if entry["memory_service"] != "team-memory" {
+		t.Fatalf("expected memory_service, got %v", entry["memory_service"])
+	}
+	if entry["memory_op"] != "recall" {
+		t.Fatalf("expected memory_op=recall, got %v", entry["memory_op"])
+	}
+	if entry["memory_status"] != "succeeded" {
+		t.Fatalf("expected memory_status=succeeded, got %v", entry["memory_status"])
+	}
+	if entry["memory_blocks"].(float64) != 2 {
+		t.Fatalf("expected memory_blocks=2, got %v", entry["memory_blocks"])
+	}
+	if entry["memory_bytes"].(float64) != 144 {
+		t.Fatalf("expected memory_bytes=144, got %v", entry["memory_bytes"])
+	}
+	if entry["latency_ms"].(float64) != 37 {
+		t.Fatalf("expected latency_ms=37, got %v", entry["latency_ms"])
+	}
+}
