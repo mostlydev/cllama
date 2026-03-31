@@ -191,6 +191,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		h.fail(w, http.StatusBadRequest, "invalid JSON body", agentID, "", start, err)
 		return
 	}
+	h.recallOpenAIMemory(r.Context(), agentID, agentCtx, payload)
 	if feedBlock := h.fetchFeeds(r.Context(), agentID, agentCtx); feedBlock != "" {
 		feeds.InjectOpenAI(payload, feedBlock)
 	}
@@ -215,7 +216,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}
 
-	h.dispatchCandidates(w, r, agentID, requestedModel, payload, resolution.Candidates, inBody, start)
+	h.dispatchCandidates(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, start)
 }
 
 // resolveOpenAIProvider maps a parsed provider name to the actual provider name
@@ -257,6 +258,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		h.fail(w, http.StatusBadRequest, "invalid JSON body", agentID, "", start, err)
 		return
 	}
+	h.recallAnthropicMemory(r.Context(), agentID, agentCtx, payload)
 	if feedBlock := h.fetchFeeds(r.Context(), agentID, agentCtx); feedBlock != "" {
 		feeds.InjectAnthropic(payload, feedBlock)
 	}
@@ -277,10 +279,10 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}
 
-	h.dispatchCandidates(w, r, agentID, requestedModel, payload, resolution.Candidates, inBody, start)
+	h.dispatchCandidates(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, start)
 }
 
-func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, agentID, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, start time.Time) {
+func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, start time.Time) {
 	sawCooldown := false
 	for i, candidate := range candidates {
 		payload["model"] = candidate.UpstreamModel
@@ -289,7 +291,7 @@ func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, age
 			h.fail(w, http.StatusInternalServerError, "failed to encode upstream body", agentID, requestedModel, start, err)
 			return
 		}
-		tryNextCandidate, candidateCooldown := h.dispatchWithRetry(w, r, agentID, requestedModel, candidate, outBody, requestOriginal, start)
+		tryNextCandidate, candidateCooldown := h.dispatchWithRetry(w, r, agentID, agentCtx, requestedModel, candidate, outBody, requestOriginal, start)
 		if !tryNextCandidate {
 			return
 		}
@@ -310,7 +312,7 @@ func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, age
 // failures (401/403/402/quota-429 → dead, rate-limit-429 → cooldown).
 // 5xx and transport errors do NOT cause key state changes.
 // It returns (advanceToNextCandidate, candidateSawCooldown).
-func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID, requestedModel string, candidate dispatchCandidate, outBody []byte, requestOriginal []byte, start time.Time) (bool, bool) {
+func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, candidate dispatchCandidate, outBody []byte, requestOriginal []byte, start time.Time) (bool, bool) {
 	const maxKeyAttempts = 5
 	sawCooldown := false
 
@@ -397,7 +399,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 
 		default:
 			// Success or 5xx: stream response back, no key state change.
-			h.streamResponse(w, resp, agentID, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start)
+			h.streamResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start)
 			return false, sawCooldown
 		}
 	}
@@ -491,7 +493,7 @@ func applyProviderAuth(outReq *http.Request, prov *provider.Provider) error {
 }
 
 // streamResponse forwards the upstream response to the client and logs it.
-func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, agentID, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time) {
+func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time) {
 	defer resp.Body.Close()
 
 	copyResponseHeaders(w.Header(), resp.Header)
@@ -531,14 +533,14 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 		}
 	}
 
-	if h.sessionRecorder != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		var responsePayload sessionhistory.Payload
 		if isSSE(resp.Header) {
 			responsePayload = sessionhistory.Payload{Format: "sse", Text: string(captured)}
 		} else {
 			responsePayload = sessionhistory.Payload{Format: "json", JSON: json.RawMessage(captured)}
 		}
-		if err := h.sessionRecorder.Record(agentID, sessionhistory.Entry{
+		entry := sessionhistory.Entry{
 			Version:           1,
 			ClawID:            agentID,
 			TS:                start.UTC().Format(time.RFC3339),
@@ -556,9 +558,13 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 				CompletionTokens: usage.CompletionTokens,
 				ReportedCostUSD:  usage.ReportedCostUSD,
 			},
-		}); err != nil {
-			h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("session history write: %w", err))
 		}
+		if h.sessionRecorder != nil {
+			if err := h.sessionRecorder.Record(agentID, entry); err != nil {
+				h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("session history write: %w", err))
+			}
+		}
+		h.retainMemory(agentID, agentCtx, entry)
 	}
 
 	latency := time.Since(start).Milliseconds()

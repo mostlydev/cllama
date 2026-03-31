@@ -16,6 +16,7 @@ type AgentContext struct {
 	ClawdapusMD []byte
 	Metadata    map[string]any
 	ServiceAuth []ServiceAuthEntry
+	Memory      *MemoryManifest
 	ModelPolicy *ModelPolicy
 }
 
@@ -24,6 +25,26 @@ type ServiceAuthEntry struct {
 	AuthType  string `json:"auth_type"`
 	Token     string `json:"token,omitempty"`
 	Principal string `json:"principal,omitempty"`
+}
+
+type AuthEntry struct {
+	Type  string `json:"type"`
+	Token string `json:"token,omitempty"`
+}
+
+type MemoryManifest struct {
+	Version int        `json:"version"`
+	Service string     `json:"service"`
+	BaseURL string     `json:"base_url"`
+	Recall  *MemoryOp  `json:"recall,omitempty"`
+	Retain  *MemoryOp  `json:"retain,omitempty"`
+	Forget  *MemoryOp  `json:"forget,omitempty"`
+	Auth    *AuthEntry `json:"auth,omitempty"`
+}
+
+type MemoryOp struct {
+	Path      string `json:"path"`
+	TimeoutMS int    `json:"timeout_ms,omitempty"`
 }
 
 // Load reads an agent's context files from contextRoot/<agentID>/.
@@ -59,6 +80,10 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load agent context %q: service-auth: %w", agentID, err)
 	}
+	memory, err := loadMemoryManifest(dir)
+	if err != nil {
+		return nil, fmt.Errorf("load agent context %q: memory.json: %w", agentID, err)
+	}
 
 	return &AgentContext{
 		AgentID:     agentID,
@@ -67,6 +92,7 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 		ClawdapusMD: clawdapusMD,
 		Metadata:    meta,
 		ServiceAuth: serviceAuth,
+		Memory:      memory,
 		ModelPolicy: typed.ModelPolicy,
 	}, nil
 }
@@ -152,6 +178,21 @@ func loadServiceAuth(dir string) ([]ServiceAuthEntry, error) {
 		auth = append(auth, parsed)
 	}
 	return auth, nil
+}
+
+func loadMemoryManifest(dir string) (*MemoryManifest, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, "memory.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var manifest MemoryManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return nil, err
+	}
+	return &manifest, nil
 }
 
 // AgentSummary is a lightweight view of an agent for listing purposes.

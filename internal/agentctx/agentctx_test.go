@@ -160,3 +160,40 @@ func TestLoadReadsServiceAuthEntries(t *testing.T) {
 		t.Fatalf("unexpected service auth entry: %+v", ctx.ServiceAuth[0])
 	}
 }
+
+func TestLoadReadsMemoryManifest(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"tiverton:secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "memory.json"), []byte(`{
+		"version": 1,
+		"service": "team-memory",
+		"base_url": "http://team-memory:8080",
+		"recall": {"path": "/recall", "timeout_ms": 300},
+		"retain": {"path": "/retain"}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "tiverton")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ctx.Memory == nil {
+		t.Fatal("expected memory manifest")
+	}
+	if ctx.Memory.Service != "team-memory" || ctx.Memory.Recall == nil || ctx.Memory.Recall.TimeoutMS != 300 {
+		t.Fatalf("unexpected memory manifest: %+v", ctx.Memory)
+	}
+}

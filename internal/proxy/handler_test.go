@@ -1484,6 +1484,156 @@ func TestHandlerSkipsSessionHistoryOnUpstreamError(t *testing.T) {
 	}
 }
 
+func TestHandlerInjectsMemoryRecallIntoOpenAIRequests(t *testing.T) {
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read backend body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	memorySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/recall" {
+			t.Fatalf("unexpected memory path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"memories":[{"text":"User prefers concise answers","kind":"profile","source":"profile-store"}]}`))
+	}))
+	defer memorySrv.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, func(id string) (*agentctx.AgentContext, error) {
+		if id != "tiverton" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID: "tiverton",
+			Metadata: map[string]any{
+				"token":   "tiverton:dummy123",
+				"pod":     "ops",
+				"service": "tiverton",
+				"type":    "openclaw",
+			},
+			Memory: &agentctx.MemoryManifest{
+				Version: 1,
+				Service: "team-memory",
+				BaseURL: memorySrv.URL,
+				Recall:  &agentctx.MemoryOp{Path: "/recall", TimeoutMS: 300},
+			},
+		}, nil
+	}, nil)
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal backend body: %v", err)
+	}
+	messages := payload["messages"].([]any)
+	if len(messages) < 2 {
+		t.Fatalf("expected injected system message, got %+v", payload)
+	}
+	first := messages[0].(map[string]any)
+	if first["role"] != "system" {
+		t.Fatalf("expected leading system message, got %+v", first)
+	}
+	content := first["content"].(string)
+	if !strings.Contains(content, "User prefers concise answers") {
+		t.Fatalf("expected recalled memory in injected content, got %q", content)
+	}
+}
+
+func TestHandlerRetainsMemoryAfterSuccessfulTurn(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer backend.Close()
+
+	retainCh := make(chan map[string]any, 1)
+	memorySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/retain" {
+			t.Fatalf("unexpected memory path: %s", r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode retain payload: %v", err)
+		}
+		retainCh <- payload
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer memorySrv.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, func(id string) (*agentctx.AgentContext, error) {
+		if id != "tiverton" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID: "tiverton",
+			Metadata: map[string]any{
+				"token":   "tiverton:dummy123",
+				"pod":     "ops",
+				"service": "tiverton",
+				"type":    "openclaw",
+			},
+			Memory: &agentctx.MemoryManifest{
+				Version: 1,
+				Service: "team-memory",
+				BaseURL: memorySrv.URL,
+				Retain:  &agentctx.MemoryOp{Path: "/retain"},
+			},
+		}, nil
+	}, nil)
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	select {
+	case payload := <-retainCh:
+		if payload["agent_id"] != "tiverton" {
+			t.Fatalf("unexpected retain payload: %+v", payload)
+		}
+		entry := payload["entry"].(map[string]any)
+		if entry["claw_id"] != "tiverton" {
+			t.Fatalf("unexpected retained entry: %+v", payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for retain request")
+	}
+}
+
 func stubContextLoaderWithToken(agentID, token string) ContextLoader {
 	return func(id string) (*agentctx.AgentContext, error) {
 		if id != agentID {
