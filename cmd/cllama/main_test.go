@@ -207,6 +207,13 @@ func TestAPIHistoryEndpointAllowsAgentAndDedicatedReplayAuth(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("expected one ndjson line, got %q", rec.Body.String())
 	}
+	var replayEntry map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &replayEntry); err != nil {
+		t.Fatalf("unmarshal replay history entry: %v", err)
+	}
+	if replayEntry["id"] == "" {
+		t.Fatalf("expected replay history entry ID, got %+v", replayEntry)
+	}
 
 	req = httptest.NewRequest(http.MethodGet, "/history/tiverton?limit=1", nil)
 	req.Header.Set("Authorization", "Bearer memory-token")
@@ -226,6 +233,13 @@ func TestAPIHistoryEndpointAllowsAgentAndDedicatedReplayAuth(t *testing.T) {
 	lines = strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
 	if len(lines) != 1 {
 		t.Fatalf("expected one filtered ndjson line, got %q", rec.Body.String())
+	}
+	replayEntry = nil
+	if err := json.Unmarshal([]byte(lines[0]), &replayEntry); err != nil {
+		t.Fatalf("unmarshal filtered history entry: %v", err)
+	}
+	if replayEntry["id"] == "" {
+		t.Fatalf("expected filtered history entry ID, got %+v", replayEntry)
 	}
 }
 

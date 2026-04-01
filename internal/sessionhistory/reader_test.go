@@ -2,6 +2,8 @@ package sessionhistory
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -37,6 +39,9 @@ func TestReadEntriesAppliesAfterAndLimit(t *testing.T) {
 	if entries[0].TS != base.Add(time.Minute).Format(time.RFC3339) {
 		t.Fatalf("unexpected first filtered timestamp: %+v", entries[0])
 	}
+	if entries[0].ID == "" {
+		t.Fatalf("expected read entries to include stable ID, got %+v", entries[0])
+	}
 }
 
 func TestReadEntriesMissingFileReturnsEmpty(t *testing.T) {
@@ -46,5 +51,28 @@ func TestReadEntriesMissingFileReturnsEmpty(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("expected no entries, got %+v", entries)
+	}
+}
+
+func TestReadEntriesHydratesLegacyIDsFromRawJSON(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "agent-legacy")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	raw := `{"version":1,"ts":"2026-04-01T00:00:00Z","claw_id":"agent-legacy","response":{"format":"json","json":{}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(agentDir, "history.jsonl"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := ReadEntries(dir, "agent-legacy", nil, 1)
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0].ID == "" {
+		t.Fatalf("expected legacy entry ID to be hydrated, got %+v", entries[0])
 	}
 }

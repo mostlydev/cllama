@@ -1388,6 +1388,9 @@ func TestHandlerRecordsSessionHistoryJSON(t *testing.T) {
 	if entry["requested_model"] != "openai/gpt-4o" {
 		t.Errorf("expected requested_model=openai/gpt-4o, got %v", entry["requested_model"])
 	}
+	if entry["id"] == "" {
+		t.Errorf("expected stable history entry ID, got %+v", entry)
+	}
 	resp, _ := entry["response"].(map[string]any)
 	if resp == nil {
 		t.Fatal("expected response field in entry")
@@ -1658,6 +1661,9 @@ func TestHandlerRetainsMemoryAfterSuccessfulTurn(t *testing.T) {
 		entry := payload["entry"].(map[string]any)
 		if entry["claw_id"] != "tiverton" {
 			t.Fatalf("unexpected retained entry: %+v", payload)
+		}
+		if entry["id"] == "" {
+			t.Fatalf("expected retained entry ID, got %+v", payload)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for retain request")

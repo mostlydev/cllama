@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -51,6 +52,9 @@ func ReadEntries(baseDir, agentID string, after *time.Time, limit int) ([]Entry,
 		var entry Entry
 		if err := json.Unmarshal(line, &entry); err != nil {
 			return nil, fmt.Errorf("parse history entry: %w", err)
+		}
+		if strings.TrimSpace(entry.ID) == "" {
+			entry.ID = IDFromJSON(line)
 		}
 		if after != nil {
 			ts, err := time.Parse(time.RFC3339, entry.TS)

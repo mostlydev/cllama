@@ -28,6 +28,7 @@ type Usage struct {
 // Entry is the normalized envelope written as one JSONL line per LLM turn.
 type Entry struct {
 	Version           int             `json:"version"`
+	ID                string          `json:"id,omitempty"`
 	TS                string          `json:"ts"`
 	ClawID            string          `json:"claw_id"`
 	Path              string          `json:"path"`
@@ -82,6 +83,9 @@ func (r *Recorder) BaseDir() string {
 func (r *Recorder) Record(agentID string, e Entry) error {
 	if r.baseDir == "" {
 		return nil
+	}
+	if err := e.EnsureID(); err != nil {
+		return err
 	}
 
 	of, err := r.openFor(agentID)

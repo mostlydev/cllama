@@ -557,6 +557,10 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 				ReportedCostUSD:  usage.ReportedCostUSD,
 			},
 		}
+		if err := entry.EnsureID(); err != nil {
+			h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("session history id: %w", err))
+			return
+		}
 		if h.sessionRecorder != nil {
 			if err := h.sessionRecorder.Record(agentID, entry); err != nil {
 				h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("session history write: %w", err))

@@ -240,6 +240,7 @@ One file per agent. Each line is one entry, appended on every successful upstrea
 | Field | Description |
 |---|---|
 | `version` | Schema version (`1`). |
+| `id` | Stable source-event ID for replay/deduplication. |
 | `ts` | RFC3339 timestamp of when the response was received. |
 | `claw_id` | Agent ID. |
 | `path` | Request path (e.g., `/v1/chat/completions`). |
