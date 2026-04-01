@@ -166,7 +166,6 @@ func (l *Logger) LogMemoryOp(clawID, model string, info MemoryOpInfo) {
 		ClawID:        clawID,
 		Type:          "memory_op",
 		Model:         model,
-		LatencyMS:     ptrI64(info.LatencyMS),
 		Intervention:  nil,
 		MemoryService: ptrString(info.Service),
 		MemoryOp:      ptrString(info.Operation),
@@ -174,6 +173,9 @@ func (l *Logger) LogMemoryOp(clawID, model string, info MemoryOpInfo) {
 		MemoryBlocks:  info.Blocks,
 		MemoryBytes:   info.InjectedBytes,
 		MemoryRemoved: info.PolicyRemoved,
+	}
+	if info.LatencyMS > 0 {
+		e.LatencyMS = ptrI64(info.LatencyMS)
 	}
 	if info.StatusCode > 0 {
 		e.StatusCode = ptrInt(info.StatusCode)

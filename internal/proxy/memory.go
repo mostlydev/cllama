@@ -63,7 +63,6 @@ func (h *Handler) recallOpenAIMemory(reqCtx context.Context, agentID string, age
 		Metadata: memoryMetadata(agentCtx, "openai", requestedModel),
 	})
 	if err != nil {
-		h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("memory recall: %w", err))
 		return
 	}
 	if block != "" {
@@ -80,7 +79,6 @@ func (h *Handler) recallAnthropicMemory(reqCtx context.Context, agentID string, 
 		Metadata: memoryMetadata(agentCtx, "anthropic", requestedModel),
 	})
 	if err != nil {
-		h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("memory recall: %w", err))
 		return
 	}
 	if block != "" {
@@ -231,7 +229,6 @@ func (h *Handler) retainMemory(agentID string, agentCtx *agentctx.AgentContext, 
 				LatencyMS:  latency,
 				Error:      err,
 			})
-			h.logger.LogError(agentID, entry.RequestedModel, 0, 0, fmt.Errorf("memory retain: %w", err))
 			return
 		}
 		h.logger.LogMemoryOp(agentID, entry.RequestedModel, logging.MemoryOpInfo{

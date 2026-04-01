@@ -1674,7 +1674,7 @@ func TestHandlerRetainsMemoryAfterSuccessfulTurn(t *testing.T) {
 }
 
 func TestHandlerLogsOversizedMemoryRecallResponseClearly(t *testing.T) {
-	var logs bytes.Buffer
+	var logs lockedBuffer
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
@@ -1721,18 +1721,199 @@ func TestHandlerLogsOversizedMemoryRecallResponseClearly(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
 	}
-	entries := parseLogEntries(t, logs.Bytes())
-	found := false
-	for _, entry := range entries {
-		if entry["type"] == "error" {
-			if errText, _ := entry["error"].(string); strings.Contains(errText, "recall response exceeds") {
-				found = true
-				break
+	failureLog := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "memory_op" && entry["memory_op"] == "recall" && entry["memory_status"] == "failed"
+	})
+	if errText, _ := failureLog["error"].(string); !strings.Contains(errText, "recall response exceeds") {
+		t.Fatalf("expected oversized recall error text in memory_op log, got %+v", failureLog)
+	}
+	if hasLogEntry(t, logs.Bytes(), func(entry map[string]any) bool { return entry["type"] == "error" }) {
+		t.Fatalf("expected no generic error log for oversized recall, got %v", parseLogEntries(t, logs.Bytes()))
+	}
+}
+
+func TestHandlerLogsSkippedMemoryRecallWithoutLatency(t *testing.T) {
+	var logs lockedBuffer
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read backend body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, func(id string) (*agentctx.AgentContext, error) {
+		if id != "tiverton" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID: "tiverton",
+			Metadata: map[string]any{
+				"token": "tiverton:dummy123",
+			},
+			Memory: &agentctx.MemoryManifest{
+				Version: 1,
+				Service: "team-memory",
+			},
+		}, nil
+	}, logging.New(&logs))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal backend body: %v", err)
+	}
+	messages := payload["messages"].([]any)
+	for _, raw := range messages {
+		msg := raw.(map[string]any)
+		if msg["role"] == "system" {
+			if content, _ := msg["content"].(string); strings.Contains(content, "BEGIN MEMORY") {
+				t.Fatalf("did not expect memory injection when recall is skipped, got %+v", msg)
 			}
 		}
 	}
-	if !found {
-		t.Fatalf("expected oversized recall error log, got %v", entries)
+	skippedLog := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "memory_op" && entry["memory_op"] == "recall" && entry["memory_status"] == "skipped"
+	})
+	if _, ok := skippedLog["latency_ms"]; ok {
+		t.Fatalf("expected skipped recall log to omit latency_ms, got %+v", skippedLog)
+	}
+}
+
+func TestHandlerLogsTimedOutMemoryRecallWithoutGenericError(t *testing.T) {
+	var logs lockedBuffer
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	memorySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"memories":[{"text":"late memory"}]}`))
+	}))
+	defer memorySrv.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, func(id string) (*agentctx.AgentContext, error) {
+		if id != "tiverton" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID: "tiverton",
+			Metadata: map[string]any{
+				"token": "tiverton:dummy123",
+			},
+			Memory: &agentctx.MemoryManifest{
+				Version: 1,
+				Service: "team-memory",
+				BaseURL: memorySrv.URL,
+				Recall:  &agentctx.MemoryOp{Path: "/recall", TimeoutMS: 10},
+			},
+		}, nil
+	}, logging.New(&logs))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	timeoutLog := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "memory_op" && entry["memory_op"] == "recall" && entry["memory_status"] == "timed_out"
+	})
+	if _, ok := timeoutLog["error"]; !ok {
+		t.Fatalf("expected timed_out recall log to include error text, got %+v", timeoutLog)
+	}
+	if hasLogEntry(t, logs.Bytes(), func(entry map[string]any) bool { return entry["type"] == "error" }) {
+		t.Fatalf("expected no generic error log for timed out recall, got %v", parseLogEntries(t, logs.Bytes()))
+	}
+}
+
+func TestHandlerLogsFailedMemoryRetainWithoutGenericError(t *testing.T) {
+	var logs lockedBuffer
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer backend.Close()
+
+	memorySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer memorySrv.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, func(id string) (*agentctx.AgentContext, error) {
+		if id != "tiverton" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID: "tiverton",
+			Metadata: map[string]any{
+				"token": "tiverton:dummy123",
+			},
+			Memory: &agentctx.MemoryManifest{
+				Version: 1,
+				Service: "team-memory",
+				BaseURL: memorySrv.URL,
+				Retain:  &agentctx.MemoryOp{Path: "/retain"},
+			},
+		}, nil
+	}, logging.New(&logs))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	failedLog := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "memory_op" && entry["memory_op"] == "retain" && entry["memory_status"] == "failed"
+	})
+	if failedLog["status_code"].(float64) != http.StatusBadGateway {
+		t.Fatalf("expected retain failure status_code=%d, got %+v", http.StatusBadGateway, failedLog)
+	}
+	if hasLogEntry(t, logs.Bytes(), func(entry map[string]any) bool { return entry["type"] == "error" }) {
+		t.Fatalf("expected no generic error log for failed retain, got %v", parseLogEntries(t, logs.Bytes()))
 	}
 }
 
@@ -1802,6 +1983,16 @@ func waitForLogEntry(t *testing.T, logs *lockedBuffer, predicate func(map[string
 	}
 	t.Fatal("timed out waiting for log entry")
 	return nil
+}
+
+func hasLogEntry(t *testing.T, raw []byte, predicate func(map[string]any) bool) bool {
+	t.Helper()
+	for _, entry := range parseLogEntries(t, raw) {
+		if predicate(entry) {
+			return true
+		}
+	}
+	return false
 }
 
 func assertInterventionLogged(t *testing.T, raw []byte, reason string) {
