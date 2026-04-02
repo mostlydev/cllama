@@ -16,6 +16,7 @@ type AgentContext struct {
 	ClawdapusMD []byte
 	Metadata    map[string]any
 	ServiceAuth []ServiceAuthEntry
+	Tools       *ToolManifest
 	Memory      *MemoryManifest
 	ModelPolicy *ModelPolicy
 }
@@ -30,6 +31,35 @@ type ServiceAuthEntry struct {
 type AuthEntry struct {
 	Type  string `json:"type"`
 	Token string `json:"token,omitempty"`
+}
+
+type ToolManifest struct {
+	Version int                 `json:"version"`
+	Tools   []ToolManifestEntry `json:"tools"`
+	Policy  ToolPolicy          `json:"policy"`
+}
+
+type ToolManifestEntry struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	InputSchema map[string]any `json:"inputSchema"`
+	Annotations map[string]any `json:"annotations,omitempty"`
+	Execution   ToolExecution  `json:"execution"`
+}
+
+type ToolExecution struct {
+	Transport string     `json:"transport"`
+	Service   string     `json:"service"`
+	BaseURL   string     `json:"base_url"`
+	Method    string     `json:"method"`
+	Path      string     `json:"path"`
+	Auth      *AuthEntry `json:"auth,omitempty"`
+}
+
+type ToolPolicy struct {
+	MaxRounds        int `json:"max_rounds"`
+	TimeoutPerToolMS int `json:"timeout_per_tool_ms"`
+	TotalTimeoutMS   int `json:"total_timeout_ms"`
 }
 
 type MemoryManifest struct {
@@ -80,6 +110,10 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load agent context %q: service-auth: %w", agentID, err)
 	}
+	tools, err := loadToolsManifest(dir)
+	if err != nil {
+		return nil, fmt.Errorf("load agent context %q: tools.json: %w", agentID, err)
+	}
 	memory, err := loadMemoryManifest(dir)
 	if err != nil {
 		return nil, fmt.Errorf("load agent context %q: memory.json: %w", agentID, err)
@@ -92,6 +126,7 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 		ClawdapusMD: clawdapusMD,
 		Metadata:    meta,
 		ServiceAuth: serviceAuth,
+		Tools:       tools,
 		Memory:      memory,
 		ModelPolicy: typed.ModelPolicy,
 	}, nil
@@ -189,6 +224,21 @@ func loadMemoryManifest(dir string) (*MemoryManifest, error) {
 		return nil, err
 	}
 	var manifest MemoryManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return nil, err
+	}
+	return &manifest, nil
+}
+
+func loadToolsManifest(dir string) (*ToolManifest, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, "tools.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var manifest ToolManifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return nil, err
 	}

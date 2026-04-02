@@ -38,6 +38,9 @@ func TestLoadReadsAllFiles(t *testing.T) {
 	if ctx.MetadataToken() != "tiverton:secret" {
 		t.Errorf("wrong token: %q", ctx.MetadataToken())
 	}
+	if ctx.Tools != nil {
+		t.Fatalf("expected no tools manifest, got %+v", ctx.Tools)
+	}
 	if ctx.HasPolicy() {
 		t.Fatal("expected no model policy")
 	}
@@ -195,5 +198,70 @@ func TestLoadReadsMemoryManifest(t *testing.T) {
 	}
 	if ctx.Memory.Service != "team-memory" || ctx.Memory.Recall == nil || ctx.Memory.Recall.TimeoutMS != 300 {
 		t.Fatalf("unexpected memory manifest: %+v", ctx.Memory)
+	}
+}
+
+func TestLoadReadsToolsManifest(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"tiverton:secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tools := `{
+		"version": 1,
+		"tools": [
+			{
+				"name": "trading-api.get_market_context",
+				"description": "Retrieve market context",
+				"inputSchema": {"type": "object"},
+				"annotations": {"readOnly": true},
+				"execution": {
+					"transport": "http",
+					"service": "trading-api",
+					"base_url": "http://trading-api:4000",
+					"method": "GET",
+					"path": "/api/v1/market_context/{claw_id}",
+					"auth": {"type": "bearer", "token": "tool-token"}
+				}
+			}
+		],
+		"policy": {
+			"max_rounds": 8,
+			"timeout_per_tool_ms": 30000,
+			"total_timeout_ms": 120000
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(agentDir, "tools.json"), []byte(tools), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "tiverton")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ctx.Tools == nil {
+		t.Fatal("expected tools manifest")
+	}
+	if ctx.Tools.Version != 1 || len(ctx.Tools.Tools) != 1 {
+		t.Fatalf("unexpected tools manifest header: %+v", ctx.Tools)
+	}
+	tool := ctx.Tools.Tools[0]
+	if tool.Name != "trading-api.get_market_context" {
+		t.Fatalf("unexpected tool name: %+v", tool)
+	}
+	if tool.Execution.Service != "trading-api" || tool.Execution.Auth == nil || tool.Execution.Auth.Token != "tool-token" {
+		t.Fatalf("unexpected tool execution: %+v", tool.Execution)
+	}
+	if ctx.Tools.Policy.MaxRounds != 8 || ctx.Tools.Policy.TimeoutPerToolMS != 30000 || ctx.Tools.Policy.TotalTimeoutMS != 120000 {
+		t.Fatalf("unexpected tool policy: %+v", ctx.Tools.Policy)
 	}
 }

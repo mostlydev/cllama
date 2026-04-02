@@ -198,6 +198,10 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		feeds.InjectOpenAI(payload, feedBlock)
 	}
 	feeds.InjectOpenAI(payload, currentTimeLine(agentCtx, time.Now()))
+	if err := injectManagedOpenAITools(payload, agentCtx); err != nil {
+		h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
+		return
+	}
 	resolution, err := h.resolveOpenAIExecution(agentCtx, requestedModel)
 	if err != nil {
 		status := http.StatusBadGateway
@@ -264,6 +268,10 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		feeds.InjectAnthropic(payload, feedBlock)
 	}
 	feeds.InjectAnthropic(payload, currentTimeLine(agentCtx, time.Now()))
+	if err := injectManagedAnthropicTools(payload, agentCtx); err != nil {
+		h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
+		return
+	}
 	resolution, err := h.resolveAnthropicExecution(agentCtx, requestedModel)
 	if err != nil {
 		status := http.StatusBadGateway
@@ -396,8 +404,8 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			continue // try next key
 
 		default:
-			// Success or 5xx: stream response back, no key state change.
-			h.streamResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start)
+			// Success or 5xx: forward response back, no key state change.
+			h.forwardResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start)
 			return false, sawCooldown
 		}
 	}
@@ -491,6 +499,40 @@ func applyProviderAuth(outReq *http.Request, prov *provider.Provider) error {
 }
 
 // streamResponse forwards the upstream response to the client and logs it.
+func (h *Handler) forwardResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time) {
+	if hasManagedTools(agentCtx) && resp.StatusCode >= 200 && resp.StatusCode < 300 && !isSSE(resp.Header) {
+		h.forwardManagedToolAwareResponse(w, resp, agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, start)
+		return
+	}
+	h.streamResponse(w, resp, agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, start)
+}
+
+func (h *Handler) forwardManagedToolAwareResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time) {
+	defer resp.Body.Close()
+
+	captured, err := io.ReadAll(resp.Body)
+	if err != nil {
+		h.logger.LogError(agentID, requestedModel, resp.StatusCode, time.Since(start).Milliseconds(), err)
+		return
+	}
+	if responseContainsManagedToolCall(requestPath, captured) {
+		h.fail(w, http.StatusNotImplemented, "managed tool execution loop not implemented", agentID, requestedModel, start, fmt.Errorf("upstream returned managed tool call"))
+		return
+	}
+
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if len(captured) > 0 {
+		if _, err := w.Write(captured); err != nil {
+			h.logger.LogError(agentID, requestedModel, resp.StatusCode, time.Since(start).Milliseconds(), err)
+			return
+		}
+	}
+
+	h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, captured, start)
+}
+
+// streamResponse forwards the upstream response to the client and logs it.
 func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time) {
 	defer resp.Body.Close()
 
@@ -505,10 +547,13 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 	}
 
 	captured := responseBuf.Bytes()
+	h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, captured, start)
+}
 
+func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, responseHeader http.Header, captured []byte, start time.Time) {
 	var usage cost.Usage
 	if h.accumulator != nil || h.sessionRecorder != nil {
-		if isSSE(resp.Header) {
+		if isSSE(responseHeader) {
 			usage, _ = cost.ExtractUsageFromSSE(captured)
 		} else {
 			usage, _ = cost.ExtractUsage(captured)
@@ -531,9 +576,9 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 		}
 	}
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if statusCode >= 200 && statusCode < 300 {
 		var responsePayload sessionhistory.Payload
-		if isSSE(resp.Header) {
+		if isSSE(responseHeader) {
 			responsePayload = sessionhistory.Payload{Format: "sse", Text: string(captured)}
 		} else {
 			responsePayload = sessionhistory.Payload{Format: "json", JSON: json.RawMessage(captured)}
@@ -546,8 +591,8 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 			RequestedModel:    requestedModel,
 			EffectiveProvider: providerName,
 			EffectiveModel:    upstreamModel,
-			StatusCode:        resp.StatusCode,
-			Stream:            isSSE(resp.Header),
+			StatusCode:        statusCode,
+			Stream:            isSSE(responseHeader),
 			RequestOriginal:   json.RawMessage(requestOriginal),
 			RequestEffective:  json.RawMessage(requestEffective),
 			Response:          responsePayload,
@@ -571,9 +616,9 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 
 	latency := time.Since(start).Milliseconds()
 	if costInfo != nil {
-		h.logger.LogResponseWithCost(agentID, requestedModel, resp.StatusCode, latency, costInfo)
+		h.logger.LogResponseWithCost(agentID, requestedModel, statusCode, latency, costInfo)
 	} else {
-		h.logger.LogResponse(agentID, requestedModel, resp.StatusCode, latency)
+		h.logger.LogResponse(agentID, requestedModel, statusCode, latency)
 	}
 }
 
@@ -621,8 +666,7 @@ func isStreamingChatCompletions(path string, payload map[string]any) bool {
 	if !strings.HasPrefix(path, "/v1/chat/completions") {
 		return false
 	}
-	stream, _ := payload["stream"].(bool)
-	return stream
+	return requestedStream(payload)
 }
 
 func ensureStreamUsage(payload map[string]any) {
@@ -757,4 +801,119 @@ func constantTimeEqual(a, b string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func injectManagedOpenAITools(payload map[string]any, agentCtx *agentctx.AgentContext) error {
+	if !hasManagedTools(agentCtx) {
+		return nil
+	}
+	if requestedStream(payload) {
+		return fmt.Errorf("managed tools do not support streaming yet")
+	}
+	payload["tools"] = buildOpenAIToolSchemas(agentCtx.Tools.Tools)
+	delete(payload, "functions")
+	delete(payload, "function_call")
+	delete(payload, "tool_choice")
+	delete(payload, "parallel_tool_calls")
+	return nil
+}
+
+func injectManagedAnthropicTools(payload map[string]any, agentCtx *agentctx.AgentContext) error {
+	if !hasManagedTools(agentCtx) {
+		return nil
+	}
+	if requestedStream(payload) {
+		return fmt.Errorf("managed tools do not support streaming yet")
+	}
+	payload["tools"] = buildAnthropicToolSchemas(agentCtx.Tools.Tools)
+	delete(payload, "tool_choice")
+	return nil
+}
+
+func hasManagedTools(agentCtx *agentctx.AgentContext) bool {
+	return agentCtx != nil && agentCtx.Tools != nil && len(agentCtx.Tools.Tools) > 0
+}
+
+func buildOpenAIToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]any {
+	schemas := make([]map[string]any, 0, len(tools))
+	for _, tool := range tools {
+		schemas = append(schemas, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        tool.Name,
+				"description": tool.Description,
+				"parameters":  tool.InputSchema,
+			},
+		})
+	}
+	return schemas
+}
+
+func buildAnthropicToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]any {
+	schemas := make([]map[string]any, 0, len(tools))
+	for _, tool := range tools {
+		schemas = append(schemas, map[string]any{
+			"name":         tool.Name,
+			"description":  tool.Description,
+			"input_schema": tool.InputSchema,
+		})
+	}
+	return schemas
+}
+
+func requestedStream(payload map[string]any) bool {
+	stream, _ := payload["stream"].(bool)
+	return stream
+}
+
+func responseContainsManagedToolCall(requestPath string, captured []byte) bool {
+	if len(bytes.TrimSpace(captured)) == 0 {
+		return false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(captured, &payload); err != nil {
+		return false
+	}
+	if strings.HasPrefix(requestPath, "/v1/messages") {
+		return anthropicToolUsePresent(payload)
+	}
+	return openAIToolCallPresent(payload)
+}
+
+func openAIToolCallPresent(payload map[string]any) bool {
+	choices, _ := payload["choices"].([]any)
+	for _, choiceAny := range choices {
+		choice, _ := choiceAny.(map[string]any)
+		if choice == nil {
+			continue
+		}
+		if finishReason, _ := choice["finish_reason"].(string); finishReason == "tool_calls" {
+			return true
+		}
+		message, _ := choice["message"].(map[string]any)
+		if message == nil {
+			continue
+		}
+		if toolCalls, _ := message["tool_calls"].([]any); len(toolCalls) > 0 {
+			return true
+		}
+		if functionCall, _ := message["function_call"].(map[string]any); len(functionCall) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func anthropicToolUsePresent(payload map[string]any) bool {
+	content, _ := payload["content"].([]any)
+	for _, blockAny := range content {
+		block, _ := blockAny.(map[string]any)
+		if block == nil {
+			continue
+		}
+		if blockType, _ := block["type"].(string); blockType == "tool_use" {
+			return true
+		}
+	}
+	return false
 }

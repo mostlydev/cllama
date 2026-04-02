@@ -68,6 +68,139 @@ func TestHandlerForwardsAndSwapsAuth(t *testing.T) {
 	}
 }
 
+func TestHandlerInjectsManagedToolsIntoOpenAIRequests(t *testing.T) {
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifest()), nil)
+	body := `{
+		"model":"openai/gpt-4o",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"runner_local"}}],
+		"functions":[{"name":"legacy"}],
+		"tool_choice":"auto",
+		"parallel_tool_calls":true
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal backend body: %v", err)
+	}
+	tools, _ := payload["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 managed tool, got %+v", payload["tools"])
+	}
+	first, _ := tools[0].(map[string]any)
+	function, _ := first["function"].(map[string]any)
+	if first["type"] != "function" || function["name"] != "trading-api.get_market_context" {
+		t.Fatalf("unexpected managed tool payload: %+v", first)
+	}
+	if _, ok := payload["functions"]; ok {
+		t.Fatalf("expected legacy functions field removed, got %+v", payload)
+	}
+	if _, ok := payload["tool_choice"]; ok {
+		t.Fatalf("expected tool_choice removed, got %+v", payload)
+	}
+	if _, ok := payload["parallel_tool_calls"]; ok {
+		t.Fatalf("expected parallel_tool_calls removed, got %+v", payload)
+	}
+}
+
+func TestHandlerRejectsStreamingManagedOpenAITools(t *testing.T) {
+	backendCalled := false
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendCalled = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifest()), nil)
+	body := `{"model":"openai/gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d: %s", w.Code, w.Body.String())
+	}
+	if backendCalled {
+		t.Fatal("expected backend not to be called for streaming managed tools")
+	}
+	if !strings.Contains(w.Body.String(), "managed tools do not support streaming yet") {
+		t.Fatalf("expected clear streaming error, got %s", w.Body.String())
+	}
+}
+
+func TestHandlerFailsClosedOnManagedOpenAIToolCallResponse(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"chatcmpl-1",
+			"choices":[{
+				"finish_reason":"tool_calls",
+				"message":{
+					"role":"assistant",
+					"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+				}
+			}]
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifest()), nil)
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "managed tool execution loop not implemented") {
+		t.Fatalf("expected clear mediation error, got %s", w.Body.String())
+	}
+}
+
 func TestHandlerRejectsMissingBearer(t *testing.T) {
 	h := NewHandler(provider.NewRegistry(""), nil, nil)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -907,6 +1040,94 @@ func TestHandlerForwardsAnthropicMessages(t *testing.T) {
 	}
 	if payload["model"] != "claude-sonnet-4-20250514" {
 		t.Errorf("expected model unchanged, got %#v", payload["model"])
+	}
+}
+
+func TestHandlerInjectsManagedToolsIntoAnthropicRequests(t *testing.T) {
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_01","type":"message","content":[{"type":"text","text":"hello"}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifest()), nil)
+	body := `{
+		"model":"claude-sonnet-4-20250514",
+		"messages":[{"role":"user","content":"hi"}],
+		"tool_choice":{"type":"tool","name":"runner_local"}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal backend body: %v", err)
+	}
+	tools, _ := payload["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 managed tool, got %+v", payload["tools"])
+	}
+	first, _ := tools[0].(map[string]any)
+	if first["name"] != "trading-api.get_market_context" {
+		t.Fatalf("unexpected anthropic tool payload: %+v", first)
+	}
+	if _, ok := payload["tool_choice"]; ok {
+		t.Fatalf("expected tool_choice removed, got %+v", payload)
+	}
+}
+
+func TestHandlerFailsClosedOnManagedAnthropicToolUseResponse(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"msg_01",
+			"type":"message",
+			"content":[
+				{"type":"tool_use","id":"toolu_01","name":"trading-api.get_market_context","input":{}}
+			]
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifest()), nil)
+	body := `{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "managed tool execution loop not implemented") {
+		t.Fatalf("expected clear mediation error, got %s", w.Body.String())
 	}
 }
 
@@ -1955,6 +2176,47 @@ func stubContextLoaderWithPolicy(agentID, token string, policy *agentctx.ModelPo
 			},
 			ModelPolicy: policy,
 		}, nil
+	}
+}
+
+func stubContextLoaderWithTools(agentID, token string, tools *agentctx.ToolManifest) ContextLoader {
+	return func(id string) (*agentctx.AgentContext, error) {
+		if id != agentID {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID:     id,
+			ContextDir:  "/claw/context/" + id,
+			AgentsMD:    []byte("# Contract"),
+			ClawdapusMD: []byte("# Infra"),
+			Metadata: map[string]any{
+				"token": token,
+			},
+			Tools: tools,
+		}, nil
+	}
+}
+
+func managedToolManifest() *agentctx.ToolManifest {
+	return &agentctx.ToolManifest{
+		Version: 1,
+		Tools: []agentctx.ToolManifestEntry{{
+			Name:        "trading-api.get_market_context",
+			Description: "Retrieve market context",
+			InputSchema: map[string]any{"type": "object"},
+			Execution: agentctx.ToolExecution{
+				Transport: "http",
+				Service:   "trading-api",
+				BaseURL:   "http://trading-api:4000",
+				Method:    http.MethodGet,
+				Path:      "/api/v1/market_context/{claw_id}",
+			},
+		}},
+		Policy: agentctx.ToolPolicy{
+			MaxRounds:        8,
+			TimeoutPerToolMS: 30000,
+			TotalTimeoutMS:   120000,
+		},
 	}
 }
 
