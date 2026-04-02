@@ -272,7 +272,8 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		feeds.InjectAnthropic(payload, feedBlock)
 	}
 	feeds.InjectAnthropic(payload, currentTimeLine(agentCtx, time.Now()))
-	if err := injectManagedAnthropicTools(payload, agentCtx); err != nil {
+	if hasManagedTools(agentCtx) {
+		err := fmt.Errorf("managed anthropic tool execution not implemented")
 		h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
 		return
 	}

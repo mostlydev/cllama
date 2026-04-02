@@ -26,6 +26,7 @@ const (
 	defaultManagedToolTimeoutMS    = 30000
 	defaultManagedToolTotalTimeout = 120000
 	maxManagedToolResultBytes      = 16 * 1024
+	maxManagedLLMResponseBytes     = 4 * 1024 * 1024
 )
 
 var (
@@ -82,6 +83,12 @@ type managedUsageAggregate struct {
 	LoggedCostUSD    float64
 	LoggedCostKnown  bool
 	SawCostUsage     bool
+}
+
+type limitedReadResult struct {
+	Body          []byte
+	Truncated     bool
+	ObservedBytes int
 }
 
 func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, start time.Time) {
@@ -294,7 +301,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			_ = h.registry.SaveToFile()
 			continue
 		default:
-			body, readErr := io.ReadAll(resp.Body)
+			limited, readErr := readBodyLimited(resp.Body, maxManagedLLMResponseBytes)
 			resp.Body.Close()
 			if readErr != nil {
 				return dispatchJSONAttemptResult{
@@ -303,11 +310,18 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 					Err:           readErr,
 				}
 			}
+			if limited.Truncated {
+				return dispatchJSONAttemptResult{
+					ClientStatus:  http.StatusBadGateway,
+					ClientMessage: "managed tool mediation upstream response exceeded size limit",
+					Err:           fmt.Errorf("upstream response exceeded %d bytes during managed tool mediation", maxManagedLLMResponseBytes),
+				}
+			}
 			return dispatchJSONAttemptResult{
 				Response: &capturedResponse{
 					StatusCode:    resp.StatusCode,
 					Header:        resp.Header.Clone(),
-					Body:          body,
+					Body:          limited.Body,
 					ProviderName:  candidate.ProviderName,
 					UpstreamModel: candidate.UpstreamModel,
 					RequestBody:   append([]byte(nil), outBody...),
@@ -367,10 +381,28 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 	defer cancel()
 	raw, statusCode, err := h.callManagedHTTPTool(childCtx, agentID, tool, call.Arguments)
 	trace.LatencyMS = time.Since(start).Milliseconds()
-	trace.StatusCode = statusCode
 	if errors.Is(err, errManagedToolBudget) {
 		return managedToolOutcome{}, err
 	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		if ctx.Err() != nil {
+			return managedToolOutcome{}, errManagedToolBudget
+		}
+		raw = toolErrorPayload("timeout", fmt.Sprintf("Service did not respond within %s", formatDuration(policy.PerToolTimeout)), http.StatusGatewayTimeout, nil)
+		statusCode = http.StatusGatewayTimeout
+		trace.StatusCode = statusCode
+		trace.Result = raw
+		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+	}
+	if errors.Is(err, context.Canceled) {
+		if ctx.Err() != nil {
+			return managedToolOutcome{}, errManagedToolBudget
+		}
+		raw = toolErrorPayload("canceled", "Tool execution was canceled", 0, nil)
+		trace.Result = raw
+		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+	}
+	trace.StatusCode = statusCode
 	if err != nil {
 		trace.Result = raw
 		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
@@ -405,25 +437,22 @@ func (h *Handler) callManagedHTTPTool(ctx context.Context, agentID string, tool 
 
 	resp, err := h.client.Do(req)
 	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) && parentContextTimedOut(ctx) {
-			return nil, 0, errManagedToolBudget
-		}
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return toolErrorPayload("timeout", fmt.Sprintf("Service did not respond within %s", policyDurationText(ctx)), http.StatusGatewayTimeout, nil), http.StatusGatewayTimeout, nil
+		if ctx.Err() != nil {
+			return nil, 0, ctx.Err()
 		}
 		return toolErrorPayload("request_failed", err.Error(), 0, nil), 0, nil
 	}
 	defer resp.Body.Close()
 
-	respBody, readErr := io.ReadAll(resp.Body)
+	limited, readErr := readBodyLimited(resp.Body, maxManagedToolResultBytes)
 	if readErr != nil {
 		return toolErrorPayload("read_failed", readErr.Error(), resp.StatusCode, nil), resp.StatusCode, nil
 	}
+	details := decodeManagedToolBody(limited, resp.Header.Get("Content-Type"))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		details := decodeManagedToolBody(respBody, resp.Header.Get("Content-Type"))
 		return toolErrorPayload(fmt.Sprintf("http_%d", resp.StatusCode), fmt.Sprintf("Service returned HTTP %d", resp.StatusCode), resp.StatusCode, details), resp.StatusCode, nil
 	}
-	return toolSuccessPayload(resp.StatusCode, decodeManagedToolBody(respBody, resp.Header.Get("Content-Type"))), resp.StatusCode, nil
+	return toolSuccessPayload(resp.StatusCode, details), resp.StatusCode, nil
 }
 
 func renderManagedToolPath(path string, agentID string, args map[string]any) (string, map[string]any, error) {
@@ -632,16 +661,16 @@ func queryArgumentValue(v any) string {
 	return string(raw)
 }
 
-func decodeManagedToolBody(body []byte, contentType string) any {
-	trimmed := bytes.TrimSpace(body)
+func decodeManagedToolBody(body limitedReadResult, contentType string) any {
+	trimmed := bytes.TrimSpace(body.Body)
 	if len(trimmed) == 0 {
 		return nil
 	}
-	if len(trimmed) > maxManagedToolResultBytes {
+	if body.Truncated {
 		return map[string]any{
-			"data":           string(trimmed[:maxManagedToolResultBytes]),
+			"data":           string(trimmed),
 			"truncated":      true,
-			"original_bytes": len(trimmed),
+			"original_bytes": body.ObservedBytes,
 		}
 	}
 	if strings.Contains(strings.ToLower(contentType), "application/json") || json.Valid(trimmed) {
@@ -731,20 +760,30 @@ func jsonErrorPayload(msg string) []byte {
 	return raw
 }
 
-func parentContextTimedOut(ctx context.Context) bool {
-	return ctx.Err() != nil && errors.Is(ctx.Err(), context.DeadlineExceeded)
+func readBodyLimited(r io.Reader, limit int) (limitedReadResult, error) {
+	data, err := io.ReadAll(io.LimitReader(r, int64(limit)+1))
+	if err != nil {
+		return limitedReadResult{}, err
+	}
+	result := limitedReadResult{
+		Body:          data,
+		ObservedBytes: len(data),
+	}
+	if len(data) > limit {
+		result.Truncated = true
+		result.Body = data[:limit]
+	}
+	return result, nil
 }
 
-func policyDurationText(ctx context.Context) string {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return "configured timeout"
+func formatDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
 	}
-	remaining := time.Until(deadline)
-	if remaining < time.Second {
-		return "configured timeout"
+	if d < time.Second {
+		return d.Round(time.Millisecond).String()
 	}
-	return remaining.Round(time.Second).String()
+	return d.Round(time.Second).String()
 }
 
 func (a *managedUsageAggregate) AddRound(agentID string, usage cost.Usage, providerName, upstreamModel string, h *Handler) {

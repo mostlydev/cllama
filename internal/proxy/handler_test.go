@@ -296,6 +296,142 @@ func TestHandlerExecutesManagedToolsViaXAI(t *testing.T) {
 	}
 }
 
+func TestHandlerManagedToolHTTPErrorFeedsBackToModel(t *testing.T) {
+	var xaiBodies [][]byte
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"message":"backend unavailable"}`))
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read xai body: %v", err)
+		}
+		xaiBodies = append(xaiBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(xaiBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-1",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+					}
+				}]
+			}`))
+		case 2:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal xai follow-up: %v", err)
+			}
+			messages := payload["messages"].([]any)
+			last := messages[len(messages)-1].(map[string]any)
+			var toolResult map[string]any
+			if err := json.Unmarshal([]byte(last["content"].(string)), &toolResult); err != nil {
+				t.Fatalf("unmarshal tool result: %v", err)
+			}
+			if ok, _ := toolResult["ok"].(bool); ok {
+				t.Fatalf("expected failed tool result, got %+v", toolResult)
+			}
+			errPayload := toolResult["error"].(map[string]any)
+			if errPayload["code"] != "http_502" {
+				t.Fatalf("expected http_502 tool error, got %+v", toolResult)
+			}
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-2","choices":[{"message":{"role":"assistant","content":"tool failed cleanly"}}]}`))
+		default:
+			t.Fatalf("unexpected xai round %d", len(xaiBodies))
+		}
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+
+	body := `{"model":"xai/grok-4.1-fast","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "tool failed cleanly") {
+		t.Fatalf("expected recovery text after tool failure, got %s", w.Body.String())
+	}
+	if len(xaiBodies) != 2 {
+		t.Fatalf("expected 2 xai rounds, got %d", len(xaiBodies))
+	}
+}
+
+func TestHandlerManagedToolMaxRoundsFailsClosed(t *testing.T) {
+	xaiCalls := 0
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		xaiCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"chatcmpl-loop",
+			"choices":[{
+				"finish_reason":"tool_calls",
+				"message":{
+					"role":"assistant",
+					"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+				}
+			}]
+		}`))
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	tools := managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")
+	tools.Policy.MaxRounds = 1
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", tools), logging.New(io.Discard))
+
+	body := `{"model":"xai/grok-4.1-fast","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "managed tool max rounds exceeded") {
+		t.Fatalf("expected max_rounds error, got %s", w.Body.String())
+	}
+	if xaiCalls != 2 {
+		t.Fatalf("expected 2 xai calls before max_rounds failure, got %d", xaiCalls)
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected 1 tool execution before max_rounds failure, got %d", toolCalls)
+	}
+}
+
 func TestHandlerRejectsMissingBearer(t *testing.T) {
 	h := NewHandler(provider.NewRegistry(""), nil, nil)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -1138,16 +1274,11 @@ func TestHandlerForwardsAnthropicMessages(t *testing.T) {
 	}
 }
 
-func TestHandlerInjectsManagedToolsIntoAnthropicRequests(t *testing.T) {
-	var gotBody []byte
+func TestHandlerRejectsManagedAnthropicToolsBeforeUpstreamCall(t *testing.T) {
+	backendCalled := false
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var err error
-		gotBody, err = io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read body: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_01","type":"message","content":[{"type":"text","text":"hello"}]}`))
+		backendCalled = true
+		t.Fatalf("managed anthropic tools should fail before upstream call")
 	}))
 	defer backend.Close()
 
@@ -1170,58 +1301,13 @@ func TestHandlerInjectsManagedToolsIntoAnthropicRequests(t *testing.T) {
 
 	h.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(gotBody, &payload); err != nil {
-		t.Fatalf("unmarshal backend body: %v", err)
-	}
-	tools, _ := payload["tools"].([]any)
-	if len(tools) != 1 {
-		t.Fatalf("expected 1 managed tool, got %+v", payload["tools"])
-	}
-	first, _ := tools[0].(map[string]any)
-	if first["name"] != "trading-api.get_market_context" {
-		t.Fatalf("unexpected anthropic tool payload: %+v", first)
-	}
-	if _, ok := payload["tool_choice"]; ok {
-		t.Fatalf("expected tool_choice removed, got %+v", payload)
-	}
-}
-
-func TestHandlerFailsClosedOnManagedAnthropicToolUseResponse(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"id":"msg_01",
-			"type":"message",
-			"content":[
-				{"type":"tool_use","id":"toolu_01","name":"trading-api.get_market_context","input":{}}
-			]
-		}`))
-	}))
-	defer backend.Close()
-
-	reg := provider.NewRegistry("")
-	reg.Set("anthropic", &provider.Provider{
-		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
-	})
-
-	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifest()), nil)
-	body := `{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}]}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
-	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Anthropic-Version", "2023-06-01")
-	w := httptest.NewRecorder()
-
-	h.ServeHTTP(w, req)
-
 	if w.Code != http.StatusNotImplemented {
 		t.Fatalf("expected 501, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "managed tool execution loop not implemented") {
+	if backendCalled {
+		t.Fatal("expected anthropic backend not to be called")
+	}
+	if !strings.Contains(w.Body.String(), "managed anthropic tool execution not implemented") {
 		t.Fatalf("expected clear mediation error, got %s", w.Body.String())
 	}
 }
