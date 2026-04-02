@@ -191,6 +191,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		h.fail(w, http.StatusBadRequest, "invalid JSON body", agentID, "", start, err)
 		return
 	}
+	downstreamStream, downstreamIncludeUsage := requestedOpenAIStreamOptions(payload)
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
 	h.recallOpenAIMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
@@ -219,7 +220,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}
 	if hasManagedTools(agentCtx) {
-		h.handleManagedOpenAI(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, start)
+		h.handleManagedOpenAI(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, downstreamStream, downstreamIncludeUsage, start)
 		return
 	}
 
@@ -813,7 +814,8 @@ func injectManagedOpenAITools(payload map[string]any, agentCtx *agentctx.AgentCo
 		return nil
 	}
 	if requestedStream(payload) {
-		return fmt.Errorf("managed tools do not support streaming yet")
+		payload["stream"] = false
+		delete(payload, "stream_options")
 	}
 	payload["tools"] = buildOpenAIToolSchemas(agentCtx.Tools.Tools)
 	delete(payload, "functions")
@@ -869,6 +871,16 @@ func buildAnthropicToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]
 func requestedStream(payload map[string]any) bool {
 	stream, _ := payload["stream"].(bool)
 	return stream
+}
+
+func requestedOpenAIStreamOptions(payload map[string]any) (bool, bool) {
+	stream := requestedStream(payload)
+	if !stream {
+		return false, false
+	}
+	streamOptions, _ := payload["stream_options"].(map[string]any)
+	includeUsage, _ := streamOptions["include_usage"].(bool)
+	return true, includeUsage
 }
 
 func responseContainsManagedToolCall(requestPath string, captured []byte) bool {

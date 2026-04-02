@@ -77,6 +77,7 @@ type managedToolPolicy struct {
 type managedUsageAggregate struct {
 	PromptTokens     int
 	CompletionTokens int
+	TotalTokens      int
 	ReportedCostUSD  float64
 	HasReportedCost  bool
 	TotalRounds      int
@@ -91,7 +92,7 @@ type limitedReadResult struct {
 	ObservedBytes int
 }
 
-func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, start time.Time) {
+func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, downstreamStream bool, downstreamIncludeUsage bool, start time.Time) {
 	policy := resolveManagedToolPolicy(agentCtx)
 	loopCtx, cancel := context.WithTimeout(r.Context(), policy.TotalTimeout)
 	defer cancel()
@@ -140,12 +141,24 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 
 		assistantMessage, toolCalls, parseErr := parseOpenAIToolResponse(resp.Body)
 		if parseErr != nil || len(toolCalls) == 0 {
-			copyResponseHeaders(w.Header(), resp.Header)
-			w.WriteHeader(resp.StatusCode)
-			if len(resp.Body) > 0 {
-				_, _ = w.Write(resp.Body)
+			responseBytes := resp.Body
+			if downstreamStream {
+				sse, synthErr := synthesizeOpenAIStream(resp.Body, resp.UpstreamModel, usageAgg, downstreamIncludeUsage)
+				if synthErr != nil {
+					h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed stream"), usageAgg, toolTrace)
+					h.fail(w, http.StatusBadGateway, "failed to synthesize managed stream", agentID, requestedModel, start, synthErr)
+					return
+				}
+				writeSyntheticSSE(w, sse)
+				responseBytes = sse
+			} else {
+				copyResponseHeaders(w.Header(), resp.Header)
+				w.WriteHeader(resp.StatusCode)
+				if len(resp.Body) > 0 {
+					_, _ = w.Write(resp.Body)
+				}
 			}
-			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, resp.Body, usageAgg, toolTrace, time.Since(start).Milliseconds())
+			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds())
 			return
 		}
 
@@ -594,6 +607,131 @@ func appendOpenAIAssistantAndToolMessages(payload map[string]any, assistantMessa
 	payload["messages"] = messages
 }
 
+func synthesizeOpenAIStream(finalBody []byte, upstreamModel string, usage managedUsageAggregate, includeUsage bool) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(finalBody, &payload); err != nil {
+		return nil, err
+	}
+	id, _ := payload["id"].(string)
+	if strings.TrimSpace(id) == "" {
+		id = "chatcmpl-managed"
+	}
+	model, _ := payload["model"].(string)
+	if strings.TrimSpace(model) == "" {
+		model = upstreamModel
+	}
+	created := time.Now().Unix()
+	if rawCreated, ok := payload["created"].(float64); ok {
+		created = int64(rawCreated)
+	}
+
+	assistantMessage, toolCalls, err := parseOpenAIToolResponse(finalBody)
+	if err != nil {
+		return nil, err
+	}
+	if len(toolCalls) > 0 {
+		return nil, fmt.Errorf("cannot synthesize streamed final text from tool_call payload")
+	}
+	content := openAIMessageContent(assistantMessage)
+
+	var stream bytes.Buffer
+	writeSSEChunk(&stream, map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"delta":         map[string]any{"role": "assistant"},
+			"finish_reason": nil,
+		}},
+	})
+	if content != "" {
+		writeSSEChunk(&stream, map[string]any{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []map[string]any{{
+				"index":         0,
+				"delta":         map[string]any{"content": content},
+				"finish_reason": nil,
+			}},
+		})
+	}
+	writeSSEChunk(&stream, map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": "stop",
+		}},
+	})
+	if includeUsage {
+		writeSSEChunk(&stream, map[string]any{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []any{},
+			"usage": map[string]any{
+				"prompt_tokens":     usage.PromptTokens,
+				"completion_tokens": usage.CompletionTokens,
+				"total_tokens":      usage.TotalTokens,
+			},
+		})
+	}
+	stream.WriteString("data: [DONE]\n\n")
+	return stream.Bytes(), nil
+}
+
+func openAIMessageContent(message map[string]any) string {
+	if message == nil {
+		return ""
+	}
+	if text, _ := message["content"].(string); strings.TrimSpace(text) != "" {
+		return text
+	}
+	parts, _ := message["content"].([]any)
+	var builder strings.Builder
+	for _, raw := range parts {
+		part, _ := raw.(map[string]any)
+		if part == nil {
+			continue
+		}
+		if partType, _ := part["type"].(string); partType != "" && partType != "text" {
+			continue
+		}
+		text, _ := part["text"].(string)
+		if text == "" {
+			continue
+		}
+		if builder.Len() > 0 {
+			builder.WriteByte('\n')
+		}
+		builder.WriteString(text)
+	}
+	return builder.String()
+}
+
+func writeSyntheticSSE(w http.ResponseWriter, stream []byte) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(stream)
+}
+
+func writeSSEChunk(buf *bytes.Buffer, payload map[string]any) {
+	raw, _ := json.Marshal(payload)
+	buf.WriteString("data: ")
+	buf.Write(raw)
+	buf.WriteString("\n\n")
+}
+
 func lookupManagedTool(agentCtx *agentctx.AgentContext, name string) (agentctx.ToolManifestEntry, bool) {
 	if agentCtx == nil || agentCtx.Tools == nil {
 		return agentctx.ToolManifestEntry{}, false
@@ -790,6 +928,11 @@ func (a *managedUsageAggregate) AddRound(agentID string, usage cost.Usage, provi
 	a.TotalRounds++
 	a.PromptTokens += usage.PromptTokens
 	a.CompletionTokens += usage.CompletionTokens
+	if usage.TotalTokens > 0 {
+		a.TotalTokens += usage.TotalTokens
+	} else {
+		a.TotalTokens += usage.PromptTokens + usage.CompletionTokens
+	}
 	if usage.ReportedCostUSD != nil {
 		a.HasReportedCost = true
 		a.ReportedCostUSD += *usage.ReportedCostUSD
@@ -836,9 +979,19 @@ func (a managedUsageAggregate) costInfo() *logging.CostInfo {
 	return ci
 }
 
-func (h *Handler) recordManagedSuccess(agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, captured []byte, usage managedUsageAggregate, toolTrace []sessionhistory.ToolRoundTrace, latencyMS int64) {
+func (h *Handler) recordManagedSuccess(agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, captured []byte, usage managedUsageAggregate, toolTrace []sessionhistory.ToolRoundTrace, downstreamStream bool, latencyMS int64) {
 	if statusCode < 200 || statusCode >= 300 {
 		return
+	}
+	responsePayload := sessionhistory.Payload{
+		Format: "json",
+		JSON:   json.RawMessage(captured),
+	}
+	if downstreamStream {
+		responsePayload = sessionhistory.Payload{
+			Format: "sse",
+			Text:   string(captured),
+		}
 	}
 	entry := sessionhistory.Entry{
 		Version:           1,
@@ -850,15 +1003,12 @@ func (h *Handler) recordManagedSuccess(agentID string, agentCtx *agentctx.AgentC
 		EffectiveProvider: providerName,
 		EffectiveModel:    upstreamModel,
 		StatusCode:        statusCode,
-		Stream:            false,
+		Stream:            downstreamStream,
 		RequestOriginal:   json.RawMessage(requestOriginal),
 		RequestEffective:  json.RawMessage(requestEffective),
-		Response: sessionhistory.Payload{
-			Format: "json",
-			JSON:   json.RawMessage(captured),
-		},
-		Usage:     usage.sessionUsage(),
-		ToolTrace: toolTrace,
+		Response:          responsePayload,
+		Usage:             usage.sessionUsage(),
+		ToolTrace:         toolTrace,
 	}
 	if err := entry.EnsureID(); err != nil {
 		h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("session history id: %w", err))

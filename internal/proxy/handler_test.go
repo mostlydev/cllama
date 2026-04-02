@@ -129,22 +129,66 @@ func TestHandlerInjectsManagedToolsIntoOpenAIRequests(t *testing.T) {
 	}
 }
 
-func TestHandlerRejectsStreamingManagedOpenAITools(t *testing.T) {
-	backendCalled := false
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		backendCalled = true
+func TestHandlerRestreamsManagedOpenAITools(t *testing.T) {
+	var xaiBodies [][]byte
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+		_, _ = w.Write([]byte(`{"balance":5000}`))
 	}))
-	defer backend.Close()
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read xai body: %v", err)
+		}
+		xaiBodies = append(xaiBodies, body)
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("unmarshal xai request: %v", err)
+		}
+		if stream, _ := payload["stream"].(bool); stream {
+			t.Fatalf("expected managed upstream request to force stream=false, got %+v", payload)
+		}
+		if _, ok := payload["stream_options"]; ok {
+			t.Fatalf("expected stream_options removed from managed upstream request, got %+v", payload)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch len(xaiBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-1",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+					}
+				}],
+				"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-2",
+				"model":"grok-4.1-fast",
+				"choices":[{"message":{"role":"assistant","content":"market context loaded"}}],
+				"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}
+			}`))
+		default:
+			t.Fatalf("unexpected xai round %d", len(xaiBodies))
+		}
+	}))
+	defer xaiBackend.Close()
 
 	reg := provider.NewRegistry("")
-	reg.Set("openai", &provider.Provider{
-		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
 	})
 
-	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifest()), nil)
-	body := `{"model":"openai/gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard),
+		WithSessionHistory(histDir))
+	body := `{"model":"xai/grok-4.1-fast","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
 	req.Header.Set("Content-Type", "application/json")
@@ -152,14 +196,39 @@ func TestHandlerRejectsStreamingManagedOpenAITools(t *testing.T) {
 
 	h.ServeHTTP(w, req)
 
-	if w.Code != http.StatusNotImplemented {
-		t.Fatalf("expected 501, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if backendCalled {
-		t.Fatal("expected backend not to be called for streaming managed tools")
+	if got := w.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("expected SSE content-type, got %q", got)
 	}
-	if !strings.Contains(w.Body.String(), "managed tools do not support streaming yet") {
-		t.Fatalf("expected clear streaming error, got %s", w.Body.String())
+	bodyText := w.Body.String()
+	if !strings.Contains(bodyText, "data: [DONE]") {
+		t.Fatalf("expected [DONE] marker, got %s", bodyText)
+	}
+	events := parseSSEEvents(t, bodyText)
+	if !sseHasContent(events, "market context loaded") {
+		t.Fatalf("expected synthetic SSE content chunk, got %+v", events)
+	}
+	if !sseHasUsage(events, 17, 8, 25) {
+		t.Fatalf("expected aggregated usage chunk, got %+v", events)
+	}
+
+	histFile := filepath.Join(histDir, "tiverton", "history.jsonl")
+	rawHist, err := os.ReadFile(histFile)
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(rawHist, "\n"), &entry); err != nil {
+		t.Fatalf("unmarshal history entry: %v", err)
+	}
+	if stream, _ := entry["stream"].(bool); !stream {
+		t.Fatalf("expected history stream=true, got %+v", entry)
+	}
+	resp, _ := entry["response"].(map[string]any)
+	if resp["format"] != "sse" {
+		t.Fatalf("expected response.format=sse, got %+v", resp)
 	}
 }
 
@@ -2450,6 +2519,63 @@ func hasLogEntry(t *testing.T, raw []byte, predicate func(map[string]any) bool) 
 	t.Helper()
 	for _, entry := range parseLogEntries(t, raw) {
 		if predicate(entry) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseSSEEvents(t *testing.T, raw string) []map[string]any {
+	t.Helper()
+	lines := strings.Split(raw, "\n")
+	events := make([]map[string]any, 0)
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			t.Fatalf("unmarshal SSE event %q: %v", payload, err)
+		}
+		events = append(events, event)
+	}
+	return events
+}
+
+func sseHasContent(events []map[string]any, want string) bool {
+	for _, event := range events {
+		choices, _ := event["choices"].([]any)
+		for _, rawChoice := range choices {
+			choice, _ := rawChoice.(map[string]any)
+			if choice == nil {
+				continue
+			}
+			delta, _ := choice["delta"].(map[string]any)
+			if delta == nil {
+				continue
+			}
+			if delta["content"] == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sseHasUsage(events []map[string]any, prompt, completion, total int) bool {
+	for _, event := range events {
+		usage, _ := event["usage"].(map[string]any)
+		if usage == nil {
+			continue
+		}
+		if int(usage["prompt_tokens"].(float64)) == prompt &&
+			int(usage["completion_tokens"].(float64)) == completion &&
+			int(usage["total_tokens"].(float64)) == total {
 			return true
 		}
 	}
