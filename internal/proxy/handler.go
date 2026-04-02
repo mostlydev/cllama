@@ -218,6 +218,10 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	if resolution.Intervention != "" {
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}
+	if hasManagedTools(agentCtx) {
+		h.handleManagedOpenAI(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, start)
+		return
+	}
 
 	h.dispatchCandidates(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, start)
 }

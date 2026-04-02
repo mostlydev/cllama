@@ -23,24 +23,42 @@ type Usage struct {
 	PromptTokens     int      `json:"prompt_tokens,omitempty"`
 	CompletionTokens int      `json:"completion_tokens,omitempty"`
 	ReportedCostUSD  *float64 `json:"reported_cost_usd,omitempty"`
+	TotalRounds      int      `json:"total_rounds,omitempty"`
+}
+
+type ToolCallTrace struct {
+	Name       string          `json:"name"`
+	Arguments  json.RawMessage `json:"arguments,omitempty"`
+	Result     json.RawMessage `json:"result,omitempty"`
+	LatencyMS  int64           `json:"latency_ms,omitempty"`
+	Service    string          `json:"service,omitempty"`
+	StatusCode int             `json:"status_code,omitempty"`
+}
+
+type ToolRoundTrace struct {
+	Round      int             `json:"round"`
+	ToolCalls  []ToolCallTrace `json:"tool_calls,omitempty"`
+	RoundUsage Usage           `json:"round_usage,omitempty"`
 }
 
 // Entry is the normalized envelope written as one JSONL line per LLM turn.
 type Entry struct {
-	Version           int             `json:"version"`
-	ID                string          `json:"id,omitempty"`
-	TS                string          `json:"ts"`
-	ClawID            string          `json:"claw_id"`
-	Path              string          `json:"path"`
-	RequestedModel    string          `json:"requested_model"`
-	EffectiveProvider string          `json:"effective_provider"`
-	EffectiveModel    string          `json:"effective_model"`
-	StatusCode        int             `json:"status_code"`
-	Stream            bool            `json:"stream"`
-	RequestOriginal   json.RawMessage `json:"request_original,omitempty"`
-	RequestEffective  json.RawMessage `json:"request_effective,omitempty"`
-	Response          Payload         `json:"response"`
-	Usage             Usage           `json:"usage,omitempty"`
+	Version           int              `json:"version"`
+	ID                string           `json:"id,omitempty"`
+	Status            string           `json:"status,omitempty"`
+	TS                string           `json:"ts"`
+	ClawID            string           `json:"claw_id"`
+	Path              string           `json:"path"`
+	RequestedModel    string           `json:"requested_model"`
+	EffectiveProvider string           `json:"effective_provider"`
+	EffectiveModel    string           `json:"effective_model"`
+	StatusCode        int              `json:"status_code"`
+	Stream            bool             `json:"stream"`
+	RequestOriginal   json.RawMessage  `json:"request_original,omitempty"`
+	RequestEffective  json.RawMessage  `json:"request_effective,omitempty"`
+	Response          Payload          `json:"response"`
+	Usage             Usage            `json:"usage,omitempty"`
+	ToolTrace         []ToolRoundTrace `json:"tool_trace,omitempty"`
 }
 
 // Recorder appends Entry values to per-agent JSONL files. It is safe for

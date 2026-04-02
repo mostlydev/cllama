@@ -11,19 +11,21 @@ import (
 const entryIDPrefix = "hist1_"
 
 type entryWithoutID struct {
-	Version           int             `json:"version"`
-	TS                string          `json:"ts"`
-	ClawID            string          `json:"claw_id"`
-	Path              string          `json:"path"`
-	RequestedModel    string          `json:"requested_model"`
-	EffectiveProvider string          `json:"effective_provider"`
-	EffectiveModel    string          `json:"effective_model"`
-	StatusCode        int             `json:"status_code"`
-	Stream            bool            `json:"stream"`
-	RequestOriginal   json.RawMessage `json:"request_original,omitempty"`
-	RequestEffective  json.RawMessage `json:"request_effective,omitempty"`
-	Response          Payload         `json:"response"`
-	Usage             Usage           `json:"usage,omitempty"`
+	Version           int              `json:"version"`
+	Status            string           `json:"status,omitempty"`
+	TS                string           `json:"ts"`
+	ClawID            string           `json:"claw_id"`
+	Path              string           `json:"path"`
+	RequestedModel    string           `json:"requested_model"`
+	EffectiveProvider string           `json:"effective_provider"`
+	EffectiveModel    string           `json:"effective_model"`
+	StatusCode        int              `json:"status_code"`
+	Stream            bool             `json:"stream"`
+	RequestOriginal   json.RawMessage  `json:"request_original,omitempty"`
+	RequestEffective  json.RawMessage  `json:"request_effective,omitempty"`
+	Response          Payload          `json:"response"`
+	Usage             Usage            `json:"usage,omitempty"`
+	ToolTrace         []ToolRoundTrace `json:"tool_trace,omitempty"`
 }
 
 // EnsureID assigns a stable source-event ID when the entry does not already
@@ -36,6 +38,7 @@ func (e *Entry) EnsureID() error {
 	}
 	raw, err := json.Marshal(entryWithoutID{
 		Version:           e.Version,
+		Status:            e.Status,
 		TS:                e.TS,
 		ClawID:            e.ClawID,
 		Path:              e.Path,
@@ -48,6 +51,7 @@ func (e *Entry) EnsureID() error {
 		RequestEffective:  e.RequestEffective,
 		Response:          e.Response,
 		Usage:             e.Usage,
+		ToolTrace:         e.ToolTrace,
 	})
 	if err != nil {
 		return err

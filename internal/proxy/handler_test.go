@@ -163,29 +163,61 @@ func TestHandlerRejectsStreamingManagedOpenAITools(t *testing.T) {
 	}
 }
 
-func TestHandlerFailsClosedOnManagedOpenAIToolCallResponse(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestHandlerExecutesManagedToolsViaXAI(t *testing.T) {
+	var xaiBodies [][]byte
+	var toolAuth string
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolAuth = r.Header.Get("Authorization")
+		if r.URL.Path != "/api/v1/market_context/tiverton" {
+			t.Fatalf("unexpected tool path: %s", r.URL.Path)
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"id":"chatcmpl-1",
-			"choices":[{
-				"finish_reason":"tool_calls",
-				"message":{
-					"role":"assistant",
-					"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
-				}
-			}]
-		}`))
+		_, _ = w.Write([]byte(`{"balance":5000,"positions":[{"symbol":"NVDA","qty":2}]}`))
 	}))
-	defer backend.Close()
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read xai body: %v", err)
+		}
+		xaiBodies = append(xaiBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(xaiBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-1",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+					}
+				}],
+				"usage":{"prompt_tokens":10,"completion_tokens":3}
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-2",
+				"choices":[{"message":{"role":"assistant","content":"market context loaded"}}],
+				"usage":{"prompt_tokens":7,"completion_tokens":5}
+			}`))
+		default:
+			t.Fatalf("unexpected xai round %d", len(xaiBodies))
+		}
+	}))
+	defer xaiBackend.Close()
 
 	reg := provider.NewRegistry("")
-	reg.Set("openai", &provider.Provider{
-		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
 	})
 
-	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifest()), nil)
-	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "svc-token")), logging.New(io.Discard),
+		WithSessionHistory(histDir))
+
+	body := `{"model":"xai/grok-4.1-fast","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
 	req.Header.Set("Content-Type", "application/json")
@@ -193,11 +225,74 @@ func TestHandlerFailsClosedOnManagedOpenAIToolCallResponse(t *testing.T) {
 
 	h.ServeHTTP(w, req)
 
-	if w.Code != http.StatusNotImplemented {
-		t.Fatalf("expected 501, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "managed tool execution loop not implemented") {
-		t.Fatalf("expected clear mediation error, got %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), "market context loaded") {
+		t.Fatalf("expected final xai text response, got %s", w.Body.String())
+	}
+	if len(xaiBodies) != 2 {
+		t.Fatalf("expected 2 xai rounds, got %d", len(xaiBodies))
+	}
+	if toolAuth != "Bearer svc-token" {
+		t.Fatalf("expected projected tool auth, got %q", toolAuth)
+	}
+
+	var secondPayload map[string]any
+	if err := json.Unmarshal(xaiBodies[1], &secondPayload); err != nil {
+		t.Fatalf("unmarshal second xai request: %v", err)
+	}
+	if secondPayload["model"] != "grok-4.1-fast" {
+		t.Fatalf("expected stripped xai model, got %#v", secondPayload["model"])
+	}
+	messages, _ := secondPayload["messages"].([]any)
+	if len(messages) < 3 {
+		t.Fatalf("expected tool round reflected in follow-up request, got %+v", secondPayload)
+	}
+	last := messages[len(messages)-1].(map[string]any)
+	if last["role"] != "tool" {
+		t.Fatalf("expected final follow-up message to be tool result, got %+v", last)
+	}
+	var toolResult map[string]any
+	if err := json.Unmarshal([]byte(last["content"].(string)), &toolResult); err != nil {
+		t.Fatalf("unmarshal tool result: %v", err)
+	}
+	if ok, _ := toolResult["ok"].(bool); !ok {
+		t.Fatalf("expected successful tool result, got %+v", toolResult)
+	}
+	data, _ := toolResult["data"].(map[string]any)
+	if data["balance"].(float64) != 5000 {
+		t.Fatalf("expected tool payload balance, got %+v", toolResult)
+	}
+
+	histFile := filepath.Join(histDir, "tiverton", "history.jsonl")
+	rawHist, err := os.ReadFile(histFile)
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(rawHist, "\n"), &entry); err != nil {
+		t.Fatalf("unmarshal history entry: %v", err)
+	}
+	if entry["status"] != "ok" {
+		t.Fatalf("expected history status=ok, got %+v", entry)
+	}
+	usage, _ := entry["usage"].(map[string]any)
+	if usage["total_rounds"].(float64) != 2 {
+		t.Fatalf("expected total_rounds=2, got %+v", usage)
+	}
+	trace, _ := entry["tool_trace"].([]any)
+	if len(trace) != 1 {
+		t.Fatalf("expected one tool trace round, got %+v", entry)
+	}
+	round := trace[0].(map[string]any)
+	toolCalls := round["tool_calls"].([]any)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected one tool call in trace, got %+v", round)
+	}
+	call := toolCalls[0].(map[string]any)
+	if call["name"] != "trading-api.get_market_context" {
+		t.Fatalf("unexpected tool trace name: %+v", call)
 	}
 }
 
@@ -2198,6 +2293,17 @@ func stubContextLoaderWithTools(agentID, token string, tools *agentctx.ToolManif
 }
 
 func managedToolManifest() *agentctx.ToolManifest {
+	return managedToolManifestForURL("http://trading-api:4000", http.MethodGet, "/api/v1/market_context/{claw_id}", "")
+}
+
+func managedToolManifestForURL(baseURL, method, path, token string) *agentctx.ToolManifest {
+	var auth *agentctx.AuthEntry
+	if token != "" {
+		auth = &agentctx.AuthEntry{
+			Type:  "bearer",
+			Token: token,
+		}
+	}
 	return &agentctx.ToolManifest{
 		Version: 1,
 		Tools: []agentctx.ToolManifestEntry{{
@@ -2207,9 +2313,10 @@ func managedToolManifest() *agentctx.ToolManifest {
 			Execution: agentctx.ToolExecution{
 				Transport: "http",
 				Service:   "trading-api",
-				BaseURL:   "http://trading-api:4000",
-				Method:    http.MethodGet,
-				Path:      "/api/v1/market_context/{claw_id}",
+				BaseURL:   baseURL,
+				Method:    method,
+				Path:      path,
+				Auth:      auth,
 			},
 		}},
 		Policy: agentctx.ToolPolicy{
