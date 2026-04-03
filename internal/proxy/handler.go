@@ -35,6 +35,7 @@ type Handler struct {
 	accumulator     *cost.Accumulator
 	pricing         *cost.Pricing
 	feedFetcher     *feeds.Fetcher
+	managedTurns    *managedOpenAIContinuityStore
 	sessionRecorder *sessionhistory.Recorder
 	adminToken      string
 }
@@ -103,10 +104,11 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 		logger = logging.New(io.Discard)
 	}
 	h := &Handler{
-		registry:    registry,
-		loadContext: contextLoader,
-		client:      &http.Client{},
-		logger:      logger,
+		registry:     registry,
+		loadContext:  contextLoader,
+		client:       &http.Client{},
+		logger:       logger,
+		managedTurns: newManagedOpenAIContinuityStore(defaultManagedToolContinuityTurns),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -194,6 +196,9 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	downstreamStream, downstreamIncludeUsage := requestedOpenAIStreamOptions(payload)
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
+	if hasManagedTools(agentCtx) {
+		h.managedTurns.Inject(agentID, payload)
+	}
 	h.recallOpenAIMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
 	if feedBlock := h.fetchFeeds(r.Context(), agentID, agentCtx); feedBlock != "" {
 		feeds.InjectOpenAI(payload, feedBlock)

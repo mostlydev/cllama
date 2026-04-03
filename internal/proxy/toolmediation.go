@@ -99,6 +99,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 
 	usageAgg := managedUsageAggregate{LoggedCostKnown: true}
 	var toolTrace []sessionhistory.ToolRoundTrace
+	var hiddenMessages []json.RawMessage
 	var requestEffective []byte
 	var lastProvider string
 	var lastUpstreamModel string
@@ -158,6 +159,9 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 					_, _ = w.Write(resp.Body)
 				}
 			}
+			if len(hiddenMessages) > 0 {
+				h.managedTurns.Record(agentID, assistantMessage, hiddenMessages)
+			}
 			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds())
 			return
 		}
@@ -195,6 +199,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 		}
 		toolTrace = append(toolTrace, roundTrace)
 		appendOpenAIAssistantAndToolMessages(payload, assistantMessage, toolMessages)
+		hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, assistantMessage, toolMessages)
 	}
 }
 

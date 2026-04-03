@@ -365,6 +365,126 @@ func TestHandlerExecutesManagedToolsViaXAI(t *testing.T) {
 	}
 }
 
+func TestHandlerReinjectsManagedToolContinuityOnNextTurn(t *testing.T) {
+	var xaiBodies [][]byte
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000,"positions":[{"symbol":"NVDA","qty":2}]}`))
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read xai body: %v", err)
+		}
+		xaiBodies = append(xaiBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(xaiBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-1",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+					}
+				}]
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-2",
+				"choices":[{"message":{"role":"assistant","content":"market context loaded"}}]
+			}`))
+		case 3:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal xai request: %v", err)
+			}
+			rawMessages, _ := payload["messages"].([]any)
+			conversation := make([]map[string]any, 0, len(rawMessages))
+			for _, raw := range rawMessages {
+				msg, _ := raw.(map[string]any)
+				if msg == nil {
+					continue
+				}
+				if role, _ := msg["role"].(string); role == "system" {
+					continue
+				}
+				conversation = append(conversation, msg)
+			}
+			if len(conversation) < 5 {
+				t.Fatalf("expected continuity-injected conversation, got %+v", payload)
+			}
+			if conversation[0]["role"] != "user" || conversation[0]["content"] != "hi" {
+				t.Fatalf("unexpected first conversation message: %+v", conversation[0])
+			}
+			if conversation[1]["role"] != "assistant" {
+				t.Fatalf("expected hidden assistant tool call before visible reply, got %+v", conversation[1])
+			}
+			toolCalls, _ := conversation[1]["tool_calls"].([]any)
+			if len(toolCalls) != 1 {
+				t.Fatalf("expected continuity assistant tool_calls, got %+v", conversation[1])
+			}
+			if conversation[2]["role"] != "tool" || conversation[2]["tool_call_id"] != "call_1" {
+				t.Fatalf("expected continuity tool result before visible reply, got %+v", conversation[2])
+			}
+			if conversation[3]["role"] != "assistant" || conversation[3]["content"] != "market context loaded" {
+				t.Fatalf("expected original visible assistant reply preserved after hidden turns, got %+v", conversation[3])
+			}
+			if conversation[4]["role"] != "user" || conversation[4]["content"] != "what next?" {
+				t.Fatalf("expected new user turn to remain after injected continuity, got %+v", conversation[4])
+			}
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-3","choices":[{"message":{"role":"assistant","content":"next step is hedge"}}]}`))
+		default:
+			t.Fatalf("unexpected xai round %d", len(xaiBodies))
+		}
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"xai/grok-4.1-fast","messages":[{"role":"user","content":"hi"}]}`))
+	firstReq.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	firstReq.Header.Set("Content-Type", "application/json")
+	firstW := httptest.NewRecorder()
+	h.ServeHTTP(firstW, firstReq)
+	if firstW.Code != http.StatusOK {
+		t.Fatalf("expected first request 200, got %d: %s", firstW.Code, firstW.Body.String())
+	}
+	if !strings.Contains(firstW.Body.String(), "market context loaded") {
+		t.Fatalf("expected first response to complete mediated tool turn, got %s", firstW.Body.String())
+	}
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{
+		"model":"xai/grok-4.1-fast",
+		"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":"market context loaded"},
+			{"role":"user","content":"what next?"}
+		]
+	}`))
+	secondReq.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	secondReq.Header.Set("Content-Type", "application/json")
+	secondW := httptest.NewRecorder()
+	h.ServeHTTP(secondW, secondReq)
+	if secondW.Code != http.StatusOK {
+		t.Fatalf("expected second request 200, got %d: %s", secondW.Code, secondW.Body.String())
+	}
+	if !strings.Contains(secondW.Body.String(), "next step is hedge") {
+		t.Fatalf("expected second response text, got %s", secondW.Body.String())
+	}
+	if len(xaiBodies) != 3 {
+		t.Fatalf("expected 3 xai calls across both turns, got %d", len(xaiBodies))
+	}
+}
+
 func TestHandlerManagedToolHTTPErrorFeedsBackToModel(t *testing.T) {
 	var xaiBodies [][]byte
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
