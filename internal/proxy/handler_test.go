@@ -2730,6 +2730,92 @@ func TestHandlerInjectsMemoryRecallIntoOpenAIRequests(t *testing.T) {
 	}
 }
 
+func TestHandlerAppliesRecallMemoryPolicyAndLogsRemovals(t *testing.T) {
+	var logs lockedBuffer
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read backend body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	memorySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"memories":[` +
+			`{"text":"raw transcript should not inject","source":"raw_transcript"},` +
+			`{"text":"   ","kind":"profile"},` +
+			`{"text":"secret note sk-live-123456789","kind":"profile","source":"profile-store"}` +
+			`]}`))
+	}))
+	defer memorySrv.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, func(id string) (*agentctx.AgentContext, error) {
+		if id != "tiverton" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID: "tiverton",
+			Metadata: map[string]any{
+				"token": "tiverton:dummy123",
+			},
+			Memory: &agentctx.MemoryManifest{
+				Version: 1,
+				Service: "team-memory",
+				BaseURL: memorySrv.URL,
+				Recall:  &agentctx.MemoryOp{Path: "/recall", TimeoutMS: 300},
+			},
+		}, nil
+	}, logging.New(&logs))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal backend body: %v", err)
+	}
+	messages := payload["messages"].([]any)
+	first := messages[0].(map[string]any)
+	content := first["content"].(string)
+	if strings.Contains(content, "raw transcript should not inject") {
+		t.Fatalf("expected blocked recall source to be removed, got %q", content)
+	}
+	if strings.Contains(content, "sk-live-123456789") {
+		t.Fatalf("expected recalled secret to be scrubbed, got %q", content)
+	}
+	if !strings.Contains(content, "[redacted-secret]") {
+		t.Fatalf("expected recalled secret to be redacted, got %q", content)
+	}
+
+	recallLog := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "memory_op" && entry["memory_op"] == "recall" && entry["memory_status"] == "succeeded"
+	})
+	if recallLog["memory_blocks"].(float64) != 3 {
+		t.Fatalf("expected recall telemetry memory_blocks=3, got %+v", recallLog)
+	}
+	if recallLog["memory_removed"].(float64) != 2 {
+		t.Fatalf("expected recall telemetry memory_removed=2, got %+v", recallLog)
+	}
+}
+
 func TestHandlerRetainsMemoryAfterSuccessfulTurn(t *testing.T) {
 	var logs lockedBuffer
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2813,6 +2899,93 @@ func TestHandlerRetainsMemoryAfterSuccessfulTurn(t *testing.T) {
 	}
 	if retainLog["status_code"].(float64) != http.StatusNoContent {
 		t.Fatalf("expected retain telemetry status_code=%d, got %+v", http.StatusNoContent, retainLog)
+	}
+}
+
+func TestHandlerAppliesRetainMemoryPolicyAndLogsRedactions(t *testing.T) {
+	var logs lockedBuffer
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"Bearer supersecrettoken"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer backend.Close()
+
+	retainBodyCh := make(chan []byte, 1)
+	memorySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read retain body: %v", err)
+		}
+		retainBodyCh <- body
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer memorySrv.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, func(id string) (*agentctx.AgentContext, error) {
+		if id != "tiverton" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID: "tiverton",
+			Metadata: map[string]any{
+				"token": "tiverton:dummy123",
+			},
+			Memory: &agentctx.MemoryManifest{
+				Version: 1,
+				Service: "team-memory",
+				BaseURL: memorySrv.URL,
+				Retain:  &agentctx.MemoryOp{Path: "/retain"},
+			},
+		}, nil
+	}, logging.New(&logs))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"my key is sk-live-123456789"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	var retainBody []byte
+	select {
+	case retainBody = <-retainBodyCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for retain request")
+	}
+	if bytes.Contains(retainBody, []byte("sk-live-123456789")) {
+		t.Fatalf("expected retain payload to scrub request secret, got %s", string(retainBody))
+	}
+	if bytes.Contains(retainBody, []byte("supersecrettoken")) {
+		t.Fatalf("expected retain payload to scrub response bearer token, got %s", string(retainBody))
+	}
+	if !bytes.Contains(retainBody, []byte("[redacted-secret]")) || !bytes.Contains(retainBody, []byte("Bearer [redacted]")) {
+		t.Fatalf("expected retain payload to include redacted placeholders, got %s", string(retainBody))
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(retainBody, &payload); err != nil {
+		t.Fatalf("unmarshal retain payload: %v", err)
+	}
+	metadata := payload["metadata"].(map[string]any)
+	if metadata["policy_removed"].(float64) != 3 {
+		t.Fatalf("expected retain metadata policy_removed=3, got %+v", metadata)
+	}
+
+	retainLog := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "memory_op" && entry["memory_op"] == "retain" && entry["memory_status"] == "succeeded"
+	})
+	if retainLog["memory_removed"].(float64) != 3 {
+		t.Fatalf("expected retain telemetry memory_removed=3, got %+v", retainLog)
 	}
 }
 
