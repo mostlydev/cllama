@@ -70,6 +70,7 @@ func TestHandlerForwardsAndSwapsAuth(t *testing.T) {
 }
 
 func TestHandlerInjectsManagedToolsIntoOpenAIRequests(t *testing.T) {
+	expectedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
 	var gotBody []byte
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var err error
@@ -116,7 +117,7 @@ func TestHandlerInjectsManagedToolsIntoOpenAIRequests(t *testing.T) {
 	}
 	first, _ := tools[0].(map[string]any)
 	function, _ := first["function"].(map[string]any)
-	if first["type"] != "function" || function["name"] != "trading-api.get_market_context" {
+	if first["type"] != "function" || function["name"] != expectedName {
 		t.Fatalf("unexpected managed tool payload: %+v", first)
 	}
 	if _, ok := payload["functions"]; ok {
@@ -234,6 +235,7 @@ func TestHandlerRestreamsManagedOpenAITools(t *testing.T) {
 }
 
 func TestHandlerStreamsManagedOpenAIKeepaliveComments(t *testing.T) {
+	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
 	toolRelease := make(chan struct{})
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-toolRelease
@@ -258,7 +260,7 @@ func TestHandlerStreamsManagedOpenAIKeepaliveComments(t *testing.T) {
 					"finish_reason":"tool_calls",
 					"message":{
 						"role":"assistant",
-						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"` + presentedName + `","arguments":"{}"}}]
 					}
 				}],
 				"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}
@@ -325,6 +327,7 @@ func TestHandlerStreamsManagedOpenAIKeepaliveComments(t *testing.T) {
 }
 
 func TestHandlerExecutesManagedToolsViaXAI(t *testing.T) {
+	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
 	var xaiBodies [][]byte
 	var toolAuth string
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -346,13 +349,26 @@ func TestHandlerExecutesManagedToolsViaXAI(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch len(xaiBodies) {
 		case 1:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal xai request: %v", err)
+			}
+			tools, _ := payload["tools"].([]any)
+			if len(tools) != 1 {
+				t.Fatalf("expected 1 managed xai tool, got %+v", payload["tools"])
+			}
+			first, _ := tools[0].(map[string]any)
+			function, _ := first["function"].(map[string]any)
+			if function["name"] != presentedName {
+				t.Fatalf("expected provider-safe managed tool name %q, got %+v", presentedName, first)
+			}
 			_, _ = w.Write([]byte(`{
 				"id":"chatcmpl-1",
 				"choices":[{
 					"finish_reason":"tool_calls",
 					"message":{
 						"role":"assistant",
-						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"` + presentedName + `","arguments":"{}"}}]
 					}
 				}],
 				"usage":{"prompt_tokens":10,"completion_tokens":3}
@@ -1556,6 +1572,7 @@ func TestHandlerForwardsAnthropicMessages(t *testing.T) {
 }
 
 func TestHandlerExecutesManagedAnthropicTools(t *testing.T) {
+	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
 	var anthropicBodies [][]byte
 	var toolAuth string
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1585,13 +1602,17 @@ func TestHandlerExecutesManagedAnthropicTools(t *testing.T) {
 			if len(tools) != 1 {
 				t.Fatalf("expected 1 managed anthropic tool, got %+v", payload["tools"])
 			}
+			first, _ := tools[0].(map[string]any)
+			if first["name"] != presentedName {
+				t.Fatalf("expected provider-safe managed anthropic tool name %q, got %+v", presentedName, first)
+			}
 			if _, ok := payload["tool_choice"]; ok {
 				t.Fatalf("expected tool_choice removed from managed anthropic request, got %+v", payload)
 			}
 			_, _ = w.Write([]byte(`{
 				"id":"msg_01",
 				"type":"message",
-				"content":[{"type":"tool_use","id":"toolu_1","name":"trading-api.get_market_context","input":{}}],
+				"content":[{"type":"tool_use","id":"toolu_1","name":"` + presentedName + `","input":{}}],
 				"stop_reason":"tool_use",
 				"usage":{"input_tokens":11,"output_tokens":4}
 			}`))

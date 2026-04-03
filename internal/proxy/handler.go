@@ -870,7 +870,7 @@ func buildOpenAIToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]any
 		schemas = append(schemas, map[string]any{
 			"type": "function",
 			"function": map[string]any{
-				"name":        tool.Name,
+				"name":        managedToolPresentedName(tool),
 				"description": tool.Description,
 				"parameters":  tool.InputSchema,
 			},
@@ -883,7 +883,7 @@ func buildAnthropicToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]
 	schemas := make([]map[string]any, 0, len(tools))
 	for _, tool := range tools {
 		schemas = append(schemas, map[string]any{
-			"name":         tool.Name,
+			"name":         managedToolPresentedName(tool),
 			"description":  tool.Description,
 			"input_schema": tool.InputSchema,
 		})

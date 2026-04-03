@@ -236,7 +236,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			},
 		}
 		for _, call := range toolCalls {
-			execResult := waitWithManagedKeepalive(streamKeepalive, managedToolWaitComment(len(toolTrace)+1, call.Name), func() managedOpenAIToolExecResult {
+			execResult := waitWithManagedKeepalive(streamKeepalive, managedToolWaitComment(len(toolTrace)+1, managedToolDisplayName(agentCtx, call.Name)), func() managedOpenAIToolExecResult {
 				outcome, execErr := h.executeManagedOpenAITool(loopCtx, agentID, agentCtx, call, policy)
 				return managedOpenAIToolExecResult{Outcome: outcome, Err: execErr}
 			})
@@ -378,7 +378,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			},
 		}
 		for _, call := range toolUses {
-			execResult := waitWithManagedKeepalive(streamKeepalive, managedToolWaitComment(len(toolTrace)+1, call.Name), func() managedAnthropicToolExecResult {
+			execResult := waitWithManagedKeepalive(streamKeepalive, managedToolWaitComment(len(toolTrace)+1, managedToolDisplayName(agentCtx, call.Name)), func() managedAnthropicToolExecResult {
 				outcome, execErr := h.executeManagedAnthropicTool(loopCtx, agentID, agentCtx, call, policy)
 				return managedAnthropicToolExecResult{Outcome: outcome, Err: execErr}
 			})
@@ -578,18 +578,19 @@ func resolveManagedToolPolicy(agentCtx *agentctx.AgentContext) managedToolPolicy
 
 func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, agentCtx *agentctx.AgentContext, call openAIToolCall, policy managedToolPolicy) (managedToolOutcome, error) {
 	trace := sessionhistory.ToolCallTrace{
-		Name:      call.Name,
+		Name:      managedToolDisplayName(agentCtx, call.Name),
 		Arguments: call.ArgumentsRaw,
 	}
-	tool, ok := lookupManagedTool(agentCtx, call.Name)
+	resolved, ok := resolveManagedTool(agentCtx, call.Name)
 	if !ok {
 		raw := toolErrorPayload("unsupported_tool", managedToolModeMessage, 0, nil)
 		trace.Result = raw
 		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
 	}
-	trace.Service = tool.Execution.Service
+	trace.Name = resolved.CanonicalName
+	trace.Service = resolved.Manifest.Execution.Service
 	if call.ParseErr != nil {
-		raw := toolErrorPayload("invalid_arguments", fmt.Sprintf("Tool arguments for %s are invalid JSON: %v", call.Name, call.ParseErr), 0, nil)
+		raw := toolErrorPayload("invalid_arguments", fmt.Sprintf("Tool arguments for %s are invalid JSON: %v", trace.Name, call.ParseErr), 0, nil)
 		trace.Result = raw
 		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
 	}
@@ -597,7 +598,7 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 	start := time.Now()
 	childCtx, cancel := context.WithTimeout(ctx, policy.PerToolTimeout)
 	defer cancel()
-	raw, statusCode, err := h.callManagedHTTPTool(childCtx, agentID, tool, call.Arguments)
+	raw, statusCode, err := h.callManagedHTTPTool(childCtx, agentID, resolved.Manifest, call.Arguments)
 	trace.LatencyMS = time.Since(start).Milliseconds()
 	if errors.Is(err, errManagedToolBudget) {
 		return managedToolOutcome{}, err
@@ -631,18 +632,19 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 
 func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID string, agentCtx *agentctx.AgentContext, call anthropicToolUse, policy managedToolPolicy) (managedToolOutcome, error) {
 	trace := sessionhistory.ToolCallTrace{
-		Name:      call.Name,
+		Name:      managedToolDisplayName(agentCtx, call.Name),
 		Arguments: call.ArgumentsRaw,
 	}
-	tool, ok := lookupManagedTool(agentCtx, call.Name)
+	resolved, ok := resolveManagedTool(agentCtx, call.Name)
 	if !ok {
 		raw := toolErrorPayload("unsupported_tool", managedToolModeMessage, 0, nil)
 		trace.Result = raw
 		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
 	}
-	trace.Service = tool.Execution.Service
+	trace.Name = resolved.CanonicalName
+	trace.Service = resolved.Manifest.Execution.Service
 	if call.ParseErr != nil {
-		raw := toolErrorPayload("invalid_arguments", fmt.Sprintf("Tool arguments for %s are invalid JSON: %v", call.Name, call.ParseErr), 0, nil)
+		raw := toolErrorPayload("invalid_arguments", fmt.Sprintf("Tool arguments for %s are invalid JSON: %v", trace.Name, call.ParseErr), 0, nil)
 		trace.Result = raw
 		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
 	}
@@ -650,7 +652,7 @@ func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID strin
 	start := time.Now()
 	childCtx, cancel := context.WithTimeout(ctx, policy.PerToolTimeout)
 	defer cancel()
-	raw, statusCode, err := h.callManagedHTTPTool(childCtx, agentID, tool, call.Arguments)
+	raw, statusCode, err := h.callManagedHTTPTool(childCtx, agentID, resolved.Manifest, call.Arguments)
 	trace.LatencyMS = time.Since(start).Milliseconds()
 	if errors.Is(err, errManagedToolBudget) {
 		return managedToolOutcome{}, err
@@ -1319,18 +1321,6 @@ func writeAnthropicSSEEvent(buf *bytes.Buffer, event string, payload map[string]
 	buf.WriteString("data: ")
 	buf.Write(raw)
 	buf.WriteString("\n\n")
-}
-
-func lookupManagedTool(agentCtx *agentctx.AgentContext, name string) (agentctx.ToolManifestEntry, bool) {
-	if agentCtx == nil || agentCtx.Tools == nil {
-		return agentctx.ToolManifestEntry{}, false
-	}
-	for _, tool := range agentCtx.Tools.Tools {
-		if tool.Name == name {
-			return tool, true
-		}
-	}
-	return agentctx.ToolManifestEntry{}, false
 }
 
 func applyManagedToolAuth(req *http.Request, auth *agentctx.AuthEntry) error {
