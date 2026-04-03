@@ -25,6 +25,7 @@ const (
 	defaultManagedToolMaxRounds    = 8
 	defaultManagedToolTimeoutMS    = 30000
 	defaultManagedToolTotalTimeout = 120000
+	managedKeepaliveInterval       = 250 * time.Millisecond
 	maxManagedToolResultBytes      = 16 * 1024
 	maxManagedLLMResponseBytes     = 4 * 1024 * 1024
 )
@@ -94,6 +95,28 @@ type managedUsageAggregate struct {
 	SawCostUsage     bool
 }
 
+type managedDispatchResult struct {
+	Response *capturedResponse
+	Status   int
+	Message  string
+	Err      error
+}
+
+type managedOpenAIToolExecResult struct {
+	Outcome managedToolOutcome
+	Err     error
+}
+
+type managedAnthropicToolExecResult struct {
+	Outcome managedToolOutcome
+	Err     error
+}
+
+type managedStreamKeepalive struct {
+	w       http.ResponseWriter
+	started bool
+}
+
 type limitedReadResult struct {
 	Body          []byte
 	Truncated     bool
@@ -104,6 +127,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 	policy := resolveManagedToolPolicy(agentCtx)
 	loopCtx, cancel := context.WithTimeout(r.Context(), policy.TotalTimeout)
 	defer cancel()
+	streamKeepalive := newManagedStreamKeepalive(w, downstreamStream)
 
 	usageAgg := managedUsageAggregate{LoggedCostKnown: true}
 	var toolTrace []sessionhistory.ToolRoundTrace
@@ -113,13 +137,27 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 	var lastUpstreamModel string
 
 	for {
-		resp, status, msg, err := h.dispatchCandidatesJSON(loopCtx, r, agentID, requestedModel, payload, candidates)
+		dispatchResult := waitWithManagedKeepalive(streamKeepalive, managedModelWaitComment(len(toolTrace)+1), func() managedDispatchResult {
+			resp, status, msg, err := h.dispatchCandidatesJSON(loopCtx, r, agentID, requestedModel, payload, candidates)
+			return managedDispatchResult{
+				Response: resp,
+				Status:   status,
+				Message:  msg,
+				Err:      err,
+			}
+		})
+		resp, status, msg, err := dispatchResult.Response, dispatchResult.Status, dispatchResult.Message, dispatchResult.Err
 		if requestEffective == nil && resp != nil && len(resp.RequestBody) > 0 {
 			requestEffective = append([]byte(nil), resp.RequestBody...)
 		}
 		if resp == nil {
 			if len(toolTrace) > 0 {
 				h.recordManagedFailure(agentID, lastProvider, requestedModel, lastUpstreamModel, r.URL.Path, requestOriginal, requestEffective, status, jsonErrorPayload(msg), usageAgg, toolTrace)
+			}
+			if streamKeepalive != nil && streamKeepalive.started {
+				streamKeepalive.writeOpenAIError(jsonErrorPayload(msg))
+				h.logger.LogError(agentID, requestedModel, status, time.Since(start).Milliseconds(), err)
+				return
 			}
 			h.fail(w, status, msg, agentID, requestedModel, start, err)
 			return
@@ -132,10 +170,14 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 		usageAgg.AddRound(agentID, usage, resp.ProviderName, resp.UpstreamModel, h)
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			copyResponseHeaders(w.Header(), resp.Header)
-			w.WriteHeader(resp.StatusCode)
-			if len(resp.Body) > 0 {
-				_, _ = w.Write(resp.Body)
+			if streamKeepalive != nil && streamKeepalive.started {
+				streamKeepalive.writeOpenAIError(resp.Body)
+			} else {
+				copyResponseHeaders(w.Header(), resp.Header)
+				w.WriteHeader(resp.StatusCode)
+				if len(resp.Body) > 0 {
+					_, _ = w.Write(resp.Body)
+				}
 			}
 			if len(toolTrace) > 0 {
 				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, ensureJSONPayload(resp.Body), usageAgg, toolTrace)
@@ -155,10 +197,15 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				sse, synthErr := synthesizeOpenAIStream(resp.Body, resp.UpstreamModel, usageAgg, downstreamIncludeUsage)
 				if synthErr != nil {
 					h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed stream"), usageAgg, toolTrace)
+					if streamKeepalive != nil && streamKeepalive.started {
+						streamKeepalive.writeOpenAIError(jsonErrorPayload("failed to synthesize managed stream"))
+						h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), synthErr)
+						return
+					}
 					h.fail(w, http.StatusBadGateway, "failed to synthesize managed stream", agentID, requestedModel, start, synthErr)
 					return
 				}
-				writeSyntheticSSE(w, sse)
+				streamKeepalive.writeFinal(sse)
 				responseBytes = sse
 			} else {
 				copyResponseHeaders(w.Header(), resp.Header)
@@ -189,10 +236,19 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			},
 		}
 		for _, call := range toolCalls {
-			outcome, execErr := h.executeManagedOpenAITool(loopCtx, agentID, agentCtx, call, policy)
+			execResult := waitWithManagedKeepalive(streamKeepalive, managedToolWaitComment(len(toolTrace)+1, call.Name), func() managedOpenAIToolExecResult {
+				outcome, execErr := h.executeManagedOpenAITool(loopCtx, agentID, agentCtx, call, policy)
+				return managedOpenAIToolExecResult{Outcome: outcome, Err: execErr}
+			})
+			outcome, execErr := execResult.Outcome, execResult.Err
 			if execErr != nil {
 				msg := "managed tool mediation timed out"
 				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, append(toolTrace, roundTrace))
+				if streamKeepalive != nil && streamKeepalive.started {
+					streamKeepalive.writeOpenAIError(jsonErrorPayload(msg))
+					h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), execErr)
+					return
+				}
 				h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, execErr)
 				return
 			}
@@ -213,6 +269,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 	policy := resolveManagedToolPolicy(agentCtx)
 	loopCtx, cancel := context.WithTimeout(r.Context(), policy.TotalTimeout)
 	defer cancel()
+	streamKeepalive := newManagedStreamKeepalive(w, downstreamStream)
 
 	usageAgg := managedUsageAggregate{LoggedCostKnown: true}
 	var toolTrace []sessionhistory.ToolRoundTrace
@@ -222,13 +279,27 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 	var lastUpstreamModel string
 
 	for {
-		resp, status, msg, err := h.dispatchCandidatesJSON(loopCtx, r, agentID, requestedModel, payload, candidates)
+		dispatchResult := waitWithManagedKeepalive(streamKeepalive, managedModelWaitComment(len(toolTrace)+1), func() managedDispatchResult {
+			resp, status, msg, err := h.dispatchCandidatesJSON(loopCtx, r, agentID, requestedModel, payload, candidates)
+			return managedDispatchResult{
+				Response: resp,
+				Status:   status,
+				Message:  msg,
+				Err:      err,
+			}
+		})
+		resp, status, msg, err := dispatchResult.Response, dispatchResult.Status, dispatchResult.Message, dispatchResult.Err
 		if requestEffective == nil && resp != nil && len(resp.RequestBody) > 0 {
 			requestEffective = append([]byte(nil), resp.RequestBody...)
 		}
 		if resp == nil {
 			if len(toolTrace) > 0 {
 				h.recordManagedFailure(agentID, lastProvider, requestedModel, lastUpstreamModel, r.URL.Path, requestOriginal, requestEffective, status, jsonErrorPayload(msg), usageAgg, toolTrace)
+			}
+			if streamKeepalive != nil && streamKeepalive.started {
+				streamKeepalive.writeAnthropicError(msg)
+				h.logger.LogError(agentID, requestedModel, status, time.Since(start).Milliseconds(), err)
+				return
 			}
 			h.fail(w, status, msg, agentID, requestedModel, start, err)
 			return
@@ -241,10 +312,14 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 		usageAgg.AddRound(agentID, usage, resp.ProviderName, resp.UpstreamModel, h)
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			copyResponseHeaders(w.Header(), resp.Header)
-			w.WriteHeader(resp.StatusCode)
-			if len(resp.Body) > 0 {
-				_, _ = w.Write(resp.Body)
+			if streamKeepalive != nil && streamKeepalive.started {
+				streamKeepalive.writeAnthropicError(extractAnthropicErrorMessage(resp.Body))
+			} else {
+				copyResponseHeaders(w.Header(), resp.Header)
+				w.WriteHeader(resp.StatusCode)
+				if len(resp.Body) > 0 {
+					_, _ = w.Write(resp.Body)
+				}
 			}
 			if len(toolTrace) > 0 {
 				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, ensureJSONPayload(resp.Body), usageAgg, toolTrace)
@@ -264,10 +339,15 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				sse, synthErr := synthesizeAnthropicStream(resp.Body, resp.UpstreamModel, usageAgg)
 				if synthErr != nil {
 					h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed stream"), usageAgg, toolTrace)
+					if streamKeepalive != nil && streamKeepalive.started {
+						streamKeepalive.writeAnthropicError("failed to synthesize managed stream")
+						h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), synthErr)
+						return
+					}
 					h.fail(w, http.StatusBadGateway, "failed to synthesize managed stream", agentID, requestedModel, start, synthErr)
 					return
 				}
-				writeSyntheticSSE(w, sse)
+				streamKeepalive.writeFinal(sse)
 				responseBytes = sse
 			} else {
 				copyResponseHeaders(w.Header(), resp.Header)
@@ -298,10 +378,19 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			},
 		}
 		for _, call := range toolUses {
-			outcome, execErr := h.executeManagedAnthropicTool(loopCtx, agentID, agentCtx, call, policy)
+			execResult := waitWithManagedKeepalive(streamKeepalive, managedToolWaitComment(len(toolTrace)+1, call.Name), func() managedAnthropicToolExecResult {
+				outcome, execErr := h.executeManagedAnthropicTool(loopCtx, agentID, agentCtx, call, policy)
+				return managedAnthropicToolExecResult{Outcome: outcome, Err: execErr}
+			})
+			outcome, execErr := execResult.Outcome, execResult.Err
 			if execErr != nil {
 				msg := "managed tool mediation timed out"
 				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, append(toolTrace, roundTrace))
+				if streamKeepalive != nil && streamKeepalive.started {
+					streamKeepalive.writeAnthropicError(msg)
+					h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), execErr)
+					return
+				}
 				h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, execErr)
 				return
 			}
@@ -1083,6 +1172,136 @@ func writeSyntheticSSE(w http.ResponseWriter, stream []byte) {
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(stream)
+}
+
+func newManagedStreamKeepalive(w http.ResponseWriter, enabled bool) *managedStreamKeepalive {
+	if !enabled {
+		return nil
+	}
+	return &managedStreamKeepalive{w: w}
+}
+
+func waitWithManagedKeepalive[T any](stream *managedStreamKeepalive, comment string, fn func() T) T {
+	if stream == nil {
+		return fn()
+	}
+
+	done := make(chan T, 1)
+	go func() {
+		done <- fn()
+	}()
+
+	ticker := time.NewTicker(managedKeepaliveInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case result := <-done:
+			return result
+		case <-ticker.C:
+			stream.writeComment(comment)
+		}
+	}
+}
+
+func managedModelWaitComment(round int) string {
+	return fmt.Sprintf("managed tool round %d waiting on model", round)
+}
+
+func managedToolWaitComment(round int, toolName string) string {
+	toolName = strings.TrimSpace(toolName)
+	if toolName == "" {
+		return fmt.Sprintf("managed tool round %d executing tool", round)
+	}
+	return fmt.Sprintf("managed tool round %d executing %s", round, toolName)
+}
+
+func (s *managedStreamKeepalive) writeComment(comment string) {
+	if s == nil {
+		return
+	}
+	s.start()
+	_, _ = io.WriteString(s.w, ": "+comment+"\n\n")
+	flushManagedStream(s.w)
+}
+
+func (s *managedStreamKeepalive) writeFinal(stream []byte) {
+	if s == nil {
+		return
+	}
+	if !s.started {
+		writeSyntheticSSE(s.w, stream)
+		return
+	}
+	_, _ = s.w.Write(stream)
+	flushManagedStream(s.w)
+}
+
+func (s *managedStreamKeepalive) writeOpenAIError(payload []byte) {
+	if s == nil {
+		return
+	}
+	s.start()
+	raw := ensureJSONPayload(payload)
+	if len(raw) == 0 {
+		raw = jsonErrorPayload("managed tool mediation failed")
+	}
+	_, _ = io.WriteString(s.w, "data: ")
+	_, _ = s.w.Write(raw)
+	_, _ = io.WriteString(s.w, "\n\n")
+	_, _ = io.WriteString(s.w, "data: [DONE]\n\n")
+	flushManagedStream(s.w)
+}
+
+func (s *managedStreamKeepalive) writeAnthropicError(message string) {
+	if s == nil {
+		return
+	}
+	s.start()
+	var stream bytes.Buffer
+	writeAnthropicSSEEvent(&stream, "error", map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "api_error",
+			"message": message,
+		},
+	})
+	_, _ = s.w.Write(stream.Bytes())
+	flushManagedStream(s.w)
+}
+
+func (s *managedStreamKeepalive) start() {
+	if s == nil || s.started {
+		return
+	}
+	s.w.Header().Set("Content-Type", "text/event-stream")
+	s.w.Header().Set("Cache-Control", "no-cache")
+	s.w.Header().Set("Connection", "keep-alive")
+	s.w.WriteHeader(http.StatusOK)
+	s.started = true
+	flushManagedStream(s.w)
+}
+
+func flushManagedStream(w http.ResponseWriter) {
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func extractAnthropicErrorMessage(body []byte) string {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "managed tool mediation failed"
+	}
+	if errObj, ok := payload["error"].(map[string]any); ok {
+		if message, _ := errObj["message"].(string); strings.TrimSpace(message) != "" {
+			return strings.TrimSpace(message)
+		}
+	}
+	if message, _ := payload["message"].(string); strings.TrimSpace(message) != "" {
+		return strings.TrimSpace(message)
+	}
+	return "managed tool mediation failed"
 }
 
 func writeSSEChunk(buf *bytes.Buffer, payload map[string]any) {

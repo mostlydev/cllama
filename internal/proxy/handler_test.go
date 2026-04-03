@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
@@ -229,6 +230,97 @@ func TestHandlerRestreamsManagedOpenAITools(t *testing.T) {
 	resp, _ := entry["response"].(map[string]any)
 	if resp["format"] != "sse" {
 		t.Fatalf("expected response.format=sse, got %+v", resp)
+	}
+}
+
+func TestHandlerStreamsManagedOpenAIKeepaliveComments(t *testing.T) {
+	toolRelease := make(chan struct{})
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-toolRelease
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	var xaiBodies [][]byte
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read xai body: %v", err)
+		}
+		xaiBodies = append(xaiBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(xaiBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-1",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+					}
+				}],
+				"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-2",
+				"model":"grok-4.1-fast",
+				"choices":[{"message":{"role":"assistant","content":"market context loaded"}}],
+				"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}
+			}`))
+		default:
+			t.Fatalf("unexpected xai round %d", len(xaiBodies))
+		}
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard),
+		WithSessionHistory(histDir))
+	proxySrv := httptest.NewServer(h)
+	defer proxySrv.Close()
+
+	req, err := http.NewRequest(http.MethodPost, proxySrv.URL+"/v1/chat/completions", bytes.NewBufferString(`{"model":"xai/grok-4.1-fast","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	bodyText, sawComment := readManagedKeepaliveStream(t, resp.Body, ": managed tool round 1 executing trading-api.get_market_context", func() {
+		close(toolRelease)
+	})
+	if !sawComment {
+		t.Fatalf("expected keepalive comment in managed stream, got %s", bodyText)
+	}
+	if !strings.Contains(bodyText, "data: [DONE]") {
+		t.Fatalf("expected managed stream completion, got %s", bodyText)
+	}
+	if !sseHasContent(parseSSEEvents(t, bodyText), "market context loaded") {
+		t.Fatalf("expected final managed SSE content, got %s", bodyText)
+	}
+
+	histFile := filepath.Join(histDir, "tiverton", "history.jsonl")
+	rawHist, err := os.ReadFile(histFile)
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	if bytes.Contains(rawHist, []byte(": managed tool round")) {
+		t.Fatalf("expected keepalive comments to stay out of session history, got %s", rawHist)
 	}
 }
 
@@ -1738,6 +1830,94 @@ func TestHandlerRestreamsManagedAnthropicTools(t *testing.T) {
 	}
 }
 
+func TestHandlerStreamsManagedAnthropicKeepaliveComments(t *testing.T) {
+	toolRelease := make(chan struct{})
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-toolRelease
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	var anthropicBodies [][]byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read anthropic body: %v", err)
+		}
+		anthropicBodies = append(anthropicBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(anthropicBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_01",
+				"type":"message",
+				"content":[{"type":"tool_use","id":"toolu_1","name":"trading-api.get_market_context","input":{}}],
+				"stop_reason":"tool_use",
+				"usage":{"input_tokens":10,"output_tokens":3}
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_02",
+				"type":"message",
+				"model":"claude-sonnet-4-20250514",
+				"content":[{"type":"text","text":"market context loaded"}],
+				"stop_reason":"end_turn",
+				"usage":{"input_tokens":7,"output_tokens":5}
+			}`))
+		default:
+			t.Fatalf("unexpected anthropic round %d", len(anthropicBodies))
+		}
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+	proxySrv := httptest.NewServer(h)
+	defer proxySrv.Close()
+
+	req, err := http.NewRequest(http.MethodPost, proxySrv.URL+"/v1/messages", bytes.NewBufferString(`{"model":"claude-sonnet-4-20250514","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	bodyText, sawComment := readManagedKeepaliveStream(t, resp.Body, ": managed tool round 1 executing trading-api.get_market_context", func() {
+		close(toolRelease)
+	})
+	if !sawComment {
+		t.Fatalf("expected keepalive comment in anthropic stream, got %s", bodyText)
+	}
+	if !strings.Contains(bodyText, "event: message_stop") {
+		t.Fatalf("expected anthropic stream completion, got %s", bodyText)
+	}
+	var sawText bool
+	for _, event := range parseSSEEvents(t, bodyText) {
+		if event["type"] == "content_block_delta" {
+			delta, _ := event["delta"].(map[string]any)
+			if delta["text"] == "market context loaded" {
+				sawText = true
+			}
+		}
+	}
+	if !sawText {
+		t.Fatalf("expected anthropic final text, got %s", bodyText)
+	}
+}
+
 func TestHandlerReinjectsManagedAnthropicContinuityOnNextTurn(t *testing.T) {
 	var anthropicBodies [][]byte
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3031,6 +3211,32 @@ func parseSSEEvents(t *testing.T, raw string) []map[string]any {
 		events = append(events, event)
 	}
 	return events
+}
+
+func readManagedKeepaliveStream(t *testing.T, body io.Reader, commentPrefix string, release func()) (string, bool) {
+	t.Helper()
+	reader := bufio.NewReader(body)
+	var out strings.Builder
+	sawComment := false
+	for {
+		line, err := reader.ReadString('\n')
+		if line != "" {
+			out.WriteString(line)
+			if !sawComment && strings.HasPrefix(strings.TrimSpace(line), commentPrefix) {
+				sawComment = true
+				if release != nil {
+					release()
+				}
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read managed stream: %v\n%s", err, out.String())
+		}
+	}
+	return out.String(), sawComment
 }
 
 func sseHasContent(events []map[string]any, want string) bool {
