@@ -68,6 +68,9 @@ func TestRecorder_WritesOneJSONEntry(t *testing.T) {
 	if got.Version != 1 {
 		t.Errorf("Version mismatch: got %d", got.Version)
 	}
+	if got.ID == "" {
+		t.Error("expected stable entry ID to be populated")
+	}
 }
 
 func TestRecorder_AppendsMultipleTurns(t *testing.T) {
@@ -100,6 +103,10 @@ func TestRecorder_AppendsMultipleTurns(t *testing.T) {
 		var e Entry
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
 			t.Errorf("line %d is not valid JSON: %v", i, err)
+			continue
+		}
+		if e.ID == "" {
+			t.Errorf("line %d missing stable entry ID", i)
 		}
 	}
 }
@@ -142,6 +149,10 @@ func TestRecorder_ConcurrentWritesSafe(t *testing.T) {
 		var e Entry
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
 			t.Errorf("line %d is corrupted (not valid JSON): %v", i, err)
+			continue
+		}
+		if e.ID == "" {
+			t.Errorf("line %d missing stable entry ID", i)
 		}
 	}
 }
@@ -185,6 +196,36 @@ func TestRecorder_SSEPayloadNoMarshalFailure(t *testing.T) {
 	}
 	if got.Response.JSON != nil {
 		t.Errorf("expected nil JSON for SSE payload, got %s", got.Response.JSON)
+	}
+	if got.ID == "" {
+		t.Error("expected stable entry ID for SSE payload")
+	}
+}
+
+func TestEnsureIDStableAcrossEquivalentEntries(t *testing.T) {
+	entryA := Entry{
+		Version:        1,
+		TS:             "2026-04-01T00:00:00Z",
+		ClawID:         "agent-1",
+		RequestedModel: "openai/gpt-4o",
+		Response: Payload{
+			Format: "json",
+			JSON:   json.RawMessage(`{"ok":true}`),
+		},
+	}
+	entryB := entryA
+
+	if err := entryA.EnsureID(); err != nil {
+		t.Fatalf("entryA.EnsureID(): %v", err)
+	}
+	if err := entryB.EnsureID(); err != nil {
+		t.Fatalf("entryB.EnsureID(): %v", err)
+	}
+	if entryA.ID == "" || entryB.ID == "" {
+		t.Fatal("expected non-empty IDs")
+	}
+	if entryA.ID != entryB.ID {
+		t.Fatalf("expected deterministic IDs, got %q and %q", entryA.ID, entryB.ID)
 	}
 }
 

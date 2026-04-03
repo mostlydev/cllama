@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,6 +65,559 @@ func TestHandlerForwardsAndSwapsAuth(t *testing.T) {
 	}
 	if payload["model"] != "gpt-4o" {
 		t.Errorf("expected stripped model gpt-4o, got %#v", payload["model"])
+	}
+}
+
+func TestHandlerInjectsManagedToolsIntoOpenAIRequests(t *testing.T) {
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifest()), nil)
+	body := `{
+		"model":"openai/gpt-4o",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"runner_local"}}],
+		"functions":[{"name":"legacy"}],
+		"tool_choice":"auto",
+		"parallel_tool_calls":true
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal backend body: %v", err)
+	}
+	tools, _ := payload["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 managed tool, got %+v", payload["tools"])
+	}
+	first, _ := tools[0].(map[string]any)
+	function, _ := first["function"].(map[string]any)
+	if first["type"] != "function" || function["name"] != "trading-api.get_market_context" {
+		t.Fatalf("unexpected managed tool payload: %+v", first)
+	}
+	if _, ok := payload["functions"]; ok {
+		t.Fatalf("expected legacy functions field removed, got %+v", payload)
+	}
+	if _, ok := payload["tool_choice"]; ok {
+		t.Fatalf("expected tool_choice removed, got %+v", payload)
+	}
+	if _, ok := payload["parallel_tool_calls"]; ok {
+		t.Fatalf("expected parallel_tool_calls removed, got %+v", payload)
+	}
+}
+
+func TestHandlerRestreamsManagedOpenAITools(t *testing.T) {
+	var xaiBodies [][]byte
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read xai body: %v", err)
+		}
+		xaiBodies = append(xaiBodies, body)
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("unmarshal xai request: %v", err)
+		}
+		if stream, _ := payload["stream"].(bool); stream {
+			t.Fatalf("expected managed upstream request to force stream=false, got %+v", payload)
+		}
+		if _, ok := payload["stream_options"]; ok {
+			t.Fatalf("expected stream_options removed from managed upstream request, got %+v", payload)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch len(xaiBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-1",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+					}
+				}],
+				"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-2",
+				"model":"grok-4.1-fast",
+				"choices":[{"message":{"role":"assistant","content":"market context loaded"}}],
+				"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}
+			}`))
+		default:
+			t.Fatalf("unexpected xai round %d", len(xaiBodies))
+		}
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard),
+		WithSessionHistory(histDir))
+	body := `{"model":"xai/grok-4.1-fast","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("expected SSE content-type, got %q", got)
+	}
+	bodyText := w.Body.String()
+	if !strings.Contains(bodyText, "data: [DONE]") {
+		t.Fatalf("expected [DONE] marker, got %s", bodyText)
+	}
+	events := parseSSEEvents(t, bodyText)
+	if !sseHasContent(events, "market context loaded") {
+		t.Fatalf("expected synthetic SSE content chunk, got %+v", events)
+	}
+	if !sseHasUsage(events, 17, 8, 25) {
+		t.Fatalf("expected aggregated usage chunk, got %+v", events)
+	}
+
+	histFile := filepath.Join(histDir, "tiverton", "history.jsonl")
+	rawHist, err := os.ReadFile(histFile)
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(rawHist, "\n"), &entry); err != nil {
+		t.Fatalf("unmarshal history entry: %v", err)
+	}
+	if stream, _ := entry["stream"].(bool); !stream {
+		t.Fatalf("expected history stream=true, got %+v", entry)
+	}
+	resp, _ := entry["response"].(map[string]any)
+	if resp["format"] != "sse" {
+		t.Fatalf("expected response.format=sse, got %+v", resp)
+	}
+}
+
+func TestHandlerExecutesManagedToolsViaXAI(t *testing.T) {
+	var xaiBodies [][]byte
+	var toolAuth string
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolAuth = r.Header.Get("Authorization")
+		if r.URL.Path != "/api/v1/market_context/tiverton" {
+			t.Fatalf("unexpected tool path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000,"positions":[{"symbol":"NVDA","qty":2}]}`))
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read xai body: %v", err)
+		}
+		xaiBodies = append(xaiBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(xaiBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-1",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+					}
+				}],
+				"usage":{"prompt_tokens":10,"completion_tokens":3}
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-2",
+				"choices":[{"message":{"role":"assistant","content":"market context loaded"}}],
+				"usage":{"prompt_tokens":7,"completion_tokens":5}
+			}`))
+		default:
+			t.Fatalf("unexpected xai round %d", len(xaiBodies))
+		}
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "svc-token")), logging.New(io.Discard),
+		WithSessionHistory(histDir))
+
+	body := `{"model":"xai/grok-4.1-fast","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "market context loaded") {
+		t.Fatalf("expected final xai text response, got %s", w.Body.String())
+	}
+	if len(xaiBodies) != 2 {
+		t.Fatalf("expected 2 xai rounds, got %d", len(xaiBodies))
+	}
+	if toolAuth != "Bearer svc-token" {
+		t.Fatalf("expected projected tool auth, got %q", toolAuth)
+	}
+
+	var secondPayload map[string]any
+	if err := json.Unmarshal(xaiBodies[1], &secondPayload); err != nil {
+		t.Fatalf("unmarshal second xai request: %v", err)
+	}
+	if secondPayload["model"] != "grok-4.1-fast" {
+		t.Fatalf("expected stripped xai model, got %#v", secondPayload["model"])
+	}
+	messages, _ := secondPayload["messages"].([]any)
+	if len(messages) < 3 {
+		t.Fatalf("expected tool round reflected in follow-up request, got %+v", secondPayload)
+	}
+	last := messages[len(messages)-1].(map[string]any)
+	if last["role"] != "tool" {
+		t.Fatalf("expected final follow-up message to be tool result, got %+v", last)
+	}
+	var toolResult map[string]any
+	if err := json.Unmarshal([]byte(last["content"].(string)), &toolResult); err != nil {
+		t.Fatalf("unmarshal tool result: %v", err)
+	}
+	if ok, _ := toolResult["ok"].(bool); !ok {
+		t.Fatalf("expected successful tool result, got %+v", toolResult)
+	}
+	data, _ := toolResult["data"].(map[string]any)
+	if data["balance"].(float64) != 5000 {
+		t.Fatalf("expected tool payload balance, got %+v", toolResult)
+	}
+
+	histFile := filepath.Join(histDir, "tiverton", "history.jsonl")
+	rawHist, err := os.ReadFile(histFile)
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(rawHist, "\n"), &entry); err != nil {
+		t.Fatalf("unmarshal history entry: %v", err)
+	}
+	if entry["status"] != "ok" {
+		t.Fatalf("expected history status=ok, got %+v", entry)
+	}
+	usage, _ := entry["usage"].(map[string]any)
+	if usage["total_rounds"].(float64) != 2 {
+		t.Fatalf("expected total_rounds=2, got %+v", usage)
+	}
+	trace, _ := entry["tool_trace"].([]any)
+	if len(trace) != 1 {
+		t.Fatalf("expected one tool trace round, got %+v", entry)
+	}
+	round := trace[0].(map[string]any)
+	toolCalls := round["tool_calls"].([]any)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected one tool call in trace, got %+v", round)
+	}
+	call := toolCalls[0].(map[string]any)
+	if call["name"] != "trading-api.get_market_context" {
+		t.Fatalf("unexpected tool trace name: %+v", call)
+	}
+}
+
+func TestHandlerReinjectsManagedToolContinuityOnNextTurn(t *testing.T) {
+	var xaiBodies [][]byte
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000,"positions":[{"symbol":"NVDA","qty":2}]}`))
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read xai body: %v", err)
+		}
+		xaiBodies = append(xaiBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(xaiBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-1",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+					}
+				}]
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-2",
+				"choices":[{"message":{"role":"assistant","content":"market context loaded"}}]
+			}`))
+		case 3:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal xai request: %v", err)
+			}
+			rawMessages, _ := payload["messages"].([]any)
+			conversation := make([]map[string]any, 0, len(rawMessages))
+			for _, raw := range rawMessages {
+				msg, _ := raw.(map[string]any)
+				if msg == nil {
+					continue
+				}
+				if role, _ := msg["role"].(string); role == "system" {
+					continue
+				}
+				conversation = append(conversation, msg)
+			}
+			if len(conversation) < 5 {
+				t.Fatalf("expected continuity-injected conversation, got %+v", payload)
+			}
+			if conversation[0]["role"] != "user" || conversation[0]["content"] != "hi" {
+				t.Fatalf("unexpected first conversation message: %+v", conversation[0])
+			}
+			if conversation[1]["role"] != "assistant" {
+				t.Fatalf("expected hidden assistant tool call before visible reply, got %+v", conversation[1])
+			}
+			toolCalls, _ := conversation[1]["tool_calls"].([]any)
+			if len(toolCalls) != 1 {
+				t.Fatalf("expected continuity assistant tool_calls, got %+v", conversation[1])
+			}
+			if conversation[2]["role"] != "tool" || conversation[2]["tool_call_id"] != "call_1" {
+				t.Fatalf("expected continuity tool result before visible reply, got %+v", conversation[2])
+			}
+			if conversation[3]["role"] != "assistant" || conversation[3]["content"] != "market context loaded" {
+				t.Fatalf("expected original visible assistant reply preserved after hidden turns, got %+v", conversation[3])
+			}
+			if conversation[4]["role"] != "user" || conversation[4]["content"] != "what next?" {
+				t.Fatalf("expected new user turn to remain after injected continuity, got %+v", conversation[4])
+			}
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-3","choices":[{"message":{"role":"assistant","content":"next step is hedge"}}]}`))
+		default:
+			t.Fatalf("unexpected xai round %d", len(xaiBodies))
+		}
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"xai/grok-4.1-fast","messages":[{"role":"user","content":"hi"}]}`))
+	firstReq.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	firstReq.Header.Set("Content-Type", "application/json")
+	firstW := httptest.NewRecorder()
+	h.ServeHTTP(firstW, firstReq)
+	if firstW.Code != http.StatusOK {
+		t.Fatalf("expected first request 200, got %d: %s", firstW.Code, firstW.Body.String())
+	}
+	if !strings.Contains(firstW.Body.String(), "market context loaded") {
+		t.Fatalf("expected first response to complete mediated tool turn, got %s", firstW.Body.String())
+	}
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{
+		"model":"xai/grok-4.1-fast",
+		"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":"market context loaded"},
+			{"role":"user","content":"what next?"}
+		]
+	}`))
+	secondReq.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	secondReq.Header.Set("Content-Type", "application/json")
+	secondW := httptest.NewRecorder()
+	h.ServeHTTP(secondW, secondReq)
+	if secondW.Code != http.StatusOK {
+		t.Fatalf("expected second request 200, got %d: %s", secondW.Code, secondW.Body.String())
+	}
+	if !strings.Contains(secondW.Body.String(), "next step is hedge") {
+		t.Fatalf("expected second response text, got %s", secondW.Body.String())
+	}
+	if len(xaiBodies) != 3 {
+		t.Fatalf("expected 3 xai calls across both turns, got %d", len(xaiBodies))
+	}
+}
+
+func TestHandlerManagedToolHTTPErrorFeedsBackToModel(t *testing.T) {
+	var xaiBodies [][]byte
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"message":"backend unavailable"}`))
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read xai body: %v", err)
+		}
+		xaiBodies = append(xaiBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(xaiBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-1",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+					}
+				}]
+			}`))
+		case 2:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal xai follow-up: %v", err)
+			}
+			messages := payload["messages"].([]any)
+			last := messages[len(messages)-1].(map[string]any)
+			var toolResult map[string]any
+			if err := json.Unmarshal([]byte(last["content"].(string)), &toolResult); err != nil {
+				t.Fatalf("unmarshal tool result: %v", err)
+			}
+			if ok, _ := toolResult["ok"].(bool); ok {
+				t.Fatalf("expected failed tool result, got %+v", toolResult)
+			}
+			errPayload := toolResult["error"].(map[string]any)
+			if errPayload["code"] != "http_502" {
+				t.Fatalf("expected http_502 tool error, got %+v", toolResult)
+			}
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-2","choices":[{"message":{"role":"assistant","content":"tool failed cleanly"}}]}`))
+		default:
+			t.Fatalf("unexpected xai round %d", len(xaiBodies))
+		}
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+
+	body := `{"model":"xai/grok-4.1-fast","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "tool failed cleanly") {
+		t.Fatalf("expected recovery text after tool failure, got %s", w.Body.String())
+	}
+	if len(xaiBodies) != 2 {
+		t.Fatalf("expected 2 xai rounds, got %d", len(xaiBodies))
+	}
+}
+
+func TestHandlerManagedToolMaxRoundsFailsClosed(t *testing.T) {
+	xaiCalls := 0
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		xaiCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"chatcmpl-loop",
+			"choices":[{
+				"finish_reason":"tool_calls",
+				"message":{
+					"role":"assistant",
+					"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+				}
+			}]
+		}`))
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	tools := managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")
+	tools.Policy.MaxRounds = 1
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", tools), logging.New(io.Discard))
+
+	body := `{"model":"xai/grok-4.1-fast","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "managed tool max rounds exceeded") {
+		t.Fatalf("expected max_rounds error, got %s", w.Body.String())
+	}
+	if xaiCalls != 2 {
+		t.Fatalf("expected 2 xai calls before max_rounds failure, got %d", xaiCalls)
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected 1 tool execution before max_rounds failure, got %d", toolCalls)
 	}
 }
 
@@ -131,6 +685,322 @@ func TestHandlerFallsBackToOpenRouterForVendorPrefixedModel(t *testing.T) {
 	}
 	if payload["model"] != "anthropic/claude-sonnet-4" {
 		t.Fatalf("expected vendor-prefixed model preserved for openrouter fallback, got %#v", payload["model"])
+	}
+}
+
+func TestHandlerNormalizesBareModelAgainstPolicy(t *testing.T) {
+	var logs bytes.Buffer
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: backend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "xai/grok-4.1-fast"},
+		},
+	}
+	h := NewHandler(reg, stubContextLoaderWithPolicy("weston", "weston:dummy123", policy), logging.New(&logs))
+	body := `{"model":"grok-4.1-fast","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer weston:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal backend body: %v", err)
+	}
+	if payload["model"] != "grok-4.1-fast" {
+		t.Fatalf("expected normalized upstream model grok-4.1-fast, got %#v", payload["model"])
+	}
+	assertInterventionLogged(t, logs.Bytes(), "bare_model_normalized")
+}
+
+func TestHandlerFailsoverToDeclaredFallbackAndRebuildsBodyPerCandidate(t *testing.T) {
+	var logs bytes.Buffer
+	primaryBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limit exceeded"}}`))
+	}))
+	defer primaryBackend.Close()
+
+	var fallbackBody []byte
+	fallbackBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		fallbackBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read fallback body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-2","choices":[{"message":{"content":"fallback"}}]}`))
+	}))
+	defer fallbackBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: primaryBackend.URL + "/v1", APIKey: "sk-openai", Auth: "bearer",
+	})
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: fallbackBackend.URL + "/v1", APIKey: "sk-or", Auth: "bearer",
+	})
+
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "openai/gpt-4o"},
+			{Slot: "fallback", Ref: "openrouter/anthropic/claude-haiku-4-5"},
+		},
+	}
+	h := NewHandler(reg, stubContextLoaderWithPolicy("weston", "weston:dummy123", policy), logging.New(&logs))
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer weston:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 after declared fallback, got %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(fallbackBody, &payload); err != nil {
+		t.Fatalf("unmarshal fallback body: %v", err)
+	}
+	if payload["model"] != "anthropic/claude-haiku-4-5" {
+		t.Fatalf("expected fallback model in rebuilt body, got %#v", payload["model"])
+	}
+	assertInterventionLogged(t, logs.Bytes(), "provider_exhausted_failover")
+}
+
+func TestHandlerAnthropicPolicyClampsMissingModelToPrimary(t *testing.T) {
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_01","type":"message","content":[{"type":"text","text":"hello"}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "anthropic/claude-sonnet-4-20250514"},
+		},
+	}
+	h := NewHandler(reg, stubContextLoaderWithPolicy("nano-bot", "nano-bot:dummy456", policy), nil)
+	body := `{"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("x-api-key", "nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal backend body: %v", err)
+	}
+	if payload["model"] != "claude-sonnet-4-20250514" {
+		t.Fatalf("expected anthropic upstream model, got %#v", payload["model"])
+	}
+}
+
+func TestHandlerAnthropicNoPolicyStripsProviderPrefix(t *testing.T) {
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_01","type":"message","content":[{"type":"text","text":"hello"}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithToken("nano-bot", "nano-bot:dummy456"), nil)
+	body := `{"model":"anthropic/claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("x-api-key", "nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal backend body: %v", err)
+	}
+	if payload["model"] != "claude-sonnet-4-20250514" {
+		t.Fatalf("expected stripped anthropic model, got %#v", payload["model"])
+	}
+}
+
+func TestHandlerAnthropicPolicyRejectsUnsupportedProviderBridge(t *testing.T) {
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: "https://api.anthropic.com/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "openrouter/anthropic/claude-sonnet-4"},
+		},
+	}
+	h := NewHandler(reg, stubContextLoaderWithPolicy("nano-bot", "nano-bot:dummy456", policy), nil)
+	body := `{"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("x-api-key", "nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "anthropic-compatible") {
+		t.Fatalf("expected clear anthropic compatibility error, got %s", w.Body.String())
+	}
+}
+
+func TestHandlerMissingModelClampsToDefaultAndLogsIntervention(t *testing.T) {
+	var logs bytes.Buffer
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "openai/gpt-4o"},
+		},
+	}
+	h := NewHandler(reg, stubContextLoaderWithPolicy("weston", "weston:dummy123", policy), logging.New(&logs))
+	body := `{"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer weston:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal backend body: %v", err)
+	}
+	if payload["model"] != "gpt-4o" {
+		t.Fatalf("expected default upstream model gpt-4o, got %#v", payload["model"])
+	}
+	assertInterventionLogged(t, logs.Bytes(), "missing")
+}
+
+func TestHandlerDoesNotAdvanceCandidatesOnUpstream500(t *testing.T) {
+	var fallbackCalls int
+	primaryBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"upstream exploded"}}`))
+	}))
+	defer primaryBackend.Close()
+
+	fallbackBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-2","choices":[{"message":{"content":"fallback"}}]}`))
+	}))
+	defer fallbackBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: primaryBackend.URL + "/v1", APIKey: "sk-openai", Auth: "bearer",
+	})
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: fallbackBackend.URL + "/v1", APIKey: "sk-or", Auth: "bearer",
+	})
+
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "openai/gpt-4o"},
+			{Slot: "fallback", Ref: "openrouter/anthropic/claude-haiku-4-5"},
+		},
+	}
+	h := NewHandler(reg, stubContextLoaderWithPolicy("weston", "weston:dummy123", policy), nil)
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer weston:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected upstream 500 to pass through, got %d: %s", w.Code, w.Body.String())
+	}
+	if fallbackCalls != 0 {
+		t.Fatalf("expected no fallback calls on upstream 500, got %d", fallbackCalls)
 	}
 }
 
@@ -590,6 +1460,410 @@ func TestHandlerForwardsAnthropicMessages(t *testing.T) {
 	}
 	if payload["model"] != "claude-sonnet-4-20250514" {
 		t.Errorf("expected model unchanged, got %#v", payload["model"])
+	}
+}
+
+func TestHandlerExecutesManagedAnthropicTools(t *testing.T) {
+	var anthropicBodies [][]byte
+	var toolAuth string
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolAuth = r.Header.Get("Authorization")
+		if r.URL.Path != "/api/v1/market_context/nano-bot" {
+			t.Fatalf("unexpected tool path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000,"positions":[{"symbol":"NVDA","qty":2}]}`))
+	}))
+	defer toolSrv.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read anthropic body: %v", err)
+		}
+		anthropicBodies = append(anthropicBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(anthropicBodies) {
+		case 1:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal anthropic request: %v", err)
+			}
+			tools, _ := payload["tools"].([]any)
+			if len(tools) != 1 {
+				t.Fatalf("expected 1 managed anthropic tool, got %+v", payload["tools"])
+			}
+			if _, ok := payload["tool_choice"]; ok {
+				t.Fatalf("expected tool_choice removed from managed anthropic request, got %+v", payload)
+			}
+			_, _ = w.Write([]byte(`{
+				"id":"msg_01",
+				"type":"message",
+				"content":[{"type":"tool_use","id":"toolu_1","name":"trading-api.get_market_context","input":{}}],
+				"stop_reason":"tool_use",
+				"usage":{"input_tokens":11,"output_tokens":4}
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_02",
+				"type":"message",
+				"model":"claude-sonnet-4-20250514",
+				"content":[{"type":"text","text":"market context loaded"}],
+				"stop_reason":"end_turn",
+				"usage":{"input_tokens":7,"output_tokens":5}
+			}`))
+		default:
+			t.Fatalf("unexpected anthropic round %d", len(anthropicBodies))
+		}
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "svc-token")), logging.New(io.Discard),
+		WithSessionHistory(histDir))
+	body := `{
+		"model":"claude-sonnet-4-20250514",
+		"messages":[{"role":"user","content":"hi"}],
+		"tool_choice":{"type":"tool","name":"runner_local"}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "market context loaded") {
+		t.Fatalf("expected final anthropic text response, got %s", w.Body.String())
+	}
+	if len(anthropicBodies) != 2 {
+		t.Fatalf("expected 2 anthropic rounds, got %d", len(anthropicBodies))
+	}
+	if toolAuth != "Bearer svc-token" {
+		t.Fatalf("expected projected tool auth, got %q", toolAuth)
+	}
+
+	var secondPayload map[string]any
+	if err := json.Unmarshal(anthropicBodies[1], &secondPayload); err != nil {
+		t.Fatalf("unmarshal second anthropic request: %v", err)
+	}
+	if secondPayload["model"] != "claude-sonnet-4-20250514" {
+		t.Fatalf("expected anthropic model unchanged, got %#v", secondPayload["model"])
+	}
+	messages, _ := secondPayload["messages"].([]any)
+	if len(messages) < 3 {
+		t.Fatalf("expected mediated anthropic follow-up messages, got %+v", secondPayload)
+	}
+	last := messages[len(messages)-1].(map[string]any)
+	if last["role"] != "user" {
+		t.Fatalf("expected final follow-up message to be user tool_result, got %+v", last)
+	}
+	blocks, _ := last["content"].([]any)
+	if len(blocks) != 1 {
+		t.Fatalf("expected one tool_result block, got %+v", last)
+	}
+	resultBlock := blocks[0].(map[string]any)
+	if resultBlock["type"] != "tool_result" || resultBlock["tool_use_id"] != "toolu_1" {
+		t.Fatalf("unexpected tool_result block: %+v", resultBlock)
+	}
+	var toolResult map[string]any
+	if err := json.Unmarshal([]byte(resultBlock["content"].(string)), &toolResult); err != nil {
+		t.Fatalf("unmarshal tool result: %v", err)
+	}
+	if ok, _ := toolResult["ok"].(bool); !ok {
+		t.Fatalf("expected successful tool result, got %+v", toolResult)
+	}
+	data, _ := toolResult["data"].(map[string]any)
+	if data["balance"].(float64) != 5000 {
+		t.Fatalf("expected tool payload balance, got %+v", toolResult)
+	}
+
+	histFile := filepath.Join(histDir, "nano-bot", "history.jsonl")
+	rawHist, err := os.ReadFile(histFile)
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(rawHist, "\n"), &entry); err != nil {
+		t.Fatalf("unmarshal history entry: %v", err)
+	}
+	if entry["status"] != "ok" {
+		t.Fatalf("expected history status=ok, got %+v", entry)
+	}
+	usage, _ := entry["usage"].(map[string]any)
+	if usage["total_rounds"].(float64) != 2 {
+		t.Fatalf("expected total_rounds=2, got %+v", usage)
+	}
+	trace, _ := entry["tool_trace"].([]any)
+	if len(trace) != 1 {
+		t.Fatalf("expected one tool trace round, got %+v", entry)
+	}
+	round := trace[0].(map[string]any)
+	toolCalls := round["tool_calls"].([]any)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected one tool call in trace, got %+v", round)
+	}
+	call := toolCalls[0].(map[string]any)
+	if call["name"] != "trading-api.get_market_context" {
+		t.Fatalf("unexpected tool trace name: %+v", call)
+	}
+}
+
+func TestHandlerRestreamsManagedAnthropicTools(t *testing.T) {
+	var anthropicBodies [][]byte
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read anthropic body: %v", err)
+		}
+		anthropicBodies = append(anthropicBodies, body)
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("unmarshal anthropic request: %v", err)
+		}
+		if stream, _ := payload["stream"].(bool); stream {
+			t.Fatalf("expected managed anthropic upstream request to force stream=false, got %+v", payload)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch len(anthropicBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_01",
+				"type":"message",
+				"content":[{"type":"tool_use","id":"toolu_1","name":"trading-api.get_market_context","input":{}}],
+				"stop_reason":"tool_use",
+				"usage":{"input_tokens":10,"output_tokens":3}
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_02",
+				"type":"message",
+				"model":"claude-sonnet-4-20250514",
+				"content":[{"type":"text","text":"market context loaded"}],
+				"stop_reason":"end_turn",
+				"usage":{"input_tokens":7,"output_tokens":5}
+			}`))
+		default:
+			t.Fatalf("unexpected anthropic round %d", len(anthropicBodies))
+		}
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard),
+		WithSessionHistory(histDir))
+	body := `{"model":"claude-sonnet-4-20250514","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("expected SSE content-type, got %q", got)
+	}
+	bodyText := w.Body.String()
+	if !strings.Contains(bodyText, "event: message_start") || !strings.Contains(bodyText, "event: message_stop") {
+		t.Fatalf("expected anthropic SSE envelope, got %s", bodyText)
+	}
+	events := parseSSEEvents(t, bodyText)
+	var sawText bool
+	var sawInput bool
+	var sawOutput bool
+	for _, event := range events {
+		if event["type"] == "content_block_delta" {
+			delta, _ := event["delta"].(map[string]any)
+			if delta["text"] == "market context loaded" {
+				sawText = true
+			}
+		}
+		if event["type"] == "message_start" {
+			msg, _ := event["message"].(map[string]any)
+			usage, _ := msg["usage"].(map[string]any)
+			if usage != nil && int(usage["input_tokens"].(float64)) == 17 {
+				sawInput = true
+			}
+		}
+		if event["type"] == "message_delta" {
+			usage, _ := event["usage"].(map[string]any)
+			if usage != nil && int(usage["output_tokens"].(float64)) == 8 {
+				sawOutput = true
+			}
+		}
+	}
+	if !sawText || !sawInput || !sawOutput {
+		t.Fatalf("expected synthetic anthropic text and aggregated usage, got %+v", events)
+	}
+
+	histFile := filepath.Join(histDir, "nano-bot", "history.jsonl")
+	rawHist, err := os.ReadFile(histFile)
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(rawHist, "\n"), &entry); err != nil {
+		t.Fatalf("unmarshal history entry: %v", err)
+	}
+	if stream, _ := entry["stream"].(bool); !stream {
+		t.Fatalf("expected history stream=true, got %+v", entry)
+	}
+	resp, _ := entry["response"].(map[string]any)
+	if resp["format"] != "sse" {
+		t.Fatalf("expected response.format=sse, got %+v", resp)
+	}
+}
+
+func TestHandlerReinjectsManagedAnthropicContinuityOnNextTurn(t *testing.T) {
+	var anthropicBodies [][]byte
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000,"positions":[{"symbol":"NVDA","qty":2}]}`))
+	}))
+	defer toolSrv.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read anthropic body: %v", err)
+		}
+		anthropicBodies = append(anthropicBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(anthropicBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_01",
+				"type":"message",
+				"content":[{"type":"tool_use","id":"toolu_1","name":"trading-api.get_market_context","input":{}}],
+				"stop_reason":"tool_use"
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_02",
+				"type":"message",
+				"content":[{"type":"text","text":"market context loaded"}],
+				"stop_reason":"end_turn"
+			}`))
+		case 3:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal anthropic request: %v", err)
+			}
+			rawMessages, _ := payload["messages"].([]any)
+			if len(rawMessages) < 5 {
+				t.Fatalf("expected continuity-injected anthropic conversation, got %+v", payload)
+			}
+			first := rawMessages[0].(map[string]any)
+			if first["role"] != "user" || first["content"] != "hi" {
+				t.Fatalf("unexpected first conversation message: %+v", first)
+			}
+			hiddenAssistant := rawMessages[1].(map[string]any)
+			if hiddenAssistant["role"] != "assistant" {
+				t.Fatalf("expected hidden assistant tool_use before visible reply, got %+v", hiddenAssistant)
+			}
+			hiddenAssistantBlocks, _ := hiddenAssistant["content"].([]any)
+			if len(hiddenAssistantBlocks) != 1 {
+				t.Fatalf("expected hidden assistant tool_use block, got %+v", hiddenAssistant)
+			}
+			if hiddenAssistantBlocks[0].(map[string]any)["type"] != "tool_use" {
+				t.Fatalf("expected tool_use block, got %+v", hiddenAssistantBlocks[0])
+			}
+			hiddenUser := rawMessages[2].(map[string]any)
+			if hiddenUser["role"] != "user" {
+				t.Fatalf("expected hidden user tool_result after tool_use, got %+v", hiddenUser)
+			}
+			hiddenUserBlocks, _ := hiddenUser["content"].([]any)
+			if len(hiddenUserBlocks) != 1 || hiddenUserBlocks[0].(map[string]any)["type"] != "tool_result" {
+				t.Fatalf("expected tool_result block, got %+v", hiddenUser)
+			}
+			visibleAssistant := rawMessages[3].(map[string]any)
+			if visibleAssistant["role"] != "assistant" {
+				t.Fatalf("expected visible assistant reply preserved after hidden turns, got %+v", visibleAssistant)
+			}
+			if text := strings.Join(anthropicMessageTextBlocks(visibleAssistant), "\n"); text != "market context loaded" {
+				t.Fatalf("expected preserved visible assistant reply, got %+v", visibleAssistant)
+			}
+			last := rawMessages[4].(map[string]any)
+			if last["role"] != "user" || last["content"] != "what next?" {
+				t.Fatalf("expected new user turn to remain after continuity injection, got %+v", last)
+			}
+			_, _ = w.Write([]byte(`{
+				"id":"msg_03",
+				"type":"message",
+				"content":[{"type":"text","text":"next step is hedge"}],
+				"stop_reason":"end_turn"
+			}`))
+		default:
+			t.Fatalf("unexpected anthropic round %d", len(anthropicBodies))
+		}
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(`{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}]}`))
+	firstReq.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	firstReq.Header.Set("Content-Type", "application/json")
+	firstReq.Header.Set("Anthropic-Version", "2023-06-01")
+	firstW := httptest.NewRecorder()
+	h.ServeHTTP(firstW, firstReq)
+	if firstW.Code != http.StatusOK {
+		t.Fatalf("expected first request 200, got %d: %s", firstW.Code, firstW.Body.String())
+	}
+	if !strings.Contains(firstW.Body.String(), "market context loaded") {
+		t.Fatalf("expected first response to complete mediated anthropic tool turn, got %s", firstW.Body.String())
+	}
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(`{
+		"model":"claude-sonnet-4-20250514",
+		"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":"market context loaded"},
+			{"role":"user","content":"what next?"}
+		]
+	}`))
+	secondReq.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	secondReq.Header.Set("Content-Type", "application/json")
+	secondReq.Header.Set("Anthropic-Version", "2023-06-01")
+	secondW := httptest.NewRecorder()
+	h.ServeHTTP(secondW, secondReq)
+	if secondW.Code != http.StatusOK {
+		t.Fatalf("expected second request 200, got %d: %s", secondW.Code, secondW.Body.String())
+	}
+	if !strings.Contains(secondW.Body.String(), "next step is hedge") {
+		t.Fatalf("expected second response text, got %s", secondW.Body.String())
+	}
+	if len(anthropicBodies) != 3 {
+		t.Fatalf("expected 3 anthropic calls across both turns, got %d", len(anthropicBodies))
 	}
 }
 
@@ -1071,6 +2345,9 @@ func TestHandlerRecordsSessionHistoryJSON(t *testing.T) {
 	if entry["requested_model"] != "openai/gpt-4o" {
 		t.Errorf("expected requested_model=openai/gpt-4o, got %v", entry["requested_model"])
 	}
+	if entry["id"] == "" {
+		t.Errorf("expected stable history entry ID, got %+v", entry)
+	}
 	resp, _ := entry["response"].(map[string]any)
 	if resp == nil {
 		t.Fatal("expected response field in entry")
@@ -1168,6 +2445,441 @@ func TestHandlerSkipsSessionHistoryOnUpstreamError(t *testing.T) {
 	}
 }
 
+func TestHandlerInjectsMemoryRecallIntoOpenAIRequests(t *testing.T) {
+	var logs lockedBuffer
+	var gotBody []byte
+	var recallPayload map[string]any
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read backend body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	memorySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/recall" {
+			t.Fatalf("unexpected memory path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&recallPayload); err != nil {
+			t.Fatalf("decode recall payload: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"memories":[{"text":"User prefers concise answers","kind":"profile","source":"profile-store"}]}`))
+	}))
+	defer memorySrv.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, func(id string) (*agentctx.AgentContext, error) {
+		if id != "tiverton" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID: "tiverton",
+			Metadata: map[string]any{
+				"token":    "tiverton:dummy123",
+				"pod":      "ops",
+				"service":  "tiverton",
+				"type":     "openclaw",
+				"timezone": "America/New_York",
+			},
+			Memory: &agentctx.MemoryManifest{
+				Version: 1,
+				Service: "team-memory",
+				BaseURL: memorySrv.URL,
+				Recall:  &agentctx.MemoryOp{Path: "/recall", TimeoutMS: 300},
+			},
+		}, nil
+	}, logging.New(&logs))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal backend body: %v", err)
+	}
+	messages := payload["messages"].([]any)
+	if len(messages) < 2 {
+		t.Fatalf("expected injected system message, got %+v", payload)
+	}
+	first := messages[0].(map[string]any)
+	if first["role"] != "system" {
+		t.Fatalf("expected leading system message, got %+v", first)
+	}
+	content := first["content"].(string)
+	if !strings.Contains(content, "User prefers concise answers") {
+		t.Fatalf("expected recalled memory in injected content, got %q", content)
+	}
+	metadata, _ := recallPayload["metadata"].(map[string]any)
+	if metadata == nil {
+		t.Fatalf("expected recall metadata, got %+v", recallPayload)
+	}
+	if metadata["timezone"] != "America/New_York" {
+		t.Fatalf("expected recall timezone metadata, got %+v", metadata)
+	}
+	if metadata["requested_model"] != "openai/gpt-4o" {
+		t.Fatalf("expected requested_model metadata, got %+v", metadata)
+	}
+	recallLog := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "memory_op" && entry["memory_op"] == "recall" && entry["memory_status"] == "succeeded"
+	})
+	if recallLog["memory_service"] != "team-memory" {
+		t.Fatalf("expected recall telemetry memory_service=team-memory, got %+v", recallLog)
+	}
+	if recallLog["memory_blocks"].(float64) != 1 {
+		t.Fatalf("expected recall telemetry memory_blocks=1, got %+v", recallLog)
+	}
+	if recallLog["memory_bytes"].(float64) <= 0 {
+		t.Fatalf("expected recall telemetry memory_bytes > 0, got %+v", recallLog)
+	}
+}
+
+func TestHandlerRetainsMemoryAfterSuccessfulTurn(t *testing.T) {
+	var logs lockedBuffer
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer backend.Close()
+
+	retainCh := make(chan map[string]any, 1)
+	memorySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/retain" {
+			t.Fatalf("unexpected memory path: %s", r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode retain payload: %v", err)
+		}
+		retainCh <- payload
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer memorySrv.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, func(id string) (*agentctx.AgentContext, error) {
+		if id != "tiverton" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID: "tiverton",
+			Metadata: map[string]any{
+				"token":   "tiverton:dummy123",
+				"pod":     "ops",
+				"service": "tiverton",
+				"type":    "openclaw",
+			},
+			Memory: &agentctx.MemoryManifest{
+				Version: 1,
+				Service: "team-memory",
+				BaseURL: memorySrv.URL,
+				Retain:  &agentctx.MemoryOp{Path: "/retain"},
+			},
+		}, nil
+	}, logging.New(&logs))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	select {
+	case payload := <-retainCh:
+		if payload["agent_id"] != "tiverton" {
+			t.Fatalf("unexpected retain payload: %+v", payload)
+		}
+		entry := payload["entry"].(map[string]any)
+		if entry["claw_id"] != "tiverton" {
+			t.Fatalf("unexpected retained entry: %+v", payload)
+		}
+		if entry["id"] == "" {
+			t.Fatalf("expected retained entry ID, got %+v", payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for retain request")
+	}
+	retainLog := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "memory_op" && entry["memory_op"] == "retain" && entry["memory_status"] == "succeeded"
+	})
+	if retainLog["memory_service"] != "team-memory" {
+		t.Fatalf("expected retain telemetry memory_service=team-memory, got %+v", retainLog)
+	}
+	if retainLog["status_code"].(float64) != http.StatusNoContent {
+		t.Fatalf("expected retain telemetry status_code=%d, got %+v", http.StatusNoContent, retainLog)
+	}
+}
+
+func TestHandlerLogsOversizedMemoryRecallResponseClearly(t *testing.T) {
+	var logs lockedBuffer
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	memorySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"memories":[{"text":"`+strings.Repeat("x", maxMemoryBlockBytes)+`"}]}`)
+	}))
+	defer memorySrv.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, func(id string) (*agentctx.AgentContext, error) {
+		if id != "tiverton" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID: "tiverton",
+			Metadata: map[string]any{
+				"token": "tiverton:dummy123",
+			},
+			Memory: &agentctx.MemoryManifest{
+				Version: 1,
+				Service: "team-memory",
+				BaseURL: memorySrv.URL,
+				Recall:  &agentctx.MemoryOp{Path: "/recall", TimeoutMS: 300},
+			},
+		}, nil
+	}, logging.New(&logs))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	failureLog := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "memory_op" && entry["memory_op"] == "recall" && entry["memory_status"] == "failed"
+	})
+	if errText, _ := failureLog["error"].(string); !strings.Contains(errText, "recall response exceeds") {
+		t.Fatalf("expected oversized recall error text in memory_op log, got %+v", failureLog)
+	}
+	if hasLogEntry(t, logs.Bytes(), func(entry map[string]any) bool { return entry["type"] == "error" }) {
+		t.Fatalf("expected no generic error log for oversized recall, got %v", parseLogEntries(t, logs.Bytes()))
+	}
+}
+
+func TestHandlerLogsSkippedMemoryRecallWithoutLatency(t *testing.T) {
+	var logs lockedBuffer
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read backend body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, func(id string) (*agentctx.AgentContext, error) {
+		if id != "tiverton" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID: "tiverton",
+			Metadata: map[string]any{
+				"token": "tiverton:dummy123",
+			},
+			Memory: &agentctx.MemoryManifest{
+				Version: 1,
+				Service: "team-memory",
+			},
+		}, nil
+	}, logging.New(&logs))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal backend body: %v", err)
+	}
+	messages := payload["messages"].([]any)
+	for _, raw := range messages {
+		msg := raw.(map[string]any)
+		if msg["role"] == "system" {
+			if content, _ := msg["content"].(string); strings.Contains(content, "BEGIN MEMORY") {
+				t.Fatalf("did not expect memory injection when recall is skipped, got %+v", msg)
+			}
+		}
+	}
+	skippedLog := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "memory_op" && entry["memory_op"] == "recall" && entry["memory_status"] == "skipped"
+	})
+	if _, ok := skippedLog["latency_ms"]; ok {
+		t.Fatalf("expected skipped recall log to omit latency_ms, got %+v", skippedLog)
+	}
+}
+
+func TestHandlerLogsTimedOutMemoryRecallWithoutGenericError(t *testing.T) {
+	var logs lockedBuffer
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	memorySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"memories":[{"text":"late memory"}]}`))
+	}))
+	defer memorySrv.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, func(id string) (*agentctx.AgentContext, error) {
+		if id != "tiverton" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID: "tiverton",
+			Metadata: map[string]any{
+				"token": "tiverton:dummy123",
+			},
+			Memory: &agentctx.MemoryManifest{
+				Version: 1,
+				Service: "team-memory",
+				BaseURL: memorySrv.URL,
+				Recall:  &agentctx.MemoryOp{Path: "/recall", TimeoutMS: 10},
+			},
+		}, nil
+	}, logging.New(&logs))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	timeoutLog := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "memory_op" && entry["memory_op"] == "recall" && entry["memory_status"] == "timed_out"
+	})
+	if _, ok := timeoutLog["error"]; !ok {
+		t.Fatalf("expected timed_out recall log to include error text, got %+v", timeoutLog)
+	}
+	if hasLogEntry(t, logs.Bytes(), func(entry map[string]any) bool { return entry["type"] == "error" }) {
+		t.Fatalf("expected no generic error log for timed out recall, got %v", parseLogEntries(t, logs.Bytes()))
+	}
+}
+
+func TestHandlerLogsFailedMemoryRetainWithoutGenericError(t *testing.T) {
+	var logs lockedBuffer
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer backend.Close()
+
+	memorySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer memorySrv.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, func(id string) (*agentctx.AgentContext, error) {
+		if id != "tiverton" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID: "tiverton",
+			Metadata: map[string]any{
+				"token": "tiverton:dummy123",
+			},
+			Memory: &agentctx.MemoryManifest{
+				Version: 1,
+				Service: "team-memory",
+				BaseURL: memorySrv.URL,
+				Retain:  &agentctx.MemoryOp{Path: "/retain"},
+			},
+		}, nil
+	}, logging.New(&logs))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	failedLog := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "memory_op" && entry["memory_op"] == "retain" && entry["memory_status"] == "failed"
+	})
+	if failedLog["status_code"].(float64) != http.StatusBadGateway {
+		t.Fatalf("expected retain failure status_code=%d, got %+v", http.StatusBadGateway, failedLog)
+	}
+	if hasLogEntry(t, logs.Bytes(), func(entry map[string]any) bool { return entry["type"] == "error" }) {
+		t.Fatalf("expected no generic error log for failed retain, got %v", parseLogEntries(t, logs.Bytes()))
+	}
+}
+
 func stubContextLoaderWithToken(agentID, token string) ContextLoader {
 	return func(id string) (*agentctx.AgentContext, error) {
 		if id != agentID {
@@ -1183,4 +2895,203 @@ func stubContextLoaderWithToken(agentID, token string) ContextLoader {
 			},
 		}, nil
 	}
+}
+
+func stubContextLoaderWithPolicy(agentID, token string, policy *agentctx.ModelPolicy) ContextLoader {
+	return func(id string) (*agentctx.AgentContext, error) {
+		if id != agentID {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID:     id,
+			ContextDir:  "/claw/context/" + id,
+			AgentsMD:    []byte("# Contract"),
+			ClawdapusMD: []byte("# Infra"),
+			Metadata: map[string]any{
+				"token": token,
+			},
+			ModelPolicy: policy,
+		}, nil
+	}
+}
+
+func stubContextLoaderWithTools(agentID, token string, tools *agentctx.ToolManifest) ContextLoader {
+	return func(id string) (*agentctx.AgentContext, error) {
+		if id != agentID {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID:     id,
+			ContextDir:  "/claw/context/" + id,
+			AgentsMD:    []byte("# Contract"),
+			ClawdapusMD: []byte("# Infra"),
+			Metadata: map[string]any{
+				"token": token,
+			},
+			Tools: tools,
+		}, nil
+	}
+}
+
+func managedToolManifest() *agentctx.ToolManifest {
+	return managedToolManifestForURL("http://trading-api:4000", http.MethodGet, "/api/v1/market_context/{claw_id}", "")
+}
+
+func managedToolManifestForURL(baseURL, method, path, token string) *agentctx.ToolManifest {
+	var auth *agentctx.AuthEntry
+	if token != "" {
+		auth = &agentctx.AuthEntry{
+			Type:  "bearer",
+			Token: token,
+		}
+	}
+	return &agentctx.ToolManifest{
+		Version: 1,
+		Tools: []agentctx.ToolManifestEntry{{
+			Name:        "trading-api.get_market_context",
+			Description: "Retrieve market context",
+			InputSchema: map[string]any{"type": "object"},
+			Execution: agentctx.ToolExecution{
+				Transport: "http",
+				Service:   "trading-api",
+				BaseURL:   baseURL,
+				Method:    method,
+				Path:      path,
+				Auth:      auth,
+			},
+		}},
+		Policy: agentctx.ToolPolicy{
+			MaxRounds:        8,
+			TimeoutPerToolMS: 30000,
+			TotalTimeoutMS:   120000,
+		},
+	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
+func waitForLogEntry(t *testing.T, logs *lockedBuffer, predicate func(map[string]any) bool) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		entries := parseLogEntries(t, logs.Bytes())
+		for _, entry := range entries {
+			if predicate(entry) {
+				return entry
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for log entry")
+	return nil
+}
+
+func hasLogEntry(t *testing.T, raw []byte, predicate func(map[string]any) bool) bool {
+	t.Helper()
+	for _, entry := range parseLogEntries(t, raw) {
+		if predicate(entry) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseSSEEvents(t *testing.T, raw string) []map[string]any {
+	t.Helper()
+	lines := strings.Split(raw, "\n")
+	events := make([]map[string]any, 0)
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			t.Fatalf("unmarshal SSE event %q: %v", payload, err)
+		}
+		events = append(events, event)
+	}
+	return events
+}
+
+func sseHasContent(events []map[string]any, want string) bool {
+	for _, event := range events {
+		choices, _ := event["choices"].([]any)
+		for _, rawChoice := range choices {
+			choice, _ := rawChoice.(map[string]any)
+			if choice == nil {
+				continue
+			}
+			delta, _ := choice["delta"].(map[string]any)
+			if delta == nil {
+				continue
+			}
+			if delta["content"] == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sseHasUsage(events []map[string]any, prompt, completion, total int) bool {
+	for _, event := range events {
+		usage, _ := event["usage"].(map[string]any)
+		if usage == nil {
+			continue
+		}
+		if int(usage["prompt_tokens"].(float64)) == prompt &&
+			int(usage["completion_tokens"].(float64)) == completion &&
+			int(usage["total_tokens"].(float64)) == total {
+			return true
+		}
+	}
+	return false
+}
+
+func assertInterventionLogged(t *testing.T, raw []byte, reason string) {
+	t.Helper()
+	entries := parseLogEntries(t, raw)
+	for _, entry := range entries {
+		if entry["type"] == "intervention" && entry["intervention"] == reason {
+			return
+		}
+	}
+	t.Fatalf("expected intervention %q in logs, got %v", reason, entries)
+}
+
+func parseLogEntries(t *testing.T, raw []byte) []map[string]any {
+	t.Helper()
+	lines := bytes.Split(bytes.TrimSpace(raw), []byte("\n"))
+	entries := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			t.Fatalf("unmarshal log entry: %v\nraw: %s", err, string(line))
+		}
+		entries = append(entries, entry)
+	}
+	return entries
 }
