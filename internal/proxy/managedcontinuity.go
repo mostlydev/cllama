@@ -6,17 +6,28 @@ import (
 	"sync"
 )
 
-const defaultManagedToolContinuityTurns = 8
+const (
+	defaultManagedToolContinuityTurns  = 8
+	defaultManagedToolContinuityAgents = 256
+)
 
 type managedOpenAIContinuityStore struct {
-	mu       sync.RWMutex
-	maxTurns int
-	agents   map[string][]managedOpenAIContinuityTurn
+	mu        sync.RWMutex
+	maxTurns  int
+	maxAgents int
+	clock     uint64
+	agents    map[string]*managedOpenAIContinuityState
+}
+
+type managedOpenAIContinuityState struct {
+	Turns      []managedOpenAIContinuityTurn
+	LastAccess uint64
 }
 
 type managedOpenAIContinuityTurn struct {
-	Anchor         string
-	HiddenMessages []json.RawMessage
+	Anchor                  string
+	VisibleAssistantFromEnd int
+	HiddenMessages          []json.RawMessage
 }
 
 func newManagedOpenAIContinuityStore(maxTurns int) *managedOpenAIContinuityStore {
@@ -24,32 +35,56 @@ func newManagedOpenAIContinuityStore(maxTurns int) *managedOpenAIContinuityStore
 		maxTurns = defaultManagedToolContinuityTurns
 	}
 	return &managedOpenAIContinuityStore{
-		maxTurns: maxTurns,
-		agents:   make(map[string][]managedOpenAIContinuityTurn),
+		maxTurns:  maxTurns,
+		maxAgents: defaultManagedToolContinuityAgents,
+		agents:    make(map[string]*managedOpenAIContinuityState),
 	}
 }
 
-func (s *managedOpenAIContinuityStore) Record(agentID string, finalAssistant map[string]any, hiddenMessages []json.RawMessage) {
-	if s == nil || strings.TrimSpace(agentID) == "" || len(hiddenMessages) == 0 {
-		return
+func (s *managedOpenAIContinuityStore) ObserveTerminalAssistant(agentID string, finalAssistant map[string]any, hiddenMessages []json.RawMessage) bool {
+	if s == nil || strings.TrimSpace(agentID) == "" {
+		return false
 	}
 	anchor, ok := openAIVisibleAssistantAnchor(finalAssistant)
 	if !ok {
-		return
-	}
-
-	turn := managedOpenAIContinuityTurn{
-		Anchor:         anchor,
-		HiddenMessages: cloneRawMessages(hiddenMessages),
+		return false
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	turns := append(s.agents[agentID], turn)
-	if len(turns) > s.maxTurns {
-		turns = turns[len(turns)-s.maxTurns:]
+
+	state, exists := s.agents[agentID]
+	if exists {
+		for i := range state.Turns {
+			state.Turns[i].VisibleAssistantFromEnd++
+		}
+		state.Turns = filterContinuityTurns(state.Turns, s.maxTurns)
+		if len(state.Turns) == 0 && len(hiddenMessages) == 0 {
+			delete(s.agents, agentID)
+			return false
+		}
 	}
-	s.agents[agentID] = turns
+
+	if len(hiddenMessages) == 0 {
+		if exists {
+			s.touchLocked(agentID, state)
+		}
+		return false
+	}
+
+	if !exists {
+		state = &managedOpenAIContinuityState{}
+		s.agents[agentID] = state
+	}
+	state.Turns = append(state.Turns, managedOpenAIContinuityTurn{
+		Anchor:                  anchor,
+		VisibleAssistantFromEnd: 1,
+		HiddenMessages:          cloneRawMessages(hiddenMessages),
+	})
+	state.Turns = filterContinuityTurns(state.Turns, s.maxTurns)
+	s.touchLocked(agentID, state)
+	s.evictAgentsLocked()
+	return true
 }
 
 func (s *managedOpenAIContinuityStore) Inject(agentID string, payload map[string]any) bool {
@@ -61,28 +96,46 @@ func (s *managedOpenAIContinuityStore) Inject(agentID string, payload map[string
 		return false
 	}
 
-	s.mu.RLock()
-	turns := cloneContinuityTurns(s.agents[agentID])
-	s.mu.RUnlock()
-	if len(turns) == 0 {
+	s.mu.Lock()
+	state := s.agents[agentID]
+	if state == nil || len(state.Turns) == 0 {
+		s.mu.Unlock()
 		return false
+	}
+	turns := cloneContinuityTurns(state.Turns)
+	s.touchLocked(agentID, state)
+	s.mu.Unlock()
+
+	totalVisible := countVisibleOpenAIAssistantMessages(messages)
+	if totalVisible == 0 {
+		return false
+	}
+	turnsByOffset := make(map[int]managedOpenAIContinuityTurn, len(turns))
+	for _, turn := range turns {
+		if turn.VisibleAssistantFromEnd <= 0 {
+			continue
+		}
+		turnsByOffset[turn.VisibleAssistantFromEnd] = turn
 	}
 
 	out := make([]any, 0, len(messages)+hiddenMessageCount(turns))
-	turnIdx := 0
+	visibleSeen := 0
 	inserted := false
 	for _, rawMsg := range messages {
 		msg, _ := rawMsg.(map[string]any)
-		if turnIdx < len(turns) && openAIMessageMatchesAnchor(msg, turns[turnIdx].Anchor) {
-			for _, hidden := range turns[turnIdx].HiddenMessages {
-				var decoded any
-				if err := json.Unmarshal(hidden, &decoded); err != nil {
-					continue
+		if isVisibleOpenAIAssistantMessage(msg) {
+			visibleSeen++
+			offsetFromEnd := totalVisible - visibleSeen + 1
+			if turn, ok := turnsByOffset[offsetFromEnd]; ok && openAIMessageMatchesAnchor(msg, turn.Anchor) {
+				for _, hidden := range turn.HiddenMessages {
+					var decoded any
+					if err := json.Unmarshal(hidden, &decoded); err != nil {
+						continue
+					}
+					out = append(out, decoded)
+					inserted = true
 				}
-				out = append(out, decoded)
-				inserted = true
 			}
-			turnIdx++
 		}
 		out = append(out, rawMsg)
 	}
@@ -106,18 +159,46 @@ func appendManagedOpenAIContinuityMessages(dst []json.RawMessage, assistantMessa
 	return dst
 }
 
+func (s *managedOpenAIContinuityStore) touchLocked(agentID string, state *managedOpenAIContinuityState) {
+	if state == nil {
+		return
+	}
+	s.clock++
+	state.LastAccess = s.clock
+	s.agents[agentID] = state
+}
+
+func (s *managedOpenAIContinuityStore) evictAgentsLocked() {
+	if s.maxAgents <= 0 {
+		return
+	}
+	for len(s.agents) > s.maxAgents {
+		var (
+			evictID   string
+			evictSeen bool
+			oldest    uint64
+		)
+		for agentID, state := range s.agents {
+			if state == nil {
+				evictID = agentID
+				evictSeen = true
+				break
+			}
+			if !evictSeen || state.LastAccess < oldest {
+				evictID = agentID
+				oldest = state.LastAccess
+				evictSeen = true
+			}
+		}
+		if !evictSeen {
+			return
+		}
+		delete(s.agents, evictID)
+	}
+}
+
 func openAIVisibleAssistantAnchor(message map[string]any) (string, bool) {
-	if len(message) == 0 {
-		return "", false
-	}
-	role, _ := message["role"].(string)
-	if !strings.EqualFold(strings.TrimSpace(role), "assistant") {
-		return "", false
-	}
-	if toolCalls, _ := message["tool_calls"].([]any); len(toolCalls) > 0 {
-		return "", false
-	}
-	if functionCall, _ := message["function_call"].(map[string]any); len(functionCall) > 0 {
+	if !isVisibleOpenAIAssistantMessage(message) {
 		return "", false
 	}
 
@@ -144,6 +225,23 @@ func openAIMessageMatchesAnchor(message map[string]any, anchor string) bool {
 		return false
 	}
 	return current == anchor
+}
+
+func isVisibleOpenAIAssistantMessage(message map[string]any) bool {
+	if len(message) == 0 {
+		return false
+	}
+	role, _ := message["role"].(string)
+	if !strings.EqualFold(strings.TrimSpace(role), "assistant") {
+		return false
+	}
+	if toolCalls, _ := message["tool_calls"].([]any); len(toolCalls) > 0 {
+		return false
+	}
+	if functionCall, _ := message["function_call"].(map[string]any); len(functionCall) > 0 {
+		return false
+	}
+	return true
 }
 
 func normalizeOpenAIMessageContent(content any) (any, bool) {
@@ -178,6 +276,30 @@ func normalizeOpenAIMessageContent(content any) (any, bool) {
 	}
 }
 
+func countVisibleOpenAIAssistantMessages(messages []any) int {
+	total := 0
+	for _, raw := range messages {
+		msg, _ := raw.(map[string]any)
+		if isVisibleOpenAIAssistantMessage(msg) {
+			total++
+		}
+	}
+	return total
+}
+
+func filterContinuityTurns(turns []managedOpenAIContinuityTurn, maxTurns int) []managedOpenAIContinuityTurn {
+	if len(turns) == 0 {
+		return nil
+	}
+	out := make([]managedOpenAIContinuityTurn, 0, len(turns))
+	for _, turn := range turns {
+		if turn.VisibleAssistantFromEnd > 0 && (maxTurns <= 0 || turn.VisibleAssistantFromEnd <= maxTurns) {
+			out = append(out, turn)
+		}
+	}
+	return out
+}
+
 func hiddenMessageCount(turns []managedOpenAIContinuityTurn) int {
 	total := 0
 	for _, turn := range turns {
@@ -193,8 +315,9 @@ func cloneContinuityTurns(in []managedOpenAIContinuityTurn) []managedOpenAIConti
 	out := make([]managedOpenAIContinuityTurn, 0, len(in))
 	for _, turn := range in {
 		out = append(out, managedOpenAIContinuityTurn{
-			Anchor:         turn.Anchor,
-			HiddenMessages: cloneRawMessages(turn.HiddenMessages),
+			Anchor:                  turn.Anchor,
+			VisibleAssistantFromEnd: turn.VisibleAssistantFromEnd,
+			HiddenMessages:          cloneRawMessages(turn.HiddenMessages),
 		})
 	}
 	return out

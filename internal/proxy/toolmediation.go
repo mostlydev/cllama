@@ -159,9 +159,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 					_, _ = w.Write(resp.Body)
 				}
 			}
-			if len(hiddenMessages) > 0 {
-				h.managedTurns.Record(agentID, assistantMessage, hiddenMessages)
-			}
+			h.managedTurns.ObserveTerminalAssistant(agentID, assistantMessage, hiddenMessages)
 			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds())
 			return
 		}

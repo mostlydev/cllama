@@ -197,6 +197,9 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
 	if hasManagedTools(agentCtx) {
+		// Continuity reinjection must happen before memory recall and feed/time
+		// injection so both the recall backend and the upstream model see the
+		// effective transcript that produced the runner-visible assistant reply.
 		h.managedTurns.Inject(agentID, payload)
 	}
 	h.recallOpenAIMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
@@ -830,18 +833,6 @@ func injectManagedOpenAITools(payload map[string]any, agentCtx *agentctx.AgentCo
 	return nil
 }
 
-func injectManagedAnthropicTools(payload map[string]any, agentCtx *agentctx.AgentContext) error {
-	if !hasManagedTools(agentCtx) {
-		return nil
-	}
-	if requestedStream(payload) {
-		return fmt.Errorf("managed tools do not support streaming yet")
-	}
-	payload["tools"] = buildAnthropicToolSchemas(agentCtx.Tools.Tools)
-	delete(payload, "tool_choice")
-	return nil
-}
-
 func hasManagedTools(agentCtx *agentctx.AgentContext) bool {
 	return agentCtx != nil && agentCtx.Tools != nil && len(agentCtx.Tools.Tools) > 0
 }
@@ -856,18 +847,6 @@ func buildOpenAIToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]any
 				"description": tool.Description,
 				"parameters":  tool.InputSchema,
 			},
-		})
-	}
-	return schemas
-}
-
-func buildAnthropicToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]any {
-	schemas := make([]map[string]any, 0, len(tools))
-	for _, tool := range tools {
-		schemas = append(schemas, map[string]any{
-			"name":         tool.Name,
-			"description":  tool.Description,
-			"input_schema": tool.InputSchema,
 		})
 	}
 	return schemas
