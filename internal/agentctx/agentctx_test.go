@@ -220,16 +220,17 @@ func TestLoadReadsToolsManifest(t *testing.T) {
 		"version": 1,
 		"tools": [
 			{
-				"name": "trading-api.get_market_context",
-				"description": "Retrieve market context",
+				"name": "trading-api.propose_trade",
+				"description": "Submit trade proposal",
 				"inputSchema": {"type": "object"},
 				"annotations": {"readOnly": true},
 				"execution": {
 					"transport": "http",
 					"service": "trading-api",
 					"base_url": "http://trading-api:4000",
-					"method": "GET",
-					"path": "/api/v1/market_context/{claw_id}",
+					"method": "POST",
+					"path": "/api/v1/trades",
+					"body_key": "trade",
 					"auth": {"type": "bearer", "token": "tool-token"}
 				}
 			}
@@ -255,11 +256,14 @@ func TestLoadReadsToolsManifest(t *testing.T) {
 		t.Fatalf("unexpected tools manifest header: %+v", ctx.Tools)
 	}
 	tool := ctx.Tools.Tools[0]
-	if tool.Name != "trading-api.get_market_context" {
+	if tool.Name != "trading-api.propose_trade" {
 		t.Fatalf("unexpected tool name: %+v", tool)
 	}
 	if tool.Execution.Service != "trading-api" || tool.Execution.Auth == nil || tool.Execution.Auth.Token != "tool-token" {
 		t.Fatalf("unexpected tool execution: %+v", tool.Execution)
+	}
+	if tool.Execution.BodyKey != "trade" {
+		t.Fatalf("unexpected tool body key: %+v", tool.Execution)
 	}
 	if ctx.Tools.Policy.MaxRounds != 8 || ctx.Tools.Policy.TimeoutPerToolMS != 30000 || ctx.Tools.Policy.TotalTimeoutMS != 120000 {
 		t.Fatalf("unexpected tool policy: %+v", ctx.Tools.Policy)

@@ -693,7 +693,7 @@ func (h *Handler) callManagedHTTPTool(ctx context.Context, agentID string, tool 
 	if err != nil {
 		return toolErrorPayload("invalid_arguments", err.Error(), 0, nil), 0, nil
 	}
-	targetURL, body, err := buildManagedToolRequest(tool.Execution.BaseURL, strings.ToUpper(tool.Execution.Method), renderedPath, remaining)
+	targetURL, body, err := buildManagedToolRequest(tool.Execution.BaseURL, strings.ToUpper(tool.Execution.Method), renderedPath, tool.Execution.BodyKey, remaining)
 	if err != nil {
 		return toolErrorPayload("request_build_failed", err.Error(), 0, nil), 0, nil
 	}
@@ -765,7 +765,7 @@ func renderManagedToolPath(path string, agentID string, args map[string]any) (st
 	return rendered, remaining, nil
 }
 
-func buildManagedToolRequest(baseURL string, method string, path string, args map[string]any) (string, io.Reader, error) {
+func buildManagedToolRequest(baseURL string, method string, path string, bodyKey string, args map[string]any) (string, io.Reader, error) {
 	u, err := url.Parse(strings.TrimSpace(baseURL))
 	if err != nil {
 		return "", nil, err
@@ -785,7 +785,11 @@ func buildManagedToolRequest(baseURL string, method string, path string, args ma
 	if len(args) == 0 {
 		args = map[string]any{}
 	}
-	body, err := json.Marshal(args)
+	payload := any(args)
+	if strings.TrimSpace(bodyKey) != "" {
+		payload = map[string]any{strings.TrimSpace(bodyKey): args}
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", nil, err
 	}
