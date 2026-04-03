@@ -63,6 +63,14 @@ type openAIToolCall struct {
 	ParseErr     error
 }
 
+type anthropicToolUse struct {
+	ID           string
+	Name         string
+	Arguments    map[string]any
+	ArgumentsRaw json.RawMessage
+	ParseErr     error
+}
+
 type managedToolOutcome struct {
 	RawJSON []byte
 	Trace   sessionhistory.ToolCallTrace
@@ -198,6 +206,111 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 		toolTrace = append(toolTrace, roundTrace)
 		appendOpenAIAssistantAndToolMessages(payload, assistantMessage, toolMessages)
 		hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, assistantMessage, toolMessages)
+	}
+}
+
+func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, downstreamStream bool, start time.Time) {
+	policy := resolveManagedToolPolicy(agentCtx)
+	loopCtx, cancel := context.WithTimeout(r.Context(), policy.TotalTimeout)
+	defer cancel()
+
+	usageAgg := managedUsageAggregate{LoggedCostKnown: true}
+	var toolTrace []sessionhistory.ToolRoundTrace
+	var hiddenMessages []json.RawMessage
+	var requestEffective []byte
+	var lastProvider string
+	var lastUpstreamModel string
+
+	for {
+		resp, status, msg, err := h.dispatchCandidatesJSON(loopCtx, r, agentID, requestedModel, payload, candidates)
+		if requestEffective == nil && resp != nil && len(resp.RequestBody) > 0 {
+			requestEffective = append([]byte(nil), resp.RequestBody...)
+		}
+		if resp == nil {
+			if len(toolTrace) > 0 {
+				h.recordManagedFailure(agentID, lastProvider, requestedModel, lastUpstreamModel, r.URL.Path, requestOriginal, requestEffective, status, jsonErrorPayload(msg), usageAgg, toolTrace)
+			}
+			h.fail(w, status, msg, agentID, requestedModel, start, err)
+			return
+		}
+
+		lastProvider = resp.ProviderName
+		lastUpstreamModel = resp.UpstreamModel
+
+		usage, _ := cost.ExtractUsage(resp.Body)
+		usageAgg.AddRound(agentID, usage, resp.ProviderName, resp.UpstreamModel, h)
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			copyResponseHeaders(w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			if len(resp.Body) > 0 {
+				_, _ = w.Write(resp.Body)
+			}
+			if len(toolTrace) > 0 {
+				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, ensureJSONPayload(resp.Body), usageAgg, toolTrace)
+			}
+			if costInfo := usageAgg.costInfo(); costInfo != nil {
+				h.logger.LogResponseWithCost(agentID, requestedModel, resp.StatusCode, time.Since(start).Milliseconds(), costInfo)
+			} else {
+				h.logger.LogResponse(agentID, requestedModel, resp.StatusCode, time.Since(start).Milliseconds())
+			}
+			return
+		}
+
+		assistantMessage, toolUses, parseErr := parseAnthropicToolResponse(resp.Body)
+		if parseErr != nil || len(toolUses) == 0 {
+			responseBytes := resp.Body
+			if downstreamStream {
+				sse, synthErr := synthesizeAnthropicStream(resp.Body, resp.UpstreamModel, usageAgg)
+				if synthErr != nil {
+					h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed stream"), usageAgg, toolTrace)
+					h.fail(w, http.StatusBadGateway, "failed to synthesize managed stream", agentID, requestedModel, start, synthErr)
+					return
+				}
+				writeSyntheticSSE(w, sse)
+				responseBytes = sse
+			} else {
+				copyResponseHeaders(w.Header(), resp.Header)
+				w.WriteHeader(resp.StatusCode)
+				if len(resp.Body) > 0 {
+					_, _ = w.Write(resp.Body)
+				}
+			}
+			h.managedAnthropicTurns.ObserveTerminalAssistant(agentID, assistantMessage, hiddenMessages)
+			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds())
+			return
+		}
+
+		if len(toolTrace) >= policy.MaxRounds {
+			msg := fmt.Sprintf("managed tool max rounds exceeded (%d)", policy.MaxRounds)
+			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
+			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
+			return
+		}
+
+		toolResults := make([]map[string]any, 0, len(toolUses))
+		roundTrace := sessionhistory.ToolRoundTrace{
+			Round: len(toolTrace) + 1,
+			RoundUsage: sessionhistory.Usage{
+				PromptTokens:     usage.PromptTokens,
+				CompletionTokens: usage.CompletionTokens,
+				ReportedCostUSD:  usage.ReportedCostUSD,
+			},
+		}
+		for _, call := range toolUses {
+			outcome, execErr := h.executeManagedAnthropicTool(loopCtx, agentID, agentCtx, call, policy)
+			if execErr != nil {
+				msg := "managed tool mediation timed out"
+				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, append(toolTrace, roundTrace))
+				h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, execErr)
+				return
+			}
+			roundTrace.ToolCalls = append(roundTrace.ToolCalls, outcome.Trace)
+			toolResults = append(toolResults, anthropicToolResultBlock(call.ID, outcome.RawJSON))
+		}
+		toolTrace = append(toolTrace, roundTrace)
+		toolResultMessage := appendAnthropicAssistantAndToolResultMessages(payload, assistantMessage, toolResults)
+		hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, assistantMessage, toolResultMessage)
 	}
 }
 
@@ -427,6 +540,59 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 	return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
 }
 
+func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID string, agentCtx *agentctx.AgentContext, call anthropicToolUse, policy managedToolPolicy) (managedToolOutcome, error) {
+	trace := sessionhistory.ToolCallTrace{
+		Name:      call.Name,
+		Arguments: call.ArgumentsRaw,
+	}
+	tool, ok := lookupManagedTool(agentCtx, call.Name)
+	if !ok {
+		raw := toolErrorPayload("unsupported_tool", managedToolModeMessage, 0, nil)
+		trace.Result = raw
+		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+	}
+	trace.Service = tool.Execution.Service
+	if call.ParseErr != nil {
+		raw := toolErrorPayload("invalid_arguments", fmt.Sprintf("Tool arguments for %s are invalid JSON: %v", call.Name, call.ParseErr), 0, nil)
+		trace.Result = raw
+		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+	}
+
+	start := time.Now()
+	childCtx, cancel := context.WithTimeout(ctx, policy.PerToolTimeout)
+	defer cancel()
+	raw, statusCode, err := h.callManagedHTTPTool(childCtx, agentID, tool, call.Arguments)
+	trace.LatencyMS = time.Since(start).Milliseconds()
+	if errors.Is(err, errManagedToolBudget) {
+		return managedToolOutcome{}, err
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		if ctx.Err() != nil {
+			return managedToolOutcome{}, errManagedToolBudget
+		}
+		raw = toolErrorPayload("timeout", fmt.Sprintf("Service did not respond within %s", formatDuration(policy.PerToolTimeout)), http.StatusGatewayTimeout, nil)
+		statusCode = http.StatusGatewayTimeout
+		trace.StatusCode = statusCode
+		trace.Result = raw
+		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+	}
+	if errors.Is(err, context.Canceled) {
+		if ctx.Err() != nil {
+			return managedToolOutcome{}, errManagedToolBudget
+		}
+		raw = toolErrorPayload("canceled", "Tool execution was canceled", 0, nil)
+		trace.Result = raw
+		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+	}
+	trace.StatusCode = statusCode
+	if err != nil {
+		trace.Result = raw
+		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+	}
+	trace.Result = raw
+	return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+}
+
 func (h *Handler) callManagedHTTPTool(ctx context.Context, agentID string, tool agentctx.ToolManifestEntry, args map[string]any) ([]byte, int, error) {
 	if !strings.EqualFold(tool.Execution.Transport, "http") {
 		return toolErrorPayload("unsupported_transport", fmt.Sprintf("Managed tool transport %q is unsupported", tool.Execution.Transport), 0, nil), 0, nil
@@ -603,11 +769,86 @@ func parseOpenAIToolResponse(body []byte) (map[string]any, []openAIToolCall, err
 	return message, calls, nil
 }
 
+func parseAnthropicToolResponse(body []byte) (map[string]any, []anthropicToolUse, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, nil, err
+	}
+	contentRaw, ok := payload["content"]
+	if !ok {
+		return nil, nil, fmt.Errorf("anthropic response missing content")
+	}
+	assistantMessage := map[string]any{
+		"role": "assistant",
+	}
+	switch content := contentRaw.(type) {
+	case string:
+		assistantMessage["content"] = content
+		return assistantMessage, nil, nil
+	case []any:
+		assistantMessage["content"] = content
+		calls := make([]anthropicToolUse, 0)
+		for i, raw := range content {
+			block, _ := raw.(map[string]any)
+			if block == nil {
+				continue
+			}
+			if blockType, _ := block["type"].(string); blockType != "tool_use" {
+				continue
+			}
+			callID, _ := block["id"].(string)
+			if strings.TrimSpace(callID) == "" {
+				callID = fmt.Sprintf("toolu_%d", i+1)
+			}
+			name, _ := block["name"].(string)
+			input := block["input"]
+			var (
+				args     map[string]any
+				parseErr error
+				rawArgs  json.RawMessage
+			)
+			switch typed := input.(type) {
+			case nil:
+				args = map[string]any{}
+				rawArgs = json.RawMessage([]byte(`{}`))
+			case map[string]any:
+				args = typed
+				rawArgs, _ = json.Marshal(typed)
+			default:
+				parseErr = fmt.Errorf("tool input must decode to an object")
+				rawArgs, _ = json.Marshal(typed)
+			}
+			calls = append(calls, anthropicToolUse{
+				ID:           callID,
+				Name:         strings.TrimSpace(name),
+				Arguments:    args,
+				ArgumentsRaw: rawArgs,
+				ParseErr:     parseErr,
+			})
+		}
+		return assistantMessage, calls, nil
+	default:
+		return nil, nil, fmt.Errorf("anthropic response content is %T", contentRaw)
+	}
+}
+
 func appendOpenAIAssistantAndToolMessages(payload map[string]any, assistantMessage map[string]any, toolMessages []any) {
 	messages, _ := payload["messages"].([]any)
 	messages = append(messages, assistantMessage)
 	messages = append(messages, toolMessages...)
 	payload["messages"] = messages
+}
+
+func appendAnthropicAssistantAndToolResultMessages(payload map[string]any, assistantMessage map[string]any, toolResults []map[string]any) map[string]any {
+	messages, _ := payload["messages"].([]any)
+	messages = append(messages, assistantMessage)
+	toolResultMessage := map[string]any{
+		"role":    "user",
+		"content": toolResults,
+	}
+	messages = append(messages, toolResultMessage)
+	payload["messages"] = messages
+	return toolResultMessage
 }
 
 func synthesizeOpenAIStream(finalBody []byte, upstreamModel string, usage managedUsageAggregate, includeUsage bool) ([]byte, error) {
@@ -691,6 +932,89 @@ func synthesizeOpenAIStream(finalBody []byte, upstreamModel string, usage manage
 	return stream.Bytes(), nil
 }
 
+func synthesizeAnthropicStream(finalBody []byte, upstreamModel string, usage managedUsageAggregate) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(finalBody, &payload); err != nil {
+		return nil, err
+	}
+	assistantMessage, toolUses, err := parseAnthropicToolResponse(finalBody)
+	if err != nil {
+		return nil, err
+	}
+	if len(toolUses) > 0 {
+		return nil, fmt.Errorf("cannot synthesize streamed final text from tool_use payload")
+	}
+	id, _ := payload["id"].(string)
+	if strings.TrimSpace(id) == "" {
+		id = "msg_managed"
+	}
+	model, _ := payload["model"].(string)
+	if strings.TrimSpace(model) == "" {
+		model = upstreamModel
+	}
+	stopReason, _ := payload["stop_reason"].(string)
+	if strings.TrimSpace(stopReason) == "" {
+		stopReason = "end_turn"
+	}
+
+	var stream bytes.Buffer
+	writeAnthropicSSEEvent(&stream, "message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id":            id,
+			"type":          "message",
+			"role":          "assistant",
+			"model":         model,
+			"content":       []any{},
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage": map[string]any{
+				"input_tokens": usage.PromptTokens,
+			},
+		},
+	})
+
+	for idx, text := range anthropicMessageTextBlocks(assistantMessage) {
+		writeAnthropicSSEEvent(&stream, "content_block_start", map[string]any{
+			"type":  "content_block_start",
+			"index": idx,
+			"content_block": map[string]any{
+				"type": "text",
+				"text": "",
+			},
+		})
+		if text != "" {
+			writeAnthropicSSEEvent(&stream, "content_block_delta", map[string]any{
+				"type":  "content_block_delta",
+				"index": idx,
+				"delta": map[string]any{
+					"type": "text_delta",
+					"text": text,
+				},
+			})
+		}
+		writeAnthropicSSEEvent(&stream, "content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": idx,
+		})
+	}
+
+	writeAnthropicSSEEvent(&stream, "message_delta", map[string]any{
+		"type": "message_delta",
+		"delta": map[string]any{
+			"stop_reason":   stopReason,
+			"stop_sequence": payload["stop_sequence"],
+		},
+		"usage": map[string]any{
+			"output_tokens": usage.CompletionTokens,
+		},
+	})
+	writeAnthropicSSEEvent(&stream, "message_stop", map[string]any{
+		"type": "message_stop",
+	})
+	return stream.Bytes(), nil
+}
+
 func openAIMessageContent(message map[string]any) string {
 	if message == nil {
 		return ""
@@ -720,6 +1044,39 @@ func openAIMessageContent(message map[string]any) string {
 	return builder.String()
 }
 
+func anthropicMessageTextBlocks(message map[string]any) []string {
+	if message == nil {
+		return nil
+	}
+	switch content := message["content"].(type) {
+	case string:
+		if content == "" {
+			return nil
+		}
+		return []string{content}
+	case []any:
+		parts := make([]string, 0, len(content))
+		for _, raw := range content {
+			block, _ := raw.(map[string]any)
+			if block == nil {
+				continue
+			}
+			blockType, _ := block["type"].(string)
+			if blockType != "" && blockType != "text" {
+				continue
+			}
+			text, _ := block["text"].(string)
+			if text == "" {
+				continue
+			}
+			parts = append(parts, text)
+		}
+		return parts
+	default:
+		return nil
+	}
+}
+
 func writeSyntheticSSE(w http.ResponseWriter, stream []byte) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -730,6 +1087,16 @@ func writeSyntheticSSE(w http.ResponseWriter, stream []byte) {
 
 func writeSSEChunk(buf *bytes.Buffer, payload map[string]any) {
 	raw, _ := json.Marshal(payload)
+	buf.WriteString("data: ")
+	buf.Write(raw)
+	buf.WriteString("\n\n")
+}
+
+func writeAnthropicSSEEvent(buf *bytes.Buffer, event string, payload map[string]any) {
+	raw, _ := json.Marshal(payload)
+	buf.WriteString("event: ")
+	buf.WriteString(event)
+	buf.WriteString("\n")
 	buf.WriteString("data: ")
 	buf.Write(raw)
 	buf.WriteString("\n\n")
@@ -845,6 +1212,18 @@ func toolSuccessPayload(statusCode int, data any) []byte {
 	return raw
 }
 
+func anthropicToolResultBlock(toolUseID string, raw []byte) map[string]any {
+	block := map[string]any{
+		"type":        "tool_result",
+		"tool_use_id": toolUseID,
+		"content":     string(raw),
+	}
+	if managedToolPayloadIsError(raw) {
+		block["is_error"] = true
+	}
+	return block
+}
+
 func toolErrorPayload(code, message string, statusCode int, details any) []byte {
 	errPayload := map[string]any{
 		"code":    code,
@@ -876,6 +1255,15 @@ func toolErrorPayload(code, message string, statusCode int, details any) []byte 
 	}
 	raw, _ := json.Marshal(payload)
 	return raw
+}
+
+func managedToolPayloadIsError(raw []byte) bool {
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return false
+	}
+	ok, present := payload["ok"].(bool)
+	return present && !ok
 }
 
 func ensureJSONPayload(body []byte) []byte {

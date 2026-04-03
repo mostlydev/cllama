@@ -1463,11 +1463,58 @@ func TestHandlerForwardsAnthropicMessages(t *testing.T) {
 	}
 }
 
-func TestHandlerRejectsManagedAnthropicToolsBeforeUpstreamCall(t *testing.T) {
-	backendCalled := false
+func TestHandlerExecutesManagedAnthropicTools(t *testing.T) {
+	var anthropicBodies [][]byte
+	var toolAuth string
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolAuth = r.Header.Get("Authorization")
+		if r.URL.Path != "/api/v1/market_context/nano-bot" {
+			t.Fatalf("unexpected tool path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000,"positions":[{"symbol":"NVDA","qty":2}]}`))
+	}))
+	defer toolSrv.Close()
+
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		backendCalled = true
-		t.Fatalf("managed anthropic tools should fail before upstream call")
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read anthropic body: %v", err)
+		}
+		anthropicBodies = append(anthropicBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(anthropicBodies) {
+		case 1:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal anthropic request: %v", err)
+			}
+			tools, _ := payload["tools"].([]any)
+			if len(tools) != 1 {
+				t.Fatalf("expected 1 managed anthropic tool, got %+v", payload["tools"])
+			}
+			if _, ok := payload["tool_choice"]; ok {
+				t.Fatalf("expected tool_choice removed from managed anthropic request, got %+v", payload)
+			}
+			_, _ = w.Write([]byte(`{
+				"id":"msg_01",
+				"type":"message",
+				"content":[{"type":"tool_use","id":"toolu_1","name":"trading-api.get_market_context","input":{}}],
+				"stop_reason":"tool_use",
+				"usage":{"input_tokens":11,"output_tokens":4}
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_02",
+				"type":"message",
+				"model":"claude-sonnet-4-20250514",
+				"content":[{"type":"text","text":"market context loaded"}],
+				"stop_reason":"end_turn",
+				"usage":{"input_tokens":7,"output_tokens":5}
+			}`))
+		default:
+			t.Fatalf("unexpected anthropic round %d", len(anthropicBodies))
+		}
 	}))
 	defer backend.Close()
 
@@ -1476,7 +1523,9 @@ func TestHandlerRejectsManagedAnthropicToolsBeforeUpstreamCall(t *testing.T) {
 		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
 	})
 
-	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifest()), nil)
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "svc-token")), logging.New(io.Discard),
+		WithSessionHistory(histDir))
 	body := `{
 		"model":"claude-sonnet-4-20250514",
 		"messages":[{"role":"user","content":"hi"}],
@@ -1490,14 +1539,331 @@ func TestHandlerRejectsManagedAnthropicToolsBeforeUpstreamCall(t *testing.T) {
 
 	h.ServeHTTP(w, req)
 
-	if w.Code != http.StatusNotImplemented {
-		t.Fatalf("expected 501, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if backendCalled {
-		t.Fatal("expected anthropic backend not to be called")
+	if !strings.Contains(w.Body.String(), "market context loaded") {
+		t.Fatalf("expected final anthropic text response, got %s", w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "managed anthropic tool execution not implemented") {
-		t.Fatalf("expected clear mediation error, got %s", w.Body.String())
+	if len(anthropicBodies) != 2 {
+		t.Fatalf("expected 2 anthropic rounds, got %d", len(anthropicBodies))
+	}
+	if toolAuth != "Bearer svc-token" {
+		t.Fatalf("expected projected tool auth, got %q", toolAuth)
+	}
+
+	var secondPayload map[string]any
+	if err := json.Unmarshal(anthropicBodies[1], &secondPayload); err != nil {
+		t.Fatalf("unmarshal second anthropic request: %v", err)
+	}
+	if secondPayload["model"] != "claude-sonnet-4-20250514" {
+		t.Fatalf("expected anthropic model unchanged, got %#v", secondPayload["model"])
+	}
+	messages, _ := secondPayload["messages"].([]any)
+	if len(messages) < 3 {
+		t.Fatalf("expected mediated anthropic follow-up messages, got %+v", secondPayload)
+	}
+	last := messages[len(messages)-1].(map[string]any)
+	if last["role"] != "user" {
+		t.Fatalf("expected final follow-up message to be user tool_result, got %+v", last)
+	}
+	blocks, _ := last["content"].([]any)
+	if len(blocks) != 1 {
+		t.Fatalf("expected one tool_result block, got %+v", last)
+	}
+	resultBlock := blocks[0].(map[string]any)
+	if resultBlock["type"] != "tool_result" || resultBlock["tool_use_id"] != "toolu_1" {
+		t.Fatalf("unexpected tool_result block: %+v", resultBlock)
+	}
+	var toolResult map[string]any
+	if err := json.Unmarshal([]byte(resultBlock["content"].(string)), &toolResult); err != nil {
+		t.Fatalf("unmarshal tool result: %v", err)
+	}
+	if ok, _ := toolResult["ok"].(bool); !ok {
+		t.Fatalf("expected successful tool result, got %+v", toolResult)
+	}
+	data, _ := toolResult["data"].(map[string]any)
+	if data["balance"].(float64) != 5000 {
+		t.Fatalf("expected tool payload balance, got %+v", toolResult)
+	}
+
+	histFile := filepath.Join(histDir, "nano-bot", "history.jsonl")
+	rawHist, err := os.ReadFile(histFile)
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(rawHist, "\n"), &entry); err != nil {
+		t.Fatalf("unmarshal history entry: %v", err)
+	}
+	if entry["status"] != "ok" {
+		t.Fatalf("expected history status=ok, got %+v", entry)
+	}
+	usage, _ := entry["usage"].(map[string]any)
+	if usage["total_rounds"].(float64) != 2 {
+		t.Fatalf("expected total_rounds=2, got %+v", usage)
+	}
+	trace, _ := entry["tool_trace"].([]any)
+	if len(trace) != 1 {
+		t.Fatalf("expected one tool trace round, got %+v", entry)
+	}
+	round := trace[0].(map[string]any)
+	toolCalls := round["tool_calls"].([]any)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected one tool call in trace, got %+v", round)
+	}
+	call := toolCalls[0].(map[string]any)
+	if call["name"] != "trading-api.get_market_context" {
+		t.Fatalf("unexpected tool trace name: %+v", call)
+	}
+}
+
+func TestHandlerRestreamsManagedAnthropicTools(t *testing.T) {
+	var anthropicBodies [][]byte
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read anthropic body: %v", err)
+		}
+		anthropicBodies = append(anthropicBodies, body)
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("unmarshal anthropic request: %v", err)
+		}
+		if stream, _ := payload["stream"].(bool); stream {
+			t.Fatalf("expected managed anthropic upstream request to force stream=false, got %+v", payload)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch len(anthropicBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_01",
+				"type":"message",
+				"content":[{"type":"tool_use","id":"toolu_1","name":"trading-api.get_market_context","input":{}}],
+				"stop_reason":"tool_use",
+				"usage":{"input_tokens":10,"output_tokens":3}
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_02",
+				"type":"message",
+				"model":"claude-sonnet-4-20250514",
+				"content":[{"type":"text","text":"market context loaded"}],
+				"stop_reason":"end_turn",
+				"usage":{"input_tokens":7,"output_tokens":5}
+			}`))
+		default:
+			t.Fatalf("unexpected anthropic round %d", len(anthropicBodies))
+		}
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard),
+		WithSessionHistory(histDir))
+	body := `{"model":"claude-sonnet-4-20250514","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("expected SSE content-type, got %q", got)
+	}
+	bodyText := w.Body.String()
+	if !strings.Contains(bodyText, "event: message_start") || !strings.Contains(bodyText, "event: message_stop") {
+		t.Fatalf("expected anthropic SSE envelope, got %s", bodyText)
+	}
+	events := parseSSEEvents(t, bodyText)
+	var sawText bool
+	var sawInput bool
+	var sawOutput bool
+	for _, event := range events {
+		if event["type"] == "content_block_delta" {
+			delta, _ := event["delta"].(map[string]any)
+			if delta["text"] == "market context loaded" {
+				sawText = true
+			}
+		}
+		if event["type"] == "message_start" {
+			msg, _ := event["message"].(map[string]any)
+			usage, _ := msg["usage"].(map[string]any)
+			if usage != nil && int(usage["input_tokens"].(float64)) == 17 {
+				sawInput = true
+			}
+		}
+		if event["type"] == "message_delta" {
+			usage, _ := event["usage"].(map[string]any)
+			if usage != nil && int(usage["output_tokens"].(float64)) == 8 {
+				sawOutput = true
+			}
+		}
+	}
+	if !sawText || !sawInput || !sawOutput {
+		t.Fatalf("expected synthetic anthropic text and aggregated usage, got %+v", events)
+	}
+
+	histFile := filepath.Join(histDir, "nano-bot", "history.jsonl")
+	rawHist, err := os.ReadFile(histFile)
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(rawHist, "\n"), &entry); err != nil {
+		t.Fatalf("unmarshal history entry: %v", err)
+	}
+	if stream, _ := entry["stream"].(bool); !stream {
+		t.Fatalf("expected history stream=true, got %+v", entry)
+	}
+	resp, _ := entry["response"].(map[string]any)
+	if resp["format"] != "sse" {
+		t.Fatalf("expected response.format=sse, got %+v", resp)
+	}
+}
+
+func TestHandlerReinjectsManagedAnthropicContinuityOnNextTurn(t *testing.T) {
+	var anthropicBodies [][]byte
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000,"positions":[{"symbol":"NVDA","qty":2}]}`))
+	}))
+	defer toolSrv.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read anthropic body: %v", err)
+		}
+		anthropicBodies = append(anthropicBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(anthropicBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_01",
+				"type":"message",
+				"content":[{"type":"tool_use","id":"toolu_1","name":"trading-api.get_market_context","input":{}}],
+				"stop_reason":"tool_use"
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_02",
+				"type":"message",
+				"content":[{"type":"text","text":"market context loaded"}],
+				"stop_reason":"end_turn"
+			}`))
+		case 3:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal anthropic request: %v", err)
+			}
+			rawMessages, _ := payload["messages"].([]any)
+			if len(rawMessages) < 5 {
+				t.Fatalf("expected continuity-injected anthropic conversation, got %+v", payload)
+			}
+			first := rawMessages[0].(map[string]any)
+			if first["role"] != "user" || first["content"] != "hi" {
+				t.Fatalf("unexpected first conversation message: %+v", first)
+			}
+			hiddenAssistant := rawMessages[1].(map[string]any)
+			if hiddenAssistant["role"] != "assistant" {
+				t.Fatalf("expected hidden assistant tool_use before visible reply, got %+v", hiddenAssistant)
+			}
+			hiddenAssistantBlocks, _ := hiddenAssistant["content"].([]any)
+			if len(hiddenAssistantBlocks) != 1 {
+				t.Fatalf("expected hidden assistant tool_use block, got %+v", hiddenAssistant)
+			}
+			if hiddenAssistantBlocks[0].(map[string]any)["type"] != "tool_use" {
+				t.Fatalf("expected tool_use block, got %+v", hiddenAssistantBlocks[0])
+			}
+			hiddenUser := rawMessages[2].(map[string]any)
+			if hiddenUser["role"] != "user" {
+				t.Fatalf("expected hidden user tool_result after tool_use, got %+v", hiddenUser)
+			}
+			hiddenUserBlocks, _ := hiddenUser["content"].([]any)
+			if len(hiddenUserBlocks) != 1 || hiddenUserBlocks[0].(map[string]any)["type"] != "tool_result" {
+				t.Fatalf("expected tool_result block, got %+v", hiddenUser)
+			}
+			visibleAssistant := rawMessages[3].(map[string]any)
+			if visibleAssistant["role"] != "assistant" {
+				t.Fatalf("expected visible assistant reply preserved after hidden turns, got %+v", visibleAssistant)
+			}
+			if text := strings.Join(anthropicMessageTextBlocks(visibleAssistant), "\n"); text != "market context loaded" {
+				t.Fatalf("expected preserved visible assistant reply, got %+v", visibleAssistant)
+			}
+			last := rawMessages[4].(map[string]any)
+			if last["role"] != "user" || last["content"] != "what next?" {
+				t.Fatalf("expected new user turn to remain after continuity injection, got %+v", last)
+			}
+			_, _ = w.Write([]byte(`{
+				"id":"msg_03",
+				"type":"message",
+				"content":[{"type":"text","text":"next step is hedge"}],
+				"stop_reason":"end_turn"
+			}`))
+		default:
+			t.Fatalf("unexpected anthropic round %d", len(anthropicBodies))
+		}
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(`{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}]}`))
+	firstReq.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	firstReq.Header.Set("Content-Type", "application/json")
+	firstReq.Header.Set("Anthropic-Version", "2023-06-01")
+	firstW := httptest.NewRecorder()
+	h.ServeHTTP(firstW, firstReq)
+	if firstW.Code != http.StatusOK {
+		t.Fatalf("expected first request 200, got %d: %s", firstW.Code, firstW.Body.String())
+	}
+	if !strings.Contains(firstW.Body.String(), "market context loaded") {
+		t.Fatalf("expected first response to complete mediated anthropic tool turn, got %s", firstW.Body.String())
+	}
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(`{
+		"model":"claude-sonnet-4-20250514",
+		"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":"market context loaded"},
+			{"role":"user","content":"what next?"}
+		]
+	}`))
+	secondReq.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	secondReq.Header.Set("Content-Type", "application/json")
+	secondReq.Header.Set("Anthropic-Version", "2023-06-01")
+	secondW := httptest.NewRecorder()
+	h.ServeHTTP(secondW, secondReq)
+	if secondW.Code != http.StatusOK {
+		t.Fatalf("expected second request 200, got %d: %s", secondW.Code, secondW.Body.String())
+	}
+	if !strings.Contains(secondW.Body.String(), "next step is hedge") {
+		t.Fatalf("expected second response text, got %s", secondW.Body.String())
+	}
+	if len(anthropicBodies) != 3 {
+		t.Fatalf("expected 3 anthropic calls across both turns, got %d", len(anthropicBodies))
 	}
 }
 

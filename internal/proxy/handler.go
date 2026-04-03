@@ -27,17 +27,18 @@ type ContextLoader func(agentID string) (*agentctx.AgentContext, error)
 
 // Handler proxies OpenAI-compatible chat requests to upstream providers.
 type Handler struct {
-	registry        *provider.Registry
-	loadContext     ContextLoader
-	client          *http.Client
-	logger          *logging.Logger
-	notifier        *alert.Notifier
-	accumulator     *cost.Accumulator
-	pricing         *cost.Pricing
-	feedFetcher     *feeds.Fetcher
-	managedTurns    *managedOpenAIContinuityStore
-	sessionRecorder *sessionhistory.Recorder
-	adminToken      string
+	registry              *provider.Registry
+	loadContext           ContextLoader
+	client                *http.Client
+	logger                *logging.Logger
+	notifier              *alert.Notifier
+	accumulator           *cost.Accumulator
+	pricing               *cost.Pricing
+	feedFetcher           *feeds.Fetcher
+	managedTurns          *managedOpenAIContinuityStore
+	managedAnthropicTurns *managedAnthropicContinuityStore
+	sessionRecorder       *sessionhistory.Recorder
+	adminToken            string
 }
 
 // HandlerOption configures optional Handler behaviour.
@@ -104,11 +105,12 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 		logger = logging.New(io.Discard)
 	}
 	h := &Handler{
-		registry:     registry,
-		loadContext:  contextLoader,
-		client:       &http.Client{},
-		logger:       logger,
-		managedTurns: newManagedOpenAIContinuityStore(defaultManagedToolContinuityTurns),
+		registry:              registry,
+		loadContext:           contextLoader,
+		client:                &http.Client{},
+		logger:                logger,
+		managedTurns:          newManagedOpenAIContinuityStore(defaultManagedToolContinuityTurns),
+		managedAnthropicTurns: newManagedAnthropicContinuityStore(defaultManagedToolContinuityTurns),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -274,17 +276,26 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		h.fail(w, http.StatusBadRequest, "invalid JSON body", agentID, "", start, err)
 		return
 	}
+	downstreamStream := requestedStream(payload)
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
+	if hasManagedTools(agentCtx) {
+		// Anthropic continuity reinjection follows the same rule as OpenAI:
+		// hidden mediated turns must be restored before recall/feed injection so
+		// the effective transcript seen by recall and the upstream model is the
+		// one that produced the runner-visible assistant reply.
+		h.managedAnthropicTurns.Inject(agentID, payload)
+	}
 	h.recallAnthropicMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
 	if feedBlock := h.fetchFeeds(r.Context(), agentID, agentCtx); feedBlock != "" {
 		feeds.InjectAnthropic(payload, feedBlock)
 	}
 	feeds.InjectAnthropic(payload, currentTimeLine(agentCtx, time.Now()))
 	if hasManagedTools(agentCtx) {
-		err := fmt.Errorf("managed anthropic tool execution not implemented")
-		h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
-		return
+		if err := injectManagedAnthropicTools(payload, agentCtx); err != nil {
+			h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
+			return
+		}
 	}
 	resolution, err := h.resolveAnthropicExecution(agentCtx, requestedModel)
 	if err != nil {
@@ -297,6 +308,10 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	}
 	if resolution.Intervention != "" {
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
+	}
+	if hasManagedTools(agentCtx) {
+		h.handleManagedAnthropic(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, downstreamStream, start)
+		return
 	}
 
 	h.dispatchCandidates(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, start)
@@ -833,6 +848,18 @@ func injectManagedOpenAITools(payload map[string]any, agentCtx *agentctx.AgentCo
 	return nil
 }
 
+func injectManagedAnthropicTools(payload map[string]any, agentCtx *agentctx.AgentContext) error {
+	if !hasManagedTools(agentCtx) {
+		return nil
+	}
+	if requestedStream(payload) {
+		payload["stream"] = false
+	}
+	payload["tools"] = buildAnthropicToolSchemas(agentCtx.Tools.Tools)
+	delete(payload, "tool_choice")
+	return nil
+}
+
 func hasManagedTools(agentCtx *agentctx.AgentContext) bool {
 	return agentCtx != nil && agentCtx.Tools != nil && len(agentCtx.Tools.Tools) > 0
 }
@@ -847,6 +874,18 @@ func buildOpenAIToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]any
 				"description": tool.Description,
 				"parameters":  tool.InputSchema,
 			},
+		})
+	}
+	return schemas
+}
+
+func buildAnthropicToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]any {
+	schemas := make([]map[string]any, 0, len(tools))
+	for _, tool := range tools {
+		schemas = append(schemas, map[string]any{
+			"name":         tool.Name,
+			"description":  tool.Description,
+			"input_schema": tool.InputSchema,
 		})
 	}
 	return schemas
