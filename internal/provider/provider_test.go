@@ -107,6 +107,46 @@ func TestLoadFromEnvSetsDefaultFields(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnvSeedsXAIProvider(t *testing.T) {
+	t.Setenv("XAI_API_KEY", "sk-xai-test")
+
+	r := NewRegistry("")
+	r.LoadFromEnv()
+
+	p, err := r.Get("xai")
+	if err != nil {
+		t.Fatalf("xai: %v", err)
+	}
+	if p.APIKey != "sk-xai-test" {
+		t.Errorf("expected xai key, got %q", p.APIKey)
+	}
+	if p.BaseURL != "https://api.x.ai/v1" {
+		t.Errorf("unexpected xai base URL: %q", p.BaseURL)
+	}
+	if p.Auth != "bearer" {
+		t.Errorf("expected xai auth=bearer, got %q", p.Auth)
+	}
+	if p.APIFormat != "openai" {
+		t.Errorf("expected xai api_format=openai, got %q", p.APIFormat)
+	}
+}
+
+func TestLoadFromEnvAppliesXAIBaseURLOverride(t *testing.T) {
+	t.Setenv("XAI_API_KEY", "sk-xai-test")
+	t.Setenv("XAI_BASE_URL", "https://proxy.example.test/v1")
+
+	r := NewRegistry("")
+	r.LoadFromEnv()
+
+	p, err := r.Get("xai")
+	if err != nil {
+		t.Fatalf("xai: %v", err)
+	}
+	if p.BaseURL != "https://proxy.example.test/v1" {
+		t.Errorf("expected xai base URL override, got %q", p.BaseURL)
+	}
+}
+
 func TestGetUnknownProviderErrors(t *testing.T) {
 	r := NewRegistry("")
 	_, err := r.Get("nonexistent")
