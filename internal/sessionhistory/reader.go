@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,6 +39,16 @@ func ReadEntries(baseDir, agentID string, after *time.Time, limit int) ([]Entry,
 		return nil, err
 	}
 	defer f.Close()
+
+	startOffset, err := readStartOffset(histPath, after)
+	if err != nil {
+		return nil, err
+	}
+	if startOffset > 0 {
+		if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+			return nil, err
+		}
+	}
 
 	entries := make([]Entry, 0, limit)
 	scanner := bufio.NewScanner(f)
