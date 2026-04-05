@@ -198,6 +198,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	downstreamStream, downstreamIncludeUsage := requestedOpenAIStreamOptions(payload)
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
+	h.logToolManifestState(agentID, requestedModel, agentCtx)
 	if hasManagedTools(agentCtx) {
 		// Continuity reinjection must happen before memory recall and feed/time
 		// injection so both the recall backend and the upstream model see the
@@ -279,6 +280,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	downstreamStream := requestedStream(payload)
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
+	h.logToolManifestState(agentID, requestedModel, agentCtx)
 	if hasManagedTools(agentCtx) {
 		// Anthropic continuity reinjection follows the same rule as OpenAI:
 		// hidden mediated turns must be restored before recall/feed injection so
@@ -830,6 +832,18 @@ func constantTimeEqual(a, b string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func (h *Handler) logToolManifestState(agentID, requestedModel string, agentCtx *agentctx.AgentContext) {
+	if agentCtx == nil {
+		return
+	}
+	manifestPresent := agentCtx.Tools != nil
+	toolsCount := 0
+	if agentCtx.Tools != nil {
+		toolsCount = len(agentCtx.Tools.Tools)
+	}
+	h.logger.LogToolManifest(agentID, requestedModel, manifestPresent, toolsCount)
 }
 
 func injectManagedOpenAITools(payload map[string]any, agentCtx *agentctx.AgentContext) error {

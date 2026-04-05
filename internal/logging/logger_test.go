@@ -126,6 +126,26 @@ func TestLogFeedFetchIncludesFeedFields(t *testing.T) {
 	}
 }
 
+func TestLogToolManifestIncludesStructuredFields(t *testing.T) {
+	var buf bytes.Buffer
+	l := New(&buf)
+	l.LogToolManifest("weston", "openai/gpt-4o", true, 2)
+
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if entry["type"] != "tool_manifest_loaded" {
+		t.Fatalf("expected type=tool_manifest_loaded, got %v", entry["type"])
+	}
+	if entry["manifest_present"] != true {
+		t.Fatalf("expected manifest_present=true, got %v", entry["manifest_present"])
+	}
+	if entry["tools_count"].(float64) != 2 {
+		t.Fatalf("expected tools_count=2, got %v", entry["tools_count"])
+	}
+}
+
 func TestLogMemoryOpIncludesStructuredFields(t *testing.T) {
 	var buf bytes.Buffer
 	l := New(&buf)

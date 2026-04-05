@@ -14,19 +14,21 @@ type Logger struct {
 }
 
 type entry struct {
-	TS           string   `json:"ts"`
-	ClawID       string   `json:"claw_id,omitempty"`
-	Type         string   `json:"type"`
-	Model        string   `json:"model,omitempty"`
-	FeedName     string   `json:"feed_name,omitempty"`
-	FeedURL      string   `json:"feed_url,omitempty"`
-	LatencyMS    *int64   `json:"latency_ms,omitempty"`
-	StatusCode   *int     `json:"status_code,omitempty"`
-	TokensIn     *int     `json:"tokens_in,omitempty"`
-	TokensOut    *int     `json:"tokens_out,omitempty"`
-	CostUSD      *float64 `json:"cost_usd,omitempty"`
-	Intervention *string  `json:"intervention"`
-	Error        string   `json:"error,omitempty"`
+	TS              string   `json:"ts"`
+	ClawID          string   `json:"claw_id,omitempty"`
+	Type            string   `json:"type"`
+	Model           string   `json:"model,omitempty"`
+	ManifestPresent *bool    `json:"manifest_present,omitempty"`
+	ToolsCount      *int     `json:"tools_count,omitempty"`
+	FeedName        string   `json:"feed_name,omitempty"`
+	FeedURL         string   `json:"feed_url,omitempty"`
+	LatencyMS       *int64   `json:"latency_ms,omitempty"`
+	StatusCode      *int     `json:"status_code,omitempty"`
+	TokensIn        *int     `json:"tokens_in,omitempty"`
+	TokensOut       *int     `json:"tokens_out,omitempty"`
+	CostUSD         *float64 `json:"cost_usd,omitempty"`
+	Intervention    *string  `json:"intervention"`
+	Error           string   `json:"error,omitempty"`
 	// memory_op event fields
 	MemoryService *string `json:"memory_service,omitempty"`
 	MemoryOp      *string `json:"memory_op,omitempty"`
@@ -160,6 +162,18 @@ func (l *Logger) LogFeedFetch(clawID, feedName, feedURL string, statusCode int, 
 	l.log(e)
 }
 
+func (l *Logger) LogToolManifest(clawID, model string, manifestPresent bool, toolsCount int) {
+	l.log(entry{
+		TS:              time.Now().UTC().Format(time.RFC3339),
+		ClawID:          clawID,
+		Type:            "tool_manifest_loaded",
+		Model:           model,
+		ManifestPresent: ptrBool(manifestPresent),
+		ToolsCount:      ptrInt(toolsCount),
+		Intervention:    nil,
+	})
+}
+
 func (l *Logger) LogMemoryOp(clawID, model string, info MemoryOpInfo) {
 	e := entry{
 		TS:            time.Now().UTC().Format(time.RFC3339),
@@ -227,5 +241,9 @@ func ptrString(v string) *string {
 	if v == "" {
 		return nil
 	}
+	return &v
+}
+
+func ptrBool(v bool) *bool {
 	return &v
 }

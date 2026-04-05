@@ -2336,6 +2336,49 @@ func TestHandlerNoFeedsStillWorks(t *testing.T) {
 	}
 }
 
+func TestHandlerLogsManagedToolManifestState(t *testing.T) {
+	var logs lockedBuffer
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("weston", "weston:secret", managedToolManifest()), logging.New(&logs))
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer weston:secret")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	entry := waitForLogEntry(t, &logs, func(entry map[string]any) bool {
+		return entry["type"] == "tool_manifest_loaded"
+	})
+	if entry["claw_id"] != "weston" {
+		t.Fatalf("expected claw_id=weston, got %+v", entry)
+	}
+	if entry["model"] != "openai/gpt-4o" {
+		t.Fatalf("expected model openai/gpt-4o, got %+v", entry)
+	}
+	if entry["manifest_present"] != true {
+		t.Fatalf("expected manifest_present=true, got %+v", entry)
+	}
+	if entry["tools_count"].(float64) != 1 {
+		t.Fatalf("expected tools_count=1, got %+v", entry)
+	}
+}
+
 // -- failure classification and retry tests ------------------------------------
 
 func TestHandlerMarksKeyDeadOn401AndFallsBack(t *testing.T) {
