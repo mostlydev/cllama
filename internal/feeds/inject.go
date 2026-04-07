@@ -69,7 +69,10 @@ func FormatAllFeeds(results []FeedResult) string {
 	return b.String()
 }
 
-// InjectOpenAI prepends feed context into an OpenAI-compatible messages array.
+// InjectOpenAI appends feed context to the system message in an OpenAI-compatible
+// messages array. Appending (rather than prepending) keeps the static system
+// prompt as a stable prefix, which is critical for Anthropic-compatible prompt
+// caching (prefix-matched, 5-min TTL).
 func InjectOpenAI(payload map[string]any, feedBlock string) bool {
 	if feedBlock == "" {
 		return false
@@ -84,7 +87,7 @@ func InjectOpenAI(payload map[string]any, feedBlock string) bool {
 		if first, ok := messages[0].(map[string]any); ok {
 			if role, _ := first["role"].(string); role == "system" {
 				if existing, ok := first["content"].(string); ok {
-					first["content"] = feedBlock + "\n\n" + existing
+					first["content"] = existing + "\n\n" + feedBlock
 					return true
 				}
 			}
@@ -95,6 +98,7 @@ func InjectOpenAI(payload map[string]any, feedBlock string) bool {
 		"role":    "system",
 		"content": feedBlock,
 	}
+	// Insert system message at the front — no existing system to append to.
 	newMessages := make([]any, 0, len(messages)+1)
 	newMessages = append(newMessages, feedMessage)
 	newMessages = append(newMessages, messages...)
@@ -102,7 +106,9 @@ func InjectOpenAI(payload map[string]any, feedBlock string) bool {
 	return true
 }
 
-// InjectAnthropic prepends feed context to an Anthropic /v1/messages payload.
+// InjectAnthropic appends feed context to an Anthropic /v1/messages payload.
+// Appending keeps the static system prompt as a stable prefix for prompt
+// caching (prefix-matched, 5-min TTL).
 func InjectAnthropic(payload map[string]any, feedBlock string) bool {
 	if feedBlock == "" {
 		return false
@@ -115,7 +121,7 @@ func InjectAnthropic(payload map[string]any, feedBlock string) bool {
 	}
 
 	if s, ok := existing.(string); ok {
-		payload["system"] = feedBlock + "\n\n" + s
+		payload["system"] = s + "\n\n" + feedBlock
 		return true
 	}
 
@@ -124,9 +130,7 @@ func InjectAnthropic(payload map[string]any, feedBlock string) bool {
 			"type": "text",
 			"text": feedBlock,
 		}
-		newBlocks := make([]any, 0, len(blocks)+1)
-		newBlocks = append(newBlocks, feedContentBlock)
-		newBlocks = append(newBlocks, blocks...)
+		newBlocks := append(blocks, feedContentBlock)
 		payload["system"] = newBlocks
 		return true
 	}

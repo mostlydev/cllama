@@ -2186,14 +2186,20 @@ func TestHandlerInjectsFeedsIntoOpenAI(t *testing.T) {
 	}
 	first := messages[0].(map[string]any)
 	content, _ := first["content"].(string)
-	if !strings.HasPrefix(content, "Current time: ") {
-		t.Errorf("expected current time at top of system content, got: %s", content)
+	if !strings.Contains(content, "Current time: ") {
+		t.Errorf("expected current time in system content, got: %s", content)
 	}
 	if !strings.Contains(content, "Wallet: $5,000") {
 		t.Errorf("expected feed content in first message, got: %s", content)
 	}
 	if !strings.Contains(content, "BEGIN FEED: market-context") {
 		t.Errorf("expected feed delimiter, got: %s", content)
+	}
+	// Feed content should appear before time (feeds set first, time appended).
+	feedIdx := strings.Index(content, "BEGIN FEED:")
+	timeIdx := strings.Index(content, "Current time:")
+	if feedIdx > timeIdx {
+		t.Errorf("expected feeds before time (append order), feed@%d time@%d", feedIdx, timeIdx)
 	}
 }
 
@@ -2261,11 +2267,17 @@ func TestHandlerInjectsFeedsIntoAnthropic(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	sys, _ := payload["system"].(string)
-	if !strings.HasPrefix(sys, "Current time: ") {
-		t.Errorf("expected current time at top of system content, got: %q", sys)
+	if !strings.Contains(sys, "Current time: ") {
+		t.Errorf("expected current time in system content, got: %q", sys)
 	}
 	if !strings.Contains(sys, "Fleet nominal") {
 		t.Errorf("expected feed in system field, got: %q", sys)
+	}
+	// Feed content should appear before time (feeds set first, time appended).
+	feedIdx := strings.Index(sys, "BEGIN FEED:")
+	timeIdx := strings.Index(sys, "Current time:")
+	if feedIdx > timeIdx {
+		t.Errorf("expected feeds before time (append order), feed@%d time@%d", feedIdx, timeIdx)
 	}
 }
 
