@@ -164,8 +164,8 @@ func TestInjectOpenAIMergesIntoExistingSystem(t *testing.T) {
 	}
 	first := messages[0].(map[string]any)
 	content := first["content"].(string)
-	if content != "feed data\n\nYou are a trader." {
-		t.Errorf("expected merged system content, got %q", content)
+	if content != "You are a trader.\n\nfeed data" {
+		t.Errorf("expected system prompt before feed (cache-friendly order), got %q", content)
 	}
 }
 
@@ -201,8 +201,8 @@ func TestInjectAnthropicExistingStringSystem(t *testing.T) {
 		t.Fatal("expected injection to succeed")
 	}
 	sys := payload["system"].(string)
-	if sys != "feed data\n\nYou are a trader." {
-		t.Errorf("unexpected system: %q", sys)
+	if sys != "You are a trader.\n\nfeed data" {
+		t.Errorf("expected system prompt before feed (cache-friendly order), got %q", sys)
 	}
 }
 
@@ -222,7 +222,11 @@ func TestInjectAnthropicExistingBlockSystem(t *testing.T) {
 		t.Fatalf("expected 2 blocks, got %d", len(blocks))
 	}
 	first := blocks[0].(map[string]any)
-	if first["text"] != "feed data" {
-		t.Errorf("expected feed data first, got %q", first["text"])
+	if first["text"] != "existing" {
+		t.Errorf("expected existing system block first (cache-friendly order), got %q", first["text"])
+	}
+	second := blocks[1].(map[string]any)
+	if second["text"] != "feed data" {
+		t.Errorf("expected feed data second, got %q", second["text"])
 	}
 }
