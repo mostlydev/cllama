@@ -32,6 +32,28 @@ func TestLookupOpenAIModel(t *testing.T) {
 	}
 }
 
+func TestLookupGoogleGeminiFlashModel(t *testing.T) {
+	p := DefaultPricing()
+	rate, ok := p.Lookup("google", "gemini-2.5-flash")
+	if !ok {
+		t.Fatal("expected to find google/gemini-2.5-flash")
+	}
+	if rate.InputPerMTok != 0.30 || rate.OutputPerMTok != 2.50 {
+		t.Fatalf("unexpected google/gemini-2.5-flash rates: %+v", rate)
+	}
+}
+
+func TestLookupGoogleGeminiProModel(t *testing.T) {
+	p := DefaultPricing()
+	rate, ok := p.Lookup("google", "gemini-2.5-pro")
+	if !ok {
+		t.Fatal("expected to find google/gemini-2.5-pro")
+	}
+	if rate.InputPerMTok != 1.25 || rate.OutputPerMTok != 10.0 {
+		t.Fatalf("unexpected google/gemini-2.5-pro rates: %+v", rate)
+	}
+}
+
 func TestComputeCost(t *testing.T) {
 	rate := Rate{InputPerMTok: 3.0, OutputPerMTok: 15.0}
 	cost := rate.Compute(1000, 500)

@@ -67,10 +67,15 @@ func DefaultPricing() *Pricing {
 		},
 		"openrouter": {
 			// OpenRouter passes through to upstream providers; rates match origin pricing.
-			"anthropic/claude-sonnet-4":   {InputPerMTok: 3.0, OutputPerMTok: 15.0},
-			"anthropic/claude-haiku-3-5":  {InputPerMTok: 0.80, OutputPerMTok: 4.0},
-			"google/gemini-2.5-pro":       {InputPerMTok: 1.25, OutputPerMTok: 10.0},
-			"google/gemini-2.5-flash":     {InputPerMTok: 0.15, OutputPerMTok: 0.60},
+			"anthropic/claude-sonnet-4":  {InputPerMTok: 3.0, OutputPerMTok: 15.0},
+			"anthropic/claude-haiku-3-5": {InputPerMTok: 0.80, OutputPerMTok: 4.0},
+			"google/gemini-2.5-pro":      {InputPerMTok: 1.25, OutputPerMTok: 10.0},
+			"google/gemini-2.5-flash":    {InputPerMTok: 0.15, OutputPerMTok: 0.60},
+		},
+		// Google pricing is simplified to the standard <=200k-token text tier.
+		"google": {
+			"gemini-2.5-pro":   {InputPerMTok: 1.25, OutputPerMTok: 10.0},
+			"gemini-2.5-flash": {InputPerMTok: 0.30, OutputPerMTok: 2.50},
 		},
 	}}
 }
