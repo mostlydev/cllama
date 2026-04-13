@@ -219,6 +219,60 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			return
 		}
 
+		managedCalls, nativeCalls := partitionManagedOpenAIToolCalls(agentCtx, toolCalls)
+		if len(managedCalls) == 0 {
+			if len(toolTrace) > 0 || len(hiddenMessages) > 0 {
+				msg := "runner-native tool calls after managed tool rounds are not supported in one request"
+				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
+				if streamKeepalive != nil && downstreamStream {
+					streamKeepalive.writeOpenAIError(jsonErrorPayload(msg))
+					h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), fmt.Errorf(msg))
+					return
+				}
+				h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
+				return
+			}
+
+			responseBytes := resp.Body
+			responseHeader := resp.Header.Clone()
+			if downstreamStream {
+				sse, synthErr := synthesizeOpenAIToolCallStream(resp.Body, resp.UpstreamModel, usageAgg, downstreamIncludeUsage)
+				if synthErr != nil {
+					h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed stream"), usageAgg, toolTrace)
+					if streamKeepalive != nil {
+						streamKeepalive.writeOpenAIError(jsonErrorPayload("failed to synthesize managed stream"))
+						h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), synthErr)
+						return
+					}
+					h.fail(w, http.StatusBadGateway, "failed to synthesize managed stream", agentID, requestedModel, start, synthErr)
+					return
+				}
+				streamKeepalive.writeFinal(sse)
+				responseBytes = sse
+				responseHeader = syntheticSSEHeader()
+			} else {
+				copyResponseHeaders(w.Header(), resp.Header)
+				w.WriteHeader(resp.StatusCode)
+				if len(resp.Body) > 0 {
+					_, _ = w.Write(resp.Body)
+				}
+			}
+			h.recordResponse(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseHeader, responseBytes, start)
+			return
+		}
+
+		if len(nativeCalls) > 0 {
+			msg := "mixed managed and runner-native tool calls are not supported in one model response"
+			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
+			if streamKeepalive != nil && downstreamStream {
+				streamKeepalive.writeOpenAIError(jsonErrorPayload(msg))
+				h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), fmt.Errorf(msg))
+				return
+			}
+			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
+			return
+		}
+
 		if len(toolTrace) >= policy.MaxRounds {
 			msg := fmt.Sprintf("managed tool max rounds exceeded (%d)", policy.MaxRounds)
 			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
@@ -235,7 +289,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				ReportedCostUSD:  usage.ReportedCostUSD,
 			},
 		}
-		for _, call := range toolCalls {
+		for _, call := range managedCalls {
 			execResult := waitWithManagedKeepalive(streamKeepalive, managedToolWaitComment(len(toolTrace)+1, managedToolDisplayName(agentCtx, call.Name)), func() managedOpenAIToolExecResult {
 				outcome, execErr := h.executeManagedOpenAITool(loopCtx, agentID, agentCtx, call, policy)
 				return managedOpenAIToolExecResult{Outcome: outcome, Err: execErr}
@@ -361,6 +415,60 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			return
 		}
 
+		managedToolUses, nativeToolUses := partitionManagedAnthropicToolUses(agentCtx, toolUses)
+		if len(managedToolUses) == 0 {
+			if len(toolTrace) > 0 || len(hiddenMessages) > 0 {
+				msg := "runner-native tool calls after managed tool rounds are not supported in one request"
+				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
+				if streamKeepalive != nil && downstreamStream {
+					streamKeepalive.writeAnthropicError(msg)
+					h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), fmt.Errorf(msg))
+					return
+				}
+				h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
+				return
+			}
+
+			responseBytes := resp.Body
+			responseHeader := resp.Header.Clone()
+			if downstreamStream {
+				sse, synthErr := synthesizeAnthropicToolUseStream(resp.Body, resp.UpstreamModel, usageAgg)
+				if synthErr != nil {
+					h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed stream"), usageAgg, toolTrace)
+					if streamKeepalive != nil {
+						streamKeepalive.writeAnthropicError("failed to synthesize managed stream")
+						h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), synthErr)
+						return
+					}
+					h.fail(w, http.StatusBadGateway, "failed to synthesize managed stream", agentID, requestedModel, start, synthErr)
+					return
+				}
+				streamKeepalive.writeFinal(sse)
+				responseBytes = sse
+				responseHeader = syntheticSSEHeader()
+			} else {
+				copyResponseHeaders(w.Header(), resp.Header)
+				w.WriteHeader(resp.StatusCode)
+				if len(resp.Body) > 0 {
+					_, _ = w.Write(resp.Body)
+				}
+			}
+			h.recordResponse(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseHeader, responseBytes, start)
+			return
+		}
+
+		if len(nativeToolUses) > 0 {
+			msg := "mixed managed and runner-native tool calls are not supported in one model response"
+			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
+			if streamKeepalive != nil && downstreamStream {
+				streamKeepalive.writeAnthropicError(msg)
+				h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), fmt.Errorf(msg))
+				return
+			}
+			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
+			return
+		}
+
 		if len(toolTrace) >= policy.MaxRounds {
 			msg := fmt.Sprintf("managed tool max rounds exceeded (%d)", policy.MaxRounds)
 			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
@@ -377,7 +485,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				ReportedCostUSD:  usage.ReportedCostUSD,
 			},
 		}
-		for _, call := range toolUses {
+		for _, call := range managedToolUses {
 			execResult := waitWithManagedKeepalive(streamKeepalive, managedToolWaitComment(len(toolTrace)+1, managedToolDisplayName(agentCtx, call.Name)), func() managedAnthropicToolExecResult {
 				outcome, execErr := h.executeManagedAnthropicTool(loopCtx, agentID, agentCtx, call, policy)
 				return managedAnthropicToolExecResult{Outcome: outcome, Err: execErr}
@@ -927,6 +1035,38 @@ func parseAnthropicToolResponse(body []byte) (map[string]any, []anthropicToolUse
 	}
 }
 
+func partitionManagedOpenAIToolCalls(agentCtx *agentctx.AgentContext, calls []openAIToolCall) ([]openAIToolCall, []openAIToolCall) {
+	if len(calls) == 0 {
+		return nil, nil
+	}
+	managed := make([]openAIToolCall, 0, len(calls))
+	native := make([]openAIToolCall, 0, len(calls))
+	for _, call := range calls {
+		if _, ok := resolveManagedTool(agentCtx, call.Name); ok {
+			managed = append(managed, call)
+			continue
+		}
+		native = append(native, call)
+	}
+	return managed, native
+}
+
+func partitionManagedAnthropicToolUses(agentCtx *agentctx.AgentContext, calls []anthropicToolUse) ([]anthropicToolUse, []anthropicToolUse) {
+	if len(calls) == 0 {
+		return nil, nil
+	}
+	managed := make([]anthropicToolUse, 0, len(calls))
+	native := make([]anthropicToolUse, 0, len(calls))
+	for _, call := range calls {
+		if _, ok := resolveManagedTool(agentCtx, call.Name); ok {
+			managed = append(managed, call)
+			continue
+		}
+		native = append(native, call)
+	}
+	return managed, native
+}
+
 func appendOpenAIAssistantAndToolMessages(payload map[string]any, assistantMessage map[string]any, toolMessages []any) {
 	messages, _ := payload["messages"].([]any)
 	messages = append(messages, assistantMessage)
@@ -1007,6 +1147,113 @@ func synthesizeOpenAIStream(finalBody []byte, upstreamModel string, usage manage
 			"index":         0,
 			"delta":         map[string]any{},
 			"finish_reason": "stop",
+		}},
+	})
+	if includeUsage {
+		writeSSEChunk(&stream, map[string]any{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []any{},
+			"usage": map[string]any{
+				"prompt_tokens":     usage.PromptTokens,
+				"completion_tokens": usage.CompletionTokens,
+				"total_tokens":      usage.TotalTokens,
+			},
+		})
+	}
+	stream.WriteString("data: [DONE]\n\n")
+	return stream.Bytes(), nil
+}
+
+func synthesizeOpenAIToolCallStream(finalBody []byte, upstreamModel string, usage managedUsageAggregate, includeUsage bool) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(finalBody, &payload); err != nil {
+		return nil, err
+	}
+	id, _ := payload["id"].(string)
+	if strings.TrimSpace(id) == "" {
+		id = "chatcmpl-managed"
+	}
+	model, _ := payload["model"].(string)
+	if strings.TrimSpace(model) == "" {
+		model = upstreamModel
+	}
+	created := time.Now().Unix()
+	if rawCreated, ok := payload["created"].(float64); ok {
+		created = int64(rawCreated)
+	}
+
+	assistantMessage, toolCalls, err := parseOpenAIToolResponse(finalBody)
+	if err != nil {
+		return nil, err
+	}
+	if len(toolCalls) == 0 {
+		return nil, fmt.Errorf("cannot synthesize streamed tool_call payload without tool calls")
+	}
+
+	var stream bytes.Buffer
+	writeSSEChunk(&stream, map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"delta":         map[string]any{"role": "assistant"},
+			"finish_reason": nil,
+		}},
+	})
+	if content := openAIMessageContent(assistantMessage); content != "" {
+		writeSSEChunk(&stream, map[string]any{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []map[string]any{{
+				"index":         0,
+				"delta":         map[string]any{"content": content},
+				"finish_reason": nil,
+			}},
+		})
+	}
+	for i, call := range toolCalls {
+		args := strings.TrimSpace(string(call.ArgumentsRaw))
+		if args == "" {
+			args = "{}"
+		}
+		writeSSEChunk(&stream, map[string]any{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []map[string]any{{
+				"index": 0,
+				"delta": map[string]any{
+					"tool_calls": []map[string]any{{
+						"index": i,
+						"id":    call.ID,
+						"type":  "function",
+						"function": map[string]any{
+							"name":      call.Name,
+							"arguments": args,
+						},
+					}},
+				},
+				"finish_reason": nil,
+			}},
+		})
+	}
+	writeSSEChunk(&stream, map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": "tool_calls",
 		}},
 	})
 	if includeUsage {
@@ -1110,6 +1357,132 @@ func synthesizeAnthropicStream(finalBody []byte, upstreamModel string, usage man
 	return stream.Bytes(), nil
 }
 
+func synthesizeAnthropicToolUseStream(finalBody []byte, upstreamModel string, usage managedUsageAggregate) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(finalBody, &payload); err != nil {
+		return nil, err
+	}
+	assistantMessage, toolUses, err := parseAnthropicToolResponse(finalBody)
+	if err != nil {
+		return nil, err
+	}
+	if len(toolUses) == 0 {
+		return nil, fmt.Errorf("cannot synthesize streamed tool_use payload without tool calls")
+	}
+
+	id, _ := payload["id"].(string)
+	if strings.TrimSpace(id) == "" {
+		id = "msg_managed"
+	}
+	model, _ := payload["model"].(string)
+	if strings.TrimSpace(model) == "" {
+		model = upstreamModel
+	}
+	stopReason, _ := payload["stop_reason"].(string)
+	if strings.TrimSpace(stopReason) == "" {
+		stopReason = "tool_use"
+	}
+
+	var stream bytes.Buffer
+	writeAnthropicSSEEvent(&stream, "message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id":            id,
+			"type":          "message",
+			"role":          "assistant",
+			"model":         model,
+			"content":       []any{},
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage": map[string]any{
+				"input_tokens": usage.PromptTokens,
+			},
+		},
+	})
+
+	content, _ := assistantMessage["content"].([]any)
+	for idx, raw := range content {
+		block, _ := raw.(map[string]any)
+		if block == nil {
+			continue
+		}
+		blockType, _ := block["type"].(string)
+		switch blockType {
+		case "tool_use":
+			blockID, _ := block["id"].(string)
+			name, _ := block["name"].(string)
+			input := "{}"
+			if block["input"] != nil {
+				encoded, err := json.Marshal(block["input"])
+				if err != nil {
+					return nil, err
+				}
+				input = string(encoded)
+			}
+			writeAnthropicSSEEvent(&stream, "content_block_start", map[string]any{
+				"type":  "content_block_start",
+				"index": idx,
+				"content_block": map[string]any{
+					"type": "tool_use",
+					"id":   blockID,
+					"name": name,
+				},
+			})
+			writeAnthropicSSEEvent(&stream, "content_block_delta", map[string]any{
+				"type":  "content_block_delta",
+				"index": idx,
+				"delta": map[string]any{
+					"type":         "input_json_delta",
+					"partial_json": input,
+				},
+			})
+			writeAnthropicSSEEvent(&stream, "content_block_stop", map[string]any{
+				"type":  "content_block_stop",
+				"index": idx,
+			})
+		case "text", "":
+			text, _ := block["text"].(string)
+			writeAnthropicSSEEvent(&stream, "content_block_start", map[string]any{
+				"type":  "content_block_start",
+				"index": idx,
+				"content_block": map[string]any{
+					"type": "text",
+					"text": "",
+				},
+			})
+			if text != "" {
+				writeAnthropicSSEEvent(&stream, "content_block_delta", map[string]any{
+					"type":  "content_block_delta",
+					"index": idx,
+					"delta": map[string]any{
+						"type": "text_delta",
+						"text": text,
+					},
+				})
+			}
+			writeAnthropicSSEEvent(&stream, "content_block_stop", map[string]any{
+				"type":  "content_block_stop",
+				"index": idx,
+			})
+		}
+	}
+
+	writeAnthropicSSEEvent(&stream, "message_delta", map[string]any{
+		"type": "message_delta",
+		"delta": map[string]any{
+			"stop_reason":   stopReason,
+			"stop_sequence": payload["stop_sequence"],
+		},
+		"usage": map[string]any{
+			"output_tokens": usage.CompletionTokens,
+		},
+	})
+	writeAnthropicSSEEvent(&stream, "message_stop", map[string]any{
+		"type": "message_stop",
+	})
+	return stream.Bytes(), nil
+}
+
 func openAIMessageContent(message map[string]any) string {
 	if message == nil {
 		return ""
@@ -1178,6 +1551,14 @@ func writeSyntheticSSE(w http.ResponseWriter, stream []byte) {
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(stream)
+}
+
+func syntheticSSEHeader() http.Header {
+	header := http.Header{}
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-cache")
+	header.Set("Connection", "keep-alive")
+	return header
 }
 
 func newManagedStreamKeepalive(w http.ResponseWriter, enabled bool) *managedStreamKeepalive {
