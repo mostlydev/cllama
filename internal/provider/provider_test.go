@@ -147,6 +147,113 @@ func TestLoadFromEnvAppliesXAIBaseURLOverride(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnvSeedsGoogleProviderFromGeminiKey(t *testing.T) {
+	t.Setenv("GEMINI_API_KEY", "sk-gemini-primary")
+
+	r := NewRegistry("")
+	r.LoadFromEnv()
+
+	p, err := r.Get("google")
+	if err != nil {
+		t.Fatalf("google: %v", err)
+	}
+	if p.APIKey != "sk-gemini-primary" {
+		t.Fatalf("expected google key from GEMINI_API_KEY, got %q", p.APIKey)
+	}
+	if p.BaseURL != "https://generativelanguage.googleapis.com/v1beta/openai" {
+		t.Fatalf("unexpected google base URL: %q", p.BaseURL)
+	}
+	if p.Auth != "bearer" {
+		t.Fatalf("expected google auth=bearer, got %q", p.Auth)
+	}
+	if p.APIFormat != "openai" {
+		t.Fatalf("expected google api_format=openai, got %q", p.APIFormat)
+	}
+
+	state := r.All()["google"]
+	if state == nil {
+		t.Fatal("expected google provider state")
+	}
+	if state.ActiveKeyID != "seed:GEMINI_API_KEY" {
+		t.Fatalf("active_key_id = %q, want seed:GEMINI_API_KEY", state.ActiveKeyID)
+	}
+	if len(state.Keys) != 1 || state.Keys[0].ID != "seed:GEMINI_API_KEY" {
+		t.Fatalf("expected single google seed key, got %+v", state.Keys)
+	}
+}
+
+func TestLoadFromEnvSeedsGoogleProviderFromGoogleAlias(t *testing.T) {
+	t.Setenv("GOOGLE_API_KEY", "sk-google-alias")
+
+	r := NewRegistry("")
+	r.LoadFromEnv()
+
+	p, err := r.Get("google")
+	if err != nil {
+		t.Fatalf("google: %v", err)
+	}
+	if p.APIKey != "sk-google-alias" {
+		t.Fatalf("expected google key from GOOGLE_API_KEY, got %q", p.APIKey)
+	}
+
+	state := r.All()["google"]
+	if state == nil {
+		t.Fatal("expected google provider state")
+	}
+	if state.ActiveKeyID != "seed:GOOGLE_API_KEY" {
+		t.Fatalf("active_key_id = %q, want seed:GOOGLE_API_KEY", state.ActiveKeyID)
+	}
+	if len(state.Keys) != 1 || state.Keys[0].ID != "seed:GOOGLE_API_KEY" {
+		t.Fatalf("expected GOOGLE_API_KEY alias to seed google provider, got %+v", state.Keys)
+	}
+}
+
+func TestLoadFromEnvPrefersGeminiKeyOverGoogleAlias(t *testing.T) {
+	t.Setenv("GEMINI_API_KEY", "sk-gemini-primary")
+	t.Setenv("GOOGLE_API_KEY", "sk-google-alias")
+
+	r := NewRegistry("")
+	r.LoadFromEnv()
+
+	p, err := r.Get("google")
+	if err != nil {
+		t.Fatalf("google: %v", err)
+	}
+	if p.APIKey != "sk-gemini-primary" {
+		t.Fatalf("expected GEMINI_API_KEY to win, got %q", p.APIKey)
+	}
+
+	state := r.All()["google"]
+	if state == nil {
+		t.Fatal("expected google provider state")
+	}
+	if state.ActiveKeyID != "seed:GEMINI_API_KEY" {
+		t.Fatalf("active_key_id = %q, want seed:GEMINI_API_KEY", state.ActiveKeyID)
+	}
+	if len(state.Keys) != 2 {
+		t.Fatalf("expected 2 google keys, got %+v", state.Keys)
+	}
+	if state.Keys[0].ID != "seed:GEMINI_API_KEY" || state.Keys[1].ID != "seed:GOOGLE_API_KEY" {
+		t.Fatalf("expected GEMINI primary then GOOGLE alias ordering, got %+v", state.Keys)
+	}
+}
+
+func TestLoadFromEnvAppliesGoogleBaseURLOverride(t *testing.T) {
+	t.Setenv("GEMINI_API_KEY", "sk-gemini-primary")
+	t.Setenv("GOOGLE_BASE_URL", "https://proxy.example.test/google")
+
+	r := NewRegistry("")
+	r.LoadFromEnv()
+
+	p, err := r.Get("google")
+	if err != nil {
+		t.Fatalf("google: %v", err)
+	}
+	if p.BaseURL != "https://proxy.example.test/google" {
+		t.Fatalf("expected google base URL override, got %q", p.BaseURL)
+	}
+}
+
 func TestGetUnknownProviderErrors(t *testing.T) {
 	r := NewRegistry("")
 	_, err := r.Get("nonexistent")

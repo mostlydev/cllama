@@ -77,6 +77,7 @@ var knownProviders = map[string]string{
 	"xai":        "https://api.x.ai/v1",
 	"anthropic":  "https://api.anthropic.com/v1",
 	"openrouter": "https://openrouter.ai/api/v1",
+	"google":     "https://generativelanguage.googleapis.com/v1beta/openai",
 	"ollama":     "http://ollama:11434/v1",
 }
 
@@ -92,6 +93,9 @@ var envKeyMap = map[string]string{
 	"ANTHROPIC_API_KEY_1":  "anthropic",
 	"OPENROUTER_API_KEY":   "openrouter",
 	"OPENROUTER_API_KEY_1": "openrouter",
+	"GEMINI_API_KEY":       "google",
+	"GEMINI_API_KEY_1":     "google",
+	"GOOGLE_API_KEY":       "google",
 }
 
 var envBaseURLMap = map[string]string{
@@ -99,6 +103,7 @@ var envBaseURLMap = map[string]string{
 	"XAI_BASE_URL":        "xai",
 	"ANTHROPIC_BASE_URL":  "anthropic",
 	"OPENROUTER_BASE_URL": "openrouter",
+	"GOOGLE_BASE_URL":     "google",
 	"OLLAMA_BASE_URL":     "ollama",
 }
 
@@ -269,6 +274,11 @@ func (r *Registry) LoadFromEnv() {
 		"openrouter": {
 			{"OPENROUTER_API_KEY", "seed:OPENROUTER_API_KEY", "primary"},
 			{"OPENROUTER_API_KEY_1", "seed:OPENROUTER_API_KEY_1", "backup-1"},
+		},
+		"google": {
+			{"GEMINI_API_KEY", "seed:GEMINI_API_KEY", "primary"},
+			{"GEMINI_API_KEY_1", "seed:GEMINI_API_KEY_1", "backup-1"},
+			{"GOOGLE_API_KEY", "seed:GOOGLE_API_KEY", "backup-2"},
 		},
 	}
 

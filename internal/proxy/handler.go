@@ -854,11 +854,21 @@ func injectManagedOpenAITools(payload map[string]any, agentCtx *agentctx.AgentCo
 		payload["stream"] = false
 		delete(payload, "stream_options")
 	}
-	payload["tools"] = buildOpenAIToolSchemas(agentCtx.Tools.Tools)
+	tools := existingOpenAIToolSchemas(payload)
+	for _, tool := range buildOpenAIToolSchemas(agentCtx.Tools.Tools) {
+		tools = append(tools, tool)
+	}
+	payload["tools"] = tools
+	if _, ok := payload["tool_choice"]; !ok {
+		if toolChoice, ok := legacyFunctionCallToToolChoice(payload["function_call"]); ok {
+			payload["tool_choice"] = toolChoice
+		}
+	}
+	if toolChoice, ok := payload["tool_choice"]; ok {
+		payload["tool_choice"] = rewriteManagedOpenAIToolChoice(toolChoice, agentCtx)
+	}
 	delete(payload, "functions")
 	delete(payload, "function_call")
-	delete(payload, "tool_choice")
-	delete(payload, "parallel_tool_calls")
 	return nil
 }
 
@@ -869,13 +879,102 @@ func injectManagedAnthropicTools(payload map[string]any, agentCtx *agentctx.Agen
 	if requestedStream(payload) {
 		payload["stream"] = false
 	}
-	payload["tools"] = buildAnthropicToolSchemas(agentCtx.Tools.Tools)
-	delete(payload, "tool_choice")
+	tools, _ := payload["tools"].([]any)
+	merged := append([]any{}, tools...)
+	for _, tool := range buildAnthropicToolSchemas(agentCtx.Tools.Tools) {
+		merged = append(merged, tool)
+	}
+	payload["tools"] = merged
+	if toolChoice, ok := payload["tool_choice"]; ok {
+		payload["tool_choice"] = rewriteManagedAnthropicToolChoice(toolChoice, agentCtx)
+	}
 	return nil
 }
 
 func hasManagedTools(agentCtx *agentctx.AgentContext) bool {
 	return agentCtx != nil && agentCtx.Tools != nil && len(agentCtx.Tools.Tools) > 0
+}
+
+func existingOpenAIToolSchemas(payload map[string]any) []any {
+	var tools []any
+	if existing, ok := payload["tools"].([]any); ok {
+		tools = append(tools, existing...)
+	}
+	if functions, ok := payload["functions"].([]any); ok {
+		for _, raw := range functions {
+			function, _ := raw.(map[string]any)
+			if function == nil {
+				continue
+			}
+			tools = append(tools, map[string]any{
+				"type":     "function",
+				"function": function,
+			})
+		}
+	}
+	return tools
+}
+
+func legacyFunctionCallToToolChoice(raw any) (any, bool) {
+	switch typed := raw.(type) {
+	case string:
+		value := strings.TrimSpace(typed)
+		if value == "" {
+			return nil, false
+		}
+		return value, true
+	case map[string]any:
+		name, _ := typed["name"].(string)
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, false
+		}
+		return map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": name,
+			},
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+func rewriteManagedOpenAIToolChoice(toolChoice any, agentCtx *agentctx.AgentContext) any {
+	choice, _ := toolChoice.(map[string]any)
+	if choice == nil {
+		return toolChoice
+	}
+	function, _ := choice["function"].(map[string]any)
+	if function == nil {
+		return toolChoice
+	}
+	name, _ := function["name"].(string)
+	resolved, ok := resolveManagedTool(agentCtx, name)
+	if !ok {
+		return toolChoice
+	}
+	function["name"] = resolved.PresentedName
+	choice["function"] = function
+	return choice
+}
+
+func rewriteManagedAnthropicToolChoice(toolChoice any, agentCtx *agentctx.AgentContext) any {
+	choice, _ := toolChoice.(map[string]any)
+	if choice == nil {
+		return toolChoice
+	}
+	kind, _ := choice["type"].(string)
+	if !strings.EqualFold(strings.TrimSpace(kind), "tool") {
+		return toolChoice
+	}
+	name, _ := choice["name"].(string)
+	resolved, ok := resolveManagedTool(agentCtx, name)
+	if !ok {
+		return toolChoice
+	}
+	choice["name"] = resolved.PresentedName
+	return choice
 }
 
 func buildOpenAIToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]any {

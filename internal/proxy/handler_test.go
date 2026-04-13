@@ -112,22 +112,28 @@ func TestHandlerInjectsManagedToolsIntoOpenAIRequests(t *testing.T) {
 		t.Fatalf("unmarshal backend body: %v", err)
 	}
 	tools, _ := payload["tools"].([]any)
-	if len(tools) != 1 {
-		t.Fatalf("expected 1 managed tool, got %+v", payload["tools"])
+	if len(tools) != 3 {
+		t.Fatalf("expected runner-local tools plus managed tools, got %+v", payload["tools"])
 	}
-	first, _ := tools[0].(map[string]any)
-	function, _ := first["function"].(map[string]any)
-	if first["type"] != "function" || function["name"] != expectedName {
-		t.Fatalf("unexpected managed tool payload: %+v", first)
+	var names []string
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		function, _ := tool["function"].(map[string]any)
+		name, _ := function["name"].(string)
+		names = append(names, name)
+	}
+	joined := strings.Join(names, ",")
+	if !strings.Contains(joined, "runner_local") || !strings.Contains(joined, "legacy") || !strings.Contains(joined, expectedName) {
+		t.Fatalf("expected merged tool list to include runner_local, legacy, and %q, got %+v", expectedName, payload["tools"])
 	}
 	if _, ok := payload["functions"]; ok {
 		t.Fatalf("expected legacy functions field removed, got %+v", payload)
 	}
-	if _, ok := payload["tool_choice"]; ok {
-		t.Fatalf("expected tool_choice removed, got %+v", payload)
+	if payload["tool_choice"] != "auto" {
+		t.Fatalf("expected tool_choice preserved, got %+v", payload)
 	}
-	if _, ok := payload["parallel_tool_calls"]; ok {
-		t.Fatalf("expected parallel_tool_calls removed, got %+v", payload)
+	if enabled, _ := payload["parallel_tool_calls"].(bool); !enabled {
+		t.Fatalf("expected parallel_tool_calls preserved, got %+v", payload)
 	}
 }
 
@@ -231,6 +237,221 @@ func TestHandlerRestreamsManagedOpenAITools(t *testing.T) {
 	resp, _ := entry["response"].(map[string]any)
 	if resp["format"] != "sse" {
 		t.Fatalf("expected response.format=sse, got %+v", resp)
+	}
+}
+
+func TestHandlerPassesThroughNativeOpenAIToolCallsWhenManagedToolsArePresent(t *testing.T) {
+	var xaiBodies [][]byte
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read xai body: %v", err)
+		}
+		xaiBodies = append(xaiBodies, body)
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("unmarshal xai request: %v", err)
+		}
+		if stream, _ := payload["stream"].(bool); stream {
+			t.Fatalf("expected managed/native upstream request to force stream=false, got %+v", payload)
+		}
+		tools, _ := payload["tools"].([]any)
+		if len(tools) != 2 {
+			t.Fatalf("expected merged tool list upstream, got %+v", payload["tools"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"chatcmpl-native",
+			"model":"grok-4.1-fast",
+			"choices":[{
+				"finish_reason":"tool_calls",
+				"message":{
+					"role":"assistant",
+					"tool_calls":[{"id":"call_native_1","type":"function","function":{"name":"runner_local","arguments":"{\"ticker\":\"NVDA\"}"}}]
+				}
+			}],
+			"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}
+		}`))
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+	body := `{
+		"model":"xai/grok-4.1-fast",
+		"stream":true,
+		"stream_options":{"include_usage":true},
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"runner_local","description":"native runner tool","parameters":{"type":"object"}}}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if toolCalls != 0 {
+		t.Fatalf("expected managed tool executor to stay idle for native tool call, got %d", toolCalls)
+	}
+	if len(xaiBodies) != 1 {
+		t.Fatalf("expected one upstream model round, got %d", len(xaiBodies))
+	}
+	if got := w.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("expected SSE content-type, got %q", got)
+	}
+	events := parseSSEEvents(t, w.Body.String())
+	if !sseHasToolCall(events, "runner_local") {
+		t.Fatalf("expected re-streamed native tool call, got %+v", events)
+	}
+	if !sseHasUsage(events, 9, 4, 13) {
+		t.Fatalf("expected usage chunk in re-streamed native tool response, got %+v", events)
+	}
+}
+
+func TestHandlerRejectsMixedManagedAndNativeOpenAIToolCalls(t *testing.T) {
+	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"chatcmpl-mixed",
+			"choices":[{
+				"finish_reason":"tool_calls",
+				"message":{
+					"role":"assistant",
+					"tool_calls":[
+						{"id":"call_managed_1","type":"function","function":{"name":"` + presentedName + `","arguments":"{}"}},
+						{"id":"call_native_1","type":"function","function":{"name":"runner_local","arguments":"{}"}}
+					]
+				}
+			}]
+		}`))
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+	body := `{
+		"model":"xai/grok-4.1-fast",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"runner_local","description":"native runner tool","parameters":{"type":"object"}}}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "mixed managed and runner-native tool calls") {
+		t.Fatalf("expected mixed tool-call error, got %s", w.Body.String())
+	}
+	if toolCalls != 0 {
+		t.Fatalf("expected no managed tool execution on mixed tool-call failure, got %d", toolCalls)
+	}
+}
+
+func TestHandlerRejectsNativeOpenAIToolCallsAfterManagedRounds(t *testing.T) {
+	xaiCalls := 0
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		xaiCalls++
+		w.Header().Set("Content-Type", "application/json")
+		switch xaiCalls {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-managed-first",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_managed_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+					}
+				}]
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-native-second",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_native_1","type":"function","function":{"name":"runner_local","arguments":"{}"}}]
+					}
+				}]
+			}`))
+		default:
+			t.Fatalf("unexpected xai round %d", xaiCalls)
+		}
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+	body := `{
+		"model":"xai/grok-4.1-fast",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"runner_local","description":"native runner tool","parameters":{"type":"object"}}}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "runner-native tool calls after managed tool rounds") {
+		t.Fatalf("expected interleaving error, got %s", w.Body.String())
+	}
+	if xaiCalls != 2 {
+		t.Fatalf("expected two model rounds before failure, got %d", xaiCalls)
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected one managed tool execution before failure, got %d", toolCalls)
 	}
 }
 
@@ -1599,15 +1820,15 @@ func TestHandlerExecutesManagedAnthropicTools(t *testing.T) {
 				t.Fatalf("unmarshal anthropic request: %v", err)
 			}
 			tools, _ := payload["tools"].([]any)
-			if len(tools) != 1 {
-				t.Fatalf("expected 1 managed anthropic tool, got %+v", payload["tools"])
+			if len(tools) != 2 {
+				t.Fatalf("expected runner-native plus managed anthropic tools, got %+v", payload["tools"])
 			}
-			first, _ := tools[0].(map[string]any)
-			if first["name"] != presentedName {
-				t.Fatalf("expected provider-safe managed anthropic tool name %q, got %+v", presentedName, first)
+			if !anthropicToolsIncludeName(tools, "runner_local") || !anthropicToolsIncludeName(tools, presentedName) {
+				t.Fatalf("expected merged anthropic tool list to include runner_local and %q, got %+v", presentedName, payload["tools"])
 			}
-			if _, ok := payload["tool_choice"]; ok {
-				t.Fatalf("expected tool_choice removed from managed anthropic request, got %+v", payload)
+			toolChoice, _ := payload["tool_choice"].(map[string]any)
+			if toolChoice == nil || toolChoice["type"] != "tool" || toolChoice["name"] != "runner_local" {
+				t.Fatalf("expected native anthropic tool_choice preserved, got %+v", payload)
 			}
 			_, _ = w.Write([]byte(`{
 				"id":"msg_01",
@@ -1642,6 +1863,7 @@ func TestHandlerExecutesManagedAnthropicTools(t *testing.T) {
 	body := `{
 		"model":"claude-sonnet-4-20250514",
 		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"name":"runner_local","description":"native runner tool","input_schema":{"type":"object"}}],
 		"tool_choice":{"type":"tool","name":"runner_local"}
 	}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
@@ -1848,6 +2070,137 @@ func TestHandlerRestreamsManagedAnthropicTools(t *testing.T) {
 	resp, _ := entry["response"].(map[string]any)
 	if resp["format"] != "sse" {
 		t.Fatalf("expected response.format=sse, got %+v", resp)
+	}
+}
+
+func TestHandlerPassesThroughNativeAnthropicToolUseWhenManagedToolsArePresent(t *testing.T) {
+	var anthropicBodies [][]byte
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read anthropic body: %v", err)
+		}
+		anthropicBodies = append(anthropicBodies, body)
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("unmarshal anthropic request: %v", err)
+		}
+		if stream, _ := payload["stream"].(bool); stream {
+			t.Fatalf("expected managed/native anthropic upstream request to force stream=false, got %+v", payload)
+		}
+		tools, _ := payload["tools"].([]any)
+		if len(tools) != 2 {
+			t.Fatalf("expected merged anthropic tool list upstream, got %+v", payload["tools"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"msg_native",
+			"type":"message",
+			"model":"claude-sonnet-4-20250514",
+			"content":[{"type":"tool_use","id":"toolu_native_1","name":"runner_local","input":{"ticker":"NVDA"}}],
+			"stop_reason":"tool_use",
+			"usage":{"input_tokens":8,"output_tokens":3}
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+	body := `{
+		"model":"claude-sonnet-4-20250514",
+		"stream":true,
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"name":"runner_local","description":"native runner tool","input_schema":{"type":"object"}}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if toolCalls != 0 {
+		t.Fatalf("expected managed tool executor to stay idle for native anthropic tool_use, got %d", toolCalls)
+	}
+	if len(anthropicBodies) != 1 {
+		t.Fatalf("expected one upstream anthropic round, got %d", len(anthropicBodies))
+	}
+	if got := w.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("expected SSE content-type, got %q", got)
+	}
+	if !anthropicSSEHasToolUse(parseSSEEvents(t, w.Body.String()), "runner_local") {
+		t.Fatalf("expected re-streamed native anthropic tool_use, got %s", w.Body.String())
+	}
+}
+
+func TestHandlerRejectsMixedManagedAndNativeAnthropicToolUse(t *testing.T) {
+	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"msg_mixed",
+			"type":"message",
+			"content":[
+				{"type":"tool_use","id":"toolu_managed_1","name":"` + presentedName + `","input":{}},
+				{"type":"tool_use","id":"toolu_native_1","name":"runner_local","input":{}}
+			],
+			"stop_reason":"tool_use",
+			"usage":{"input_tokens":8,"output_tokens":3}
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+	body := `{
+		"model":"claude-sonnet-4-20250514",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"name":"runner_local","description":"native runner tool","input_schema":{"type":"object"}}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "mixed managed and runner-native tool calls") {
+		t.Fatalf("expected mixed anthropic tool-use error, got %s", w.Body.String())
+	}
+	if toolCalls != 0 {
+		t.Fatalf("expected no managed tool execution on mixed anthropic failure, got %d", toolCalls)
 	}
 }
 
@@ -3508,6 +3861,47 @@ func sseHasContent(events []map[string]any, want string) bool {
 	return false
 }
 
+func sseHasToolCall(events []map[string]any, want string) bool {
+	for _, event := range events {
+		choices, _ := event["choices"].([]any)
+		for _, rawChoice := range choices {
+			choice, _ := rawChoice.(map[string]any)
+			if choice == nil {
+				continue
+			}
+			delta, _ := choice["delta"].(map[string]any)
+			if delta == nil {
+				continue
+			}
+			toolCalls, _ := delta["tool_calls"].([]any)
+			for _, rawTool := range toolCalls {
+				tool, _ := rawTool.(map[string]any)
+				function, _ := tool["function"].(map[string]any)
+				if function["name"] == want {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func anthropicSSEHasToolUse(events []map[string]any, want string) bool {
+	for _, event := range events {
+		if event["type"] != "content_block_start" {
+			continue
+		}
+		block, _ := event["content_block"].(map[string]any)
+		if block == nil {
+			continue
+		}
+		if block["type"] == "tool_use" && block["name"] == want {
+			return true
+		}
+	}
+	return false
+}
+
 func sseHasUsage(events []map[string]any, prompt, completion, total int) bool {
 	for _, event := range events {
 		usage, _ := event["usage"].(map[string]any)
@@ -3517,6 +3911,19 @@ func sseHasUsage(events []map[string]any, prompt, completion, total int) bool {
 		if int(usage["prompt_tokens"].(float64)) == prompt &&
 			int(usage["completion_tokens"].(float64)) == completion &&
 			int(usage["total_tokens"].(float64)) == total {
+			return true
+		}
+	}
+	return false
+}
+
+func anthropicToolsIncludeName(tools []any, want string) bool {
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		if tool == nil {
+			continue
+		}
+		if tool["name"] == want {
 			return true
 		}
 	}

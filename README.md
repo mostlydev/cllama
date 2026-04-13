@@ -9,7 +9,7 @@ It is a single Go binary with zero dependencies. 15 MB distroless image. Two por
 ```mermaid
 flowchart LR
   A[Agent<br/><i>bearer token</i>] -->|request| P[cllama-passthrough<br/><b>identity → route → swap key</b><br/><i>extract usage → record cost</i>]
-  P -->|real key| U[Provider<br/><i>OpenAI · Anthropic<br/>OpenRouter · Ollama</i>]
+  P -->|real key| U[Provider<br/><i>OpenAI · Anthropic<br/>OpenRouter · Google · Ollama</i>]
   U -->|response| P
   P -->|response| A
   P --- D[:8081 dashboard<br/><i>providers · pod · costs · api</i>]
@@ -84,6 +84,7 @@ Or with Docker:
 docker run -p 8080:8080 -p 8081:8081 \
   -e ANTHROPIC_API_KEY=sk-ant-... \
   -e OPENROUTER_API_KEY=sk-or-... \
+  -e GEMINI_API_KEY=sk-gemini-... \
   -v ./context:/claw/context:ro \
   ghcr.io/mostlydev/cllama:latest
 ```
@@ -105,6 +106,9 @@ docker run -p 8080:8080 -p 8081:8081 \
 | `OPENAI_API_KEY` | | Provider key override |
 | `ANTHROPIC_API_KEY` | | Provider key override |
 | `OPENROUTER_API_KEY` | | Provider key override |
+| `GEMINI_API_KEY` | | Primary Google Gemini provider key override |
+| `GOOGLE_API_KEY` | | Lower-priority alias for the Google Gemini provider key |
+| `GOOGLE_BASE_URL` | | Override for Google's OpenAI-compatible base URL |
 
 Environment variables override keys saved via the web UI.
 
@@ -153,6 +157,11 @@ When orchestrated by Clawdapus, `claw up` generates all of this — tokens via `
       "api_key": "sk-or-...",
       "auth": "bearer"
     },
+    "google": {
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "api_key": "sk-gemini-...",
+      "auth": "bearer"
+    },
     "ollama": {
       "base_url": "http://ollama:11434/v1",
       "auth": "none"
@@ -161,7 +170,7 @@ When orchestrated by Clawdapus, `claw up` generates all of this — tokens via `
 }
 ```
 
-Auth schemes: `bearer` (OpenAI, OpenRouter), `x-api-key` (Anthropic), `none` (Ollama, local models).
+Auth schemes: `bearer` (OpenAI, OpenRouter, Google), `x-api-key` (Anthropic), `none` (Ollama, local models).
 
 ---
 
