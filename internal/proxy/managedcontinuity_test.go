@@ -98,6 +98,259 @@ func TestManagedOpenAIContinuityStoreEvictsLeastRecentlyUsedAgents(t *testing.T)
 	}
 }
 
+func TestManagedOpenAIContinuityStoreInjectsPendingNativeToolCallOnce(t *testing.T) {
+	store := newManagedOpenAIContinuityStore(8)
+
+	if !store.ObserveNativeToolCallAssistant("tiverton", map[string]any{
+		"role": "assistant",
+		"tool_calls": []any{
+			map[string]any{
+				"id":   "call_native_1",
+				"type": "function",
+				"function": map[string]any{
+					"name":      "runner_local",
+					"arguments": "{}",
+				},
+			},
+		},
+	}, continuityHiddenMessages(
+		map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": "call_managed_1"}}},
+		map[string]any{"role": "tool", "tool_call_id": "call_managed_1", "content": `{"ok":true,"tag":"managed"}`},
+	)) {
+		t.Fatal("expected pending native handoff to be recorded")
+	}
+
+	payload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+			map[string]any{"role": "assistant", "tool_calls": []any{
+				map[string]any{
+					"id":   "call_native_1",
+					"type": "function",
+					"function": map[string]any{
+						"name":      "runner_local",
+						"arguments": "{}",
+					},
+				},
+			}},
+			map[string]any{"role": "tool", "tool_call_id": "call_native_1", "content": `{"native":true}`},
+		},
+	}
+
+	if !store.Inject("tiverton", payload) {
+		t.Fatal("expected pending native handoff injection")
+	}
+
+	messages, _ := payload["messages"].([]any)
+	if len(messages) != 5 {
+		t.Fatalf("expected 5 messages after pending native handoff injection, got %d", len(messages))
+	}
+	assertJSONToolTag(t, messages[2], "managed")
+	if state := store.agents["tiverton"]; state != nil && state.PendingToolCallTurn != nil {
+		t.Fatalf("expected pending native handoff to clear after injection, state=%+v", state)
+	}
+
+	secondPayload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+			map[string]any{"role": "assistant", "tool_calls": []any{
+				map[string]any{
+					"id":   "call_native_1",
+					"type": "function",
+					"function": map[string]any{
+						"name":      "runner_local",
+						"arguments": "{}",
+					},
+				},
+			}},
+			map[string]any{"role": "tool", "tool_call_id": "call_native_1", "content": `{"native":true}`},
+		},
+	}
+	if store.Inject("tiverton", secondPayload) {
+		t.Fatal("did not expect pending native handoff to inject twice")
+	}
+}
+
+func TestManagedAnthropicContinuityStoreInjectsPendingNativeToolUseOnce(t *testing.T) {
+	store := newManagedAnthropicContinuityStore(8)
+
+	if !store.ObserveNativeToolUseAssistant("nano-bot", map[string]any{
+		"role": "assistant",
+		"content": []any{
+			map[string]any{"type": "tool_use", "id": "toolu_native_1", "name": "runner_local", "input": map[string]any{}},
+		},
+	}, continuityHiddenMessages(
+		map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "tool_use", "id": "toolu_managed_1", "name": "svc.tool", "input": map[string]any{}}}},
+		map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": "toolu_managed_1", "content": `{"ok":true}`}}},
+	)) {
+		t.Fatal("expected pending native anthropic handoff to be recorded")
+	}
+
+	payload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+			map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "tool_use", "id": "toolu_native_1", "name": "runner_local", "input": map[string]any{}},
+			}},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "toolu_native_1", "content": `{"native":true}`},
+			}},
+		},
+	}
+
+	if !store.Inject("nano-bot", payload) {
+		t.Fatal("expected pending native anthropic handoff injection")
+	}
+
+	messages, _ := payload["messages"].([]any)
+	if len(messages) != 5 {
+		t.Fatalf("expected 5 messages after pending native anthropic handoff injection, got %d", len(messages))
+	}
+	if hiddenAssistant := messages[1].(map[string]any); hiddenAssistant["role"] != "assistant" {
+		t.Fatalf("expected hidden assistant injected before native handoff, got %+v", hiddenAssistant)
+	}
+	if hiddenUser := messages[2].(map[string]any); hiddenUser["role"] != "user" {
+		t.Fatalf("expected hidden user tool_result injected before native handoff, got %+v", hiddenUser)
+	}
+	if state := store.agents["nano-bot"]; state != nil && state.PendingToolUseTurn != nil {
+		t.Fatalf("expected pending native anthropic handoff to clear after injection, state=%+v", state)
+	}
+
+	secondPayload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+			map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "tool_use", "id": "toolu_native_1", "name": "runner_local", "input": map[string]any{}},
+			}},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "toolu_native_1", "content": `{"native":true}`},
+			}},
+		},
+	}
+	if store.Inject("nano-bot", secondPayload) {
+		t.Fatal("did not expect pending native anthropic handoff to inject twice")
+	}
+}
+
+func TestManagedOpenAIContinuityStorePreservesPendingNativeToolCallOnAnchorMiss(t *testing.T) {
+	store := newManagedOpenAIContinuityStore(8)
+
+	if !store.ObserveNativeToolCallAssistant("tiverton", map[string]any{
+		"role": "assistant",
+		"tool_calls": []any{
+			map[string]any{
+				"id":   "call_native_1",
+				"type": "function",
+				"function": map[string]any{
+					"name":      "runner_local",
+					"arguments": "{}",
+				},
+			},
+		},
+	}, continuityHiddenMessages(
+		map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": "call_managed_1"}}},
+		map[string]any{"role": "tool", "tool_call_id": "call_managed_1", "content": `{"ok":true,"tag":"managed"}`},
+	)) {
+		t.Fatal("expected pending native handoff to be recorded")
+	}
+
+	missPayload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+			map[string]any{"role": "assistant", "tool_calls": []any{
+				map[string]any{
+					"id":   "call_native_2",
+					"type": "function",
+					"function": map[string]any{
+						"name":      "runner_local",
+						"arguments": "{}",
+					},
+				},
+			}},
+			map[string]any{"role": "tool", "tool_call_id": "call_native_2", "content": `{"native":true}`},
+		},
+	}
+
+	if store.Inject("tiverton", missPayload) {
+		t.Fatal("did not expect anchor-miss payload to inject pending native handoff")
+	}
+	if state := store.agents["tiverton"]; state == nil || state.PendingToolCallTurn == nil {
+		t.Fatalf("expected pending native handoff to remain after anchor miss, state=%+v", state)
+	}
+
+	matchPayload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+			map[string]any{"role": "assistant", "tool_calls": []any{
+				map[string]any{
+					"id":   "call_native_1",
+					"type": "function",
+					"function": map[string]any{
+						"name":      "runner_local",
+						"arguments": "{}",
+					},
+				},
+			}},
+			map[string]any{"role": "tool", "tool_call_id": "call_native_1", "content": `{"native":true}`},
+		},
+	}
+
+	if !store.Inject("tiverton", matchPayload) {
+		t.Fatal("expected pending native handoff to inject after later anchor match")
+	}
+}
+
+func TestManagedAnthropicContinuityStorePreservesPendingNativeToolUseOnAnchorMiss(t *testing.T) {
+	store := newManagedAnthropicContinuityStore(8)
+
+	if !store.ObserveNativeToolUseAssistant("nano-bot", map[string]any{
+		"role": "assistant",
+		"content": []any{
+			map[string]any{"type": "tool_use", "id": "toolu_native_1", "name": "runner_local", "input": map[string]any{}},
+		},
+	}, continuityHiddenMessages(
+		map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "tool_use", "id": "toolu_managed_1", "name": "svc.tool", "input": map[string]any{}}}},
+		map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": "toolu_managed_1", "content": `{"ok":true}`}}},
+	)) {
+		t.Fatal("expected pending native anthropic handoff to be recorded")
+	}
+
+	missPayload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+			map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "tool_use", "id": "toolu_native_2", "name": "runner_local", "input": map[string]any{}},
+			}},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "toolu_native_2", "content": `{"native":true}`},
+			}},
+		},
+	}
+
+	if store.Inject("nano-bot", missPayload) {
+		t.Fatal("did not expect anchor-miss anthropic payload to inject pending native handoff")
+	}
+	if state := store.agents["nano-bot"]; state == nil || state.PendingToolUseTurn == nil {
+		t.Fatalf("expected pending native anthropic handoff to remain after anchor miss, state=%+v", state)
+	}
+
+	matchPayload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+			map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "tool_use", "id": "toolu_native_1", "name": "runner_local", "input": map[string]any{}},
+			}},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "toolu_native_1", "content": `{"native":true}`},
+			}},
+		},
+	}
+
+	if !store.Inject("nano-bot", matchPayload) {
+		t.Fatal("expected pending native anthropic handoff to inject after later anchor match")
+	}
+}
+
 func continuityHiddenMessages(messages ...map[string]any) []json.RawMessage {
 	out := make([]json.RawMessage, 0, len(messages))
 	for _, msg := range messages {

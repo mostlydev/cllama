@@ -15,14 +15,20 @@ type managedAnthropicContinuityStore struct {
 }
 
 type managedAnthropicContinuityState struct {
-	Turns      []managedAnthropicContinuityTurn
-	LastAccess uint64
+	Turns              []managedAnthropicContinuityTurn
+	PendingToolUseTurn *managedAnthropicToolUseContinuityTurn
+	LastAccess         uint64
 }
 
 type managedAnthropicContinuityTurn struct {
 	Anchor                  string
 	VisibleAssistantFromEnd int
 	HiddenMessages          []json.RawMessage
+}
+
+type managedAnthropicToolUseContinuityTurn struct {
+	Anchor         string
+	HiddenMessages []json.RawMessage
 }
 
 func newManagedAnthropicContinuityStore(maxTurns int) *managedAnthropicContinuityStore {
@@ -54,7 +60,7 @@ func (s *managedAnthropicContinuityStore) ObserveTerminalAssistant(agentID strin
 			state.Turns[i].VisibleAssistantFromEnd++
 		}
 		state.Turns = filterAnthropicContinuityTurns(state.Turns, s.maxTurns)
-		if len(state.Turns) == 0 && len(hiddenMessages) == 0 {
+		if len(state.Turns) == 0 && len(hiddenMessages) == 0 && state.PendingToolUseTurn == nil {
 			delete(s.agents, agentID)
 			return false
 		}
@@ -82,6 +88,32 @@ func (s *managedAnthropicContinuityStore) ObserveTerminalAssistant(agentID strin
 	return true
 }
 
+func (s *managedAnthropicContinuityStore) ObserveNativeToolUseAssistant(agentID string, assistantMessage map[string]any, hiddenMessages []json.RawMessage) bool {
+	if s == nil || strings.TrimSpace(agentID) == "" || len(hiddenMessages) == 0 {
+		return false
+	}
+	anchor, ok := anthropicToolUseAssistantAnchor(assistantMessage)
+	if !ok {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state := s.agents[agentID]
+	if state == nil {
+		state = &managedAnthropicContinuityState{}
+		s.agents[agentID] = state
+	}
+	state.PendingToolUseTurn = &managedAnthropicToolUseContinuityTurn{
+		Anchor:         anchor,
+		HiddenMessages: cloneRawMessages(hiddenMessages),
+	}
+	s.touchLocked(agentID, state)
+	s.evictAgentsLocked()
+	return true
+}
+
 func (s *managedAnthropicContinuityStore) Inject(agentID string, payload map[string]any) bool {
 	if s == nil || strings.TrimSpace(agentID) == "" {
 		return false
@@ -93,16 +125,20 @@ func (s *managedAnthropicContinuityStore) Inject(agentID string, payload map[str
 
 	s.mu.Lock()
 	state := s.agents[agentID]
-	if state == nil || len(state.Turns) == 0 {
+	if state == nil || (len(state.Turns) == 0 && state.PendingToolUseTurn == nil) {
 		s.mu.Unlock()
 		return false
 	}
 	turns := cloneAnthropicContinuityTurns(state.Turns)
+	pendingToolUseTurn := cloneAnthropicToolUseContinuityTurn(state.PendingToolUseTurn)
+	if pendingToolUseTurn != nil {
+		state.PendingToolUseTurn = nil
+	}
 	s.touchLocked(agentID, state)
 	s.mu.Unlock()
 
 	totalVisible := countVisibleAnthropicAssistantMessages(messages)
-	if totalVisible == 0 {
+	if totalVisible == 0 && pendingToolUseTurn == nil {
 		return false
 	}
 	turnsByOffset := make(map[int]managedAnthropicContinuityTurn, len(turns))
@@ -113,11 +149,25 @@ func (s *managedAnthropicContinuityStore) Inject(agentID string, payload map[str
 		turnsByOffset[turn.VisibleAssistantFromEnd] = turn
 	}
 
-	out := make([]any, 0, len(messages)+hiddenAnthropicMessageCount(turns))
+	out := make([]any, 0, len(messages)+hiddenAnthropicMessageCount(turns)+anthropicToolUseHiddenMessageCount(pendingToolUseTurn))
 	visibleSeen := 0
 	inserted := false
+	insertedPendingToolUse := false
 	for _, rawMsg := range messages {
 		msg, _ := rawMsg.(map[string]any)
+		if !insertedPendingToolUse && pendingToolUseTurn != nil && anthropicToolUseMessageMatchesAnchor(msg, pendingToolUseTurn.Anchor) {
+			for _, hidden := range pendingToolUseTurn.HiddenMessages {
+				var decoded any
+				if err := json.Unmarshal(hidden, &decoded); err != nil {
+					// Hidden continuity messages are stored from valid JSON payloads.
+					// Decode failure here means corrupted in-memory state; skip rather than injecting garbage.
+					continue
+				}
+				out = append(out, decoded)
+				inserted = true
+			}
+			insertedPendingToolUse = true
+		}
 		if isVisibleAnthropicAssistantMessage(msg) {
 			visibleSeen++
 			offsetFromEnd := totalVisible - visibleSeen + 1
@@ -125,6 +175,8 @@ func (s *managedAnthropicContinuityStore) Inject(agentID string, payload map[str
 				for _, hidden := range turn.HiddenMessages {
 					var decoded any
 					if err := json.Unmarshal(hidden, &decoded); err != nil {
+						// Hidden continuity messages are stored from valid JSON payloads.
+						// Decode failure here means corrupted in-memory state; skip rather than injecting garbage.
 						continue
 					}
 					out = append(out, decoded)
@@ -136,6 +188,12 @@ func (s *managedAnthropicContinuityStore) Inject(agentID string, payload map[str
 	}
 	if inserted {
 		payload["messages"] = out
+	}
+	if insertedPendingToolUse {
+		return inserted
+	}
+	if pendingToolUseTurn != nil {
+		s.restorePendingToolUseTurn(agentID, pendingToolUseTurn)
 	}
 	return inserted
 }
@@ -208,8 +266,34 @@ func anthropicVisibleAssistantAnchor(message map[string]any) (string, bool) {
 	return string(raw), true
 }
 
+func anthropicToolUseAssistantAnchor(message map[string]any) (string, bool) {
+	if !isAnthropicToolUseAssistantMessage(message) {
+		return "", false
+	}
+
+	normalized := map[string]any{
+		"role": "assistant",
+	}
+	if content, ok := normalizeAnthropicMessageContent(message["content"]); ok {
+		normalized["content"] = content
+	}
+	raw, err := json.Marshal(normalized)
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
+}
+
 func anthropicMessageMatchesAnchor(message map[string]any, anchor string) bool {
 	current, ok := anthropicVisibleAssistantAnchor(message)
+	if !ok {
+		return false
+	}
+	return current == anchor
+}
+
+func anthropicToolUseMessageMatchesAnchor(message map[string]any, anchor string) bool {
+	current, ok := anthropicToolUseAssistantAnchor(message)
 	if !ok {
 		return false
 	}
@@ -237,6 +321,27 @@ func isVisibleAnthropicAssistantMessage(message map[string]any) bool {
 		}
 	}
 	return true
+}
+
+func isAnthropicToolUseAssistantMessage(message map[string]any) bool {
+	if len(message) == 0 {
+		return false
+	}
+	role, _ := message["role"].(string)
+	if !strings.EqualFold(strings.TrimSpace(role), "assistant") {
+		return false
+	}
+	content, _ := message["content"].([]any)
+	for _, raw := range content {
+		block, _ := raw.(map[string]any)
+		if block == nil {
+			continue
+		}
+		if blockType, _ := block["type"].(string); blockType == "tool_use" {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeAnthropicMessageContent(content any) (any, bool) {
@@ -295,6 +400,13 @@ func countVisibleAnthropicAssistantMessages(messages []any) int {
 	return total
 }
 
+func anthropicToolUseHiddenMessageCount(turn *managedAnthropicToolUseContinuityTurn) int {
+	if turn == nil {
+		return 0
+	}
+	return len(turn.HiddenMessages)
+}
+
 func filterAnthropicContinuityTurns(turns []managedAnthropicContinuityTurn, maxTurns int) []managedAnthropicContinuityTurn {
 	if len(turns) == 0 {
 		return nil
@@ -329,4 +441,34 @@ func cloneAnthropicContinuityTurns(in []managedAnthropicContinuityTurn) []manage
 		})
 	}
 	return out
+}
+
+func cloneAnthropicToolUseContinuityTurn(in *managedAnthropicToolUseContinuityTurn) *managedAnthropicToolUseContinuityTurn {
+	if in == nil {
+		return nil
+	}
+	return &managedAnthropicToolUseContinuityTurn{
+		Anchor:         in.Anchor,
+		HiddenMessages: cloneRawMessages(in.HiddenMessages),
+	}
+}
+
+func (s *managedAnthropicContinuityStore) restorePendingToolUseTurn(agentID string, turn *managedAnthropicToolUseContinuityTurn) {
+	if s == nil || strings.TrimSpace(agentID) == "" || turn == nil {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state := s.agents[agentID]
+	if state == nil {
+		state = &managedAnthropicContinuityState{}
+		s.agents[agentID] = state
+	}
+	if state.PendingToolUseTurn != nil {
+		return
+	}
+	state.PendingToolUseTurn = cloneAnthropicToolUseContinuityTurn(turn)
+	s.touchLocked(agentID, state)
 }

@@ -381,7 +381,7 @@ func TestHandlerRejectsMixedManagedAndNativeOpenAIToolCalls(t *testing.T) {
 	}
 }
 
-func TestHandlerRejectsNativeOpenAIToolCallsAfterManagedRounds(t *testing.T) {
+func TestHandlerHandsOffNativeOpenAIToolCallsAfterManagedRounds(t *testing.T) {
 	xaiCalls := 0
 	toolCalls := 0
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -417,6 +417,64 @@ func TestHandlerRejectsNativeOpenAIToolCallsAfterManagedRounds(t *testing.T) {
 					}
 				}]
 			}`))
+		case 3:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read xai body: %v", err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal xai request: %v", err)
+			}
+			rawMessages, _ := payload["messages"].([]any)
+			conversation := make([]map[string]any, 0, len(rawMessages))
+			for _, raw := range rawMessages {
+				msg, _ := raw.(map[string]any)
+				if msg == nil {
+					continue
+				}
+				if role, _ := msg["role"].(string); role == "system" {
+					continue
+				}
+				conversation = append(conversation, msg)
+			}
+			if len(conversation) < 5 {
+				t.Fatalf("expected managed handoff continuity injection, got %+v", payload)
+			}
+			if conversation[0]["role"] != "user" || conversation[0]["content"] != "hi" {
+				t.Fatalf("unexpected first conversation message: %+v", conversation[0])
+			}
+			hiddenAssistant := conversation[1]
+			if hiddenAssistant["role"] != "assistant" {
+				t.Fatalf("expected hidden managed assistant before native tool call, got %+v", hiddenAssistant)
+			}
+			hiddenToolCalls, _ := hiddenAssistant["tool_calls"].([]any)
+			if len(hiddenToolCalls) != 1 {
+				t.Fatalf("expected hidden managed tool call, got %+v", hiddenAssistant)
+			}
+			if hiddenAssistantCall := hiddenToolCalls[0].(map[string]any); hiddenAssistantCall["id"] != "call_managed_1" {
+				t.Fatalf("expected hidden managed tool call id, got %+v", hiddenAssistantCall)
+			}
+			hiddenTool := conversation[2]
+			if hiddenTool["role"] != "tool" || hiddenTool["tool_call_id"] != "call_managed_1" {
+				t.Fatalf("expected hidden managed tool result, got %+v", hiddenTool)
+			}
+			nativeAssistant := conversation[3]
+			nativeToolCalls, _ := nativeAssistant["tool_calls"].([]any)
+			if nativeAssistant["role"] != "assistant" || len(nativeToolCalls) != 1 {
+				t.Fatalf("expected native tool call after hidden managed rounds, got %+v", nativeAssistant)
+			}
+			if nativeAssistantCall := nativeToolCalls[0].(map[string]any); nativeAssistantCall["id"] != "call_native_1" {
+				t.Fatalf("expected native tool call id preserved, got %+v", nativeAssistantCall)
+			}
+			nativeToolResult := conversation[4]
+			if nativeToolResult["role"] != "tool" || nativeToolResult["tool_call_id"] != "call_native_1" {
+				t.Fatalf("expected native tool result after injected hidden rounds, got %+v", nativeToolResult)
+			}
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-final",
+				"choices":[{"message":{"role":"assistant","content":"native handoff complete"}}]
+			}`))
 		default:
 			t.Fatalf("unexpected xai round %d", xaiCalls)
 		}
@@ -441,17 +499,42 @@ func TestHandlerRejectsNativeOpenAIToolCallsAfterManagedRounds(t *testing.T) {
 
 	h.ServeHTTP(w, req)
 
-	if w.Code != http.StatusBadGateway {
-		t.Fatalf("expected 502, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "runner-native tool calls after managed tool rounds") {
-		t.Fatalf("expected interleaving error, got %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), "\"runner_local\"") {
+		t.Fatalf("expected native tool call to be returned to runner, got %s", w.Body.String())
 	}
 	if xaiCalls != 2 {
-		t.Fatalf("expected two model rounds before failure, got %d", xaiCalls)
+		t.Fatalf("expected two model rounds before handoff, got %d", xaiCalls)
 	}
 	if toolCalls != 1 {
-		t.Fatalf("expected one managed tool execution before failure, got %d", toolCalls)
+		t.Fatalf("expected one managed tool execution before handoff, got %d", toolCalls)
+	}
+
+	followupReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{
+		"model":"xai/grok-4.1-fast",
+		"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","tool_calls":[{"id":"call_native_1","type":"function","function":{"name":"runner_local","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_native_1","content":"{\"native\":true}"}
+		],
+		"tools":[{"type":"function","function":{"name":"runner_local","description":"native runner tool","parameters":{"type":"object"}}}]
+	}`))
+	followupReq.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	followupReq.Header.Set("Content-Type", "application/json")
+	followupW := httptest.NewRecorder()
+
+	h.ServeHTTP(followupW, followupReq)
+
+	if followupW.Code != http.StatusOK {
+		t.Fatalf("expected follow-up request 200, got %d: %s", followupW.Code, followupW.Body.String())
+	}
+	if !strings.Contains(followupW.Body.String(), "native handoff complete") {
+		t.Fatalf("expected final text after native handoff, got %s", followupW.Body.String())
+	}
+	if xaiCalls != 3 {
+		t.Fatalf("expected third model round after runner tool result, got %d", xaiCalls)
 	}
 }
 
@@ -2201,6 +2284,151 @@ func TestHandlerRejectsMixedManagedAndNativeAnthropicToolUse(t *testing.T) {
 	}
 	if toolCalls != 0 {
 		t.Fatalf("expected no managed tool execution on mixed anthropic failure, got %d", toolCalls)
+	}
+}
+
+func TestHandlerHandsOffNativeAnthropicToolUseAfterManagedRounds(t *testing.T) {
+	anthropicCalls := 0
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		anthropicCalls++
+		w.Header().Set("Content-Type", "application/json")
+		switch anthropicCalls {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_managed_first",
+				"type":"message",
+				"content":[{"type":"tool_use","id":"toolu_managed_1","name":"trading-api.get_market_context","input":{}}],
+				"stop_reason":"tool_use",
+				"usage":{"input_tokens":10,"output_tokens":3}
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_native_second",
+				"type":"message",
+				"content":[{"type":"tool_use","id":"toolu_native_1","name":"runner_local","input":{}}],
+				"stop_reason":"tool_use",
+				"usage":{"input_tokens":7,"output_tokens":4}
+			}`))
+		case 3:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read anthropic body: %v", err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal anthropic request: %v", err)
+			}
+			rawMessages, _ := payload["messages"].([]any)
+			if len(rawMessages) < 5 {
+				t.Fatalf("expected managed handoff continuity injection, got %+v", payload)
+			}
+			first := rawMessages[0].(map[string]any)
+			if first["role"] != "user" || first["content"] != "hi" {
+				t.Fatalf("unexpected first conversation message: %+v", first)
+			}
+			hiddenAssistant := rawMessages[1].(map[string]any)
+			hiddenAssistantBlocks, _ := hiddenAssistant["content"].([]any)
+			if hiddenAssistant["role"] != "assistant" || len(hiddenAssistantBlocks) != 1 {
+				t.Fatalf("expected hidden managed assistant before native tool use, got %+v", hiddenAssistant)
+			}
+			if hiddenAssistantBlocks[0].(map[string]any)["id"] != "toolu_managed_1" {
+				t.Fatalf("expected hidden managed tool_use block, got %+v", hiddenAssistantBlocks[0])
+			}
+			hiddenUser := rawMessages[2].(map[string]any)
+			hiddenUserBlocks, _ := hiddenUser["content"].([]any)
+			if hiddenUser["role"] != "user" || len(hiddenUserBlocks) != 1 || hiddenUserBlocks[0].(map[string]any)["type"] != "tool_result" {
+				t.Fatalf("expected hidden managed tool_result after tool_use, got %+v", hiddenUser)
+			}
+			nativeAssistant := rawMessages[3].(map[string]any)
+			nativeAssistantBlocks, _ := nativeAssistant["content"].([]any)
+			if nativeAssistant["role"] != "assistant" || len(nativeAssistantBlocks) != 1 {
+				t.Fatalf("expected native tool_use after injected hidden rounds, got %+v", nativeAssistant)
+			}
+			if nativeAssistantBlocks[0].(map[string]any)["id"] != "toolu_native_1" {
+				t.Fatalf("expected native tool_use id preserved, got %+v", nativeAssistantBlocks[0])
+			}
+			nativeUser := rawMessages[4].(map[string]any)
+			nativeUserBlocks, _ := nativeUser["content"].([]any)
+			if nativeUser["role"] != "user" || len(nativeUserBlocks) != 1 || nativeUserBlocks[0].(map[string]any)["tool_use_id"] != "toolu_native_1" {
+				t.Fatalf("expected native tool_result after injected hidden rounds, got %+v", nativeUser)
+			}
+			_, _ = w.Write([]byte(`{
+				"id":"msg_final",
+				"type":"message",
+				"content":[{"type":"text","text":"native handoff complete"}],
+				"stop_reason":"end_turn",
+				"usage":{"input_tokens":6,"output_tokens":5}
+			}`))
+		default:
+			t.Fatalf("unexpected anthropic round %d", anthropicCalls)
+		}
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+	body := `{
+		"model":"claude-sonnet-4-20250514",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"name":"runner_local","description":"native runner tool","input_schema":{"type":"object"}}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "\"runner_local\"") {
+		t.Fatalf("expected native anthropic tool_use to be returned to runner, got %s", w.Body.String())
+	}
+	if anthropicCalls != 2 {
+		t.Fatalf("expected two anthropic rounds before handoff, got %d", anthropicCalls)
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected one managed tool execution before handoff, got %d", toolCalls)
+	}
+
+	followupReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(`{
+		"model":"claude-sonnet-4-20250514",
+		"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":[{"type":"tool_use","id":"toolu_native_1","name":"runner_local","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_native_1","content":"{\"native\":true}"}]}
+		],
+		"tools":[{"name":"runner_local","description":"native runner tool","input_schema":{"type":"object"}}]
+	}`))
+	followupReq.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	followupReq.Header.Set("Content-Type", "application/json")
+	followupReq.Header.Set("Anthropic-Version", "2023-06-01")
+	followupW := httptest.NewRecorder()
+
+	h.ServeHTTP(followupW, followupReq)
+
+	if followupW.Code != http.StatusOK {
+		t.Fatalf("expected follow-up request 200, got %d: %s", followupW.Code, followupW.Body.String())
+	}
+	if !strings.Contains(followupW.Body.String(), "native handoff complete") {
+		t.Fatalf("expected final anthropic text after native handoff, got %s", followupW.Body.String())
+	}
+	if anthropicCalls != 3 {
+		t.Fatalf("expected third anthropic round after runner tool result, got %d", anthropicCalls)
 	}
 }
 

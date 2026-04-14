@@ -221,20 +221,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 
 		managedCalls, nativeCalls := partitionManagedOpenAIToolCalls(agentCtx, toolCalls)
 		if len(managedCalls) == 0 {
-			if len(toolTrace) > 0 || len(hiddenMessages) > 0 {
-				msg := "runner-native tool calls after managed tool rounds are not supported in one request"
-				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
-				if streamKeepalive != nil && downstreamStream {
-					streamKeepalive.writeOpenAIError(jsonErrorPayload(msg))
-					h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), fmt.Errorf(msg))
-					return
-				}
-				h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
-				return
-			}
-
 			responseBytes := resp.Body
-			responseHeader := resp.Header.Clone()
 			if downstreamStream {
 				sse, synthErr := synthesizeOpenAIToolCallStream(resp.Body, resp.UpstreamModel, usageAgg, downstreamIncludeUsage)
 				if synthErr != nil {
@@ -249,13 +236,21 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				}
 				streamKeepalive.writeFinal(sse)
 				responseBytes = sse
-				responseHeader = syntheticSSEHeader()
 			} else {
 				copyResponseHeaders(w.Header(), resp.Header)
 				w.WriteHeader(resp.StatusCode)
 				if len(resp.Body) > 0 {
 					_, _ = w.Write(resp.Body)
 				}
+			}
+			if len(toolTrace) > 0 || len(hiddenMessages) > 0 {
+				h.managedTurns.ObserveNativeToolCallAssistant(agentID, assistantMessage, hiddenMessages)
+				h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds())
+				return
+			}
+			responseHeader := resp.Header.Clone()
+			if downstreamStream {
+				responseHeader = syntheticSSEHeader()
 			}
 			h.recordResponse(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseHeader, responseBytes, start)
 			return
@@ -417,20 +412,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 
 		managedToolUses, nativeToolUses := partitionManagedAnthropicToolUses(agentCtx, toolUses)
 		if len(managedToolUses) == 0 {
-			if len(toolTrace) > 0 || len(hiddenMessages) > 0 {
-				msg := "runner-native tool calls after managed tool rounds are not supported in one request"
-				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
-				if streamKeepalive != nil && downstreamStream {
-					streamKeepalive.writeAnthropicError(msg)
-					h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), fmt.Errorf(msg))
-					return
-				}
-				h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
-				return
-			}
-
 			responseBytes := resp.Body
-			responseHeader := resp.Header.Clone()
 			if downstreamStream {
 				sse, synthErr := synthesizeAnthropicToolUseStream(resp.Body, resp.UpstreamModel, usageAgg)
 				if synthErr != nil {
@@ -445,13 +427,21 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				}
 				streamKeepalive.writeFinal(sse)
 				responseBytes = sse
-				responseHeader = syntheticSSEHeader()
 			} else {
 				copyResponseHeaders(w.Header(), resp.Header)
 				w.WriteHeader(resp.StatusCode)
 				if len(resp.Body) > 0 {
 					_, _ = w.Write(resp.Body)
 				}
+			}
+			if len(toolTrace) > 0 || len(hiddenMessages) > 0 {
+				h.managedAnthropicTurns.ObserveNativeToolUseAssistant(agentID, assistantMessage, hiddenMessages)
+				h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds())
+				return
+			}
+			responseHeader := resp.Header.Clone()
+			if downstreamStream {
+				responseHeader = syntheticSSEHeader()
 			}
 			h.recordResponse(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseHeader, responseBytes, start)
 			return
