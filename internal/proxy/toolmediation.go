@@ -38,7 +38,7 @@ var (
 
 const managedToolModeMessage = "This request is in mediated mode. Action required: re-emit only managed service tools for this turn, or respond in text."
 
-const mixedToolOrderMessage = "mixed managed and runner-native tool calls are only supported when managed service tools come first. Re-emit managed service tools first, then emit runner-native tool calls in a later response."
+const mixedToolOrderMessage = "mixed managed and runner-native tool calls are not supported in one model response unless managed service tools come first. Re-emit managed service tools first, then emit runner-native tool calls in a later response."
 
 const managedMixedPrefixSerializedIntervention = "managed_prefix_native_suffix_serialized"
 
@@ -289,15 +289,14 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
 			return
 		}
-		if ownership == openAIToolsManagedThenNative {
-			h.logger.LogIntervention(agentID, requestedModel, managedMixedPrefixSerializedIntervention)
-		}
-
 		if len(toolTrace) >= policy.MaxRounds {
 			msg := fmt.Sprintf("managed tool max rounds exceeded (%d)", policy.MaxRounds)
 			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
 			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
 			return
+		}
+		if ownership == openAIToolsManagedThenNative {
+			h.logger.LogIntervention(agentID, requestedModel, managedMixedPrefixSerializedIntervention)
 		}
 
 		toolMessages := make([]any, 0, len(toolCalls))
@@ -339,6 +338,9 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			managedAssistant = buildOpenAIAssistantMessage(assistantMessage, managedCalls, true)
 		}
 		appendOpenAIAssistantAndToolMessages(payload, managedAssistant, toolMessages)
+		// Persist the filtered managed-only assistant so the hidden continuity
+		// transcript matches the serialized round the model actually saw before
+		// the runner-native handoff.
 		hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, managedAssistant, toolMessages)
 	}
 }
@@ -487,15 +489,14 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
 			return
 		}
-		if ownership == anthropicToolsManagedThenNative {
-			h.logger.LogIntervention(agentID, requestedModel, managedMixedPrefixSerializedIntervention)
-		}
-
 		if len(toolTrace) >= policy.MaxRounds {
 			msg := fmt.Sprintf("managed tool max rounds exceeded (%d)", policy.MaxRounds)
 			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
 			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
 			return
+		}
+		if ownership == anthropicToolsManagedThenNative {
+			h.logger.LogIntervention(agentID, requestedModel, managedMixedPrefixSerializedIntervention)
 		}
 
 		toolResults := make([]map[string]any, 0, len(toolUses))
@@ -533,6 +534,9 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			managedAssistant = buildAnthropicAssistantMessage(assistantMessage, managedToolUses, true)
 		}
 		toolResultMessage := appendAnthropicAssistantAndToolResultMessages(payload, managedAssistant, toolResults)
+		// Persist the filtered managed-only assistant so the hidden continuity
+		// transcript matches the serialized round the model actually saw before
+		// the runner-native handoff.
 		hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, managedAssistant, toolResultMessage)
 	}
 }
@@ -1177,7 +1181,7 @@ func filterAnthropicToolUseContent(content any, calls []anthropicToolUse, includ
 	}
 	blocks, _ := content.([]any)
 	out := make([]any, 0, len(blocks))
-	for _, raw := range blocks {
+	for i, raw := range blocks {
 		block, _ := raw.(map[string]any)
 		if block == nil {
 			if includeText {
@@ -1188,7 +1192,14 @@ func filterAnthropicToolUseContent(content any, calls []anthropicToolUse, includ
 		blockType, _ := block["type"].(string)
 		if blockType == "tool_use" {
 			blockID, _ := block["id"].(string)
-			if _, ok := selected[strings.TrimSpace(blockID)]; ok {
+			selectedID := strings.TrimSpace(blockID)
+			if selectedID == "" {
+				// parseAnthropicToolResponse synthesizes toolu_<content-index> ids
+				// for id-less tool_use blocks; mirror that mapping here so the
+				// managed prefix can be filtered back out consistently.
+				selectedID = fmt.Sprintf("toolu_%d", i+1)
+			}
+			if _, ok := selected[selectedID]; ok {
 				out = append(out, cloneAnyMap(block))
 			}
 			continue
@@ -1204,6 +1215,8 @@ func cloneAnyMap(in map[string]any) map[string]any {
 	if in == nil {
 		return map[string]any{}
 	}
+	// Intentionally shallow: callers replace top-level keys but otherwise treat
+	// nested values as immutable snapshots of the captured assistant message.
 	out := make(map[string]any, len(in))
 	for key, value := range in {
 		out[key] = value

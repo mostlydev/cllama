@@ -2648,6 +2648,43 @@ func TestHandlerSerializesManagedPrefixBeforeNativeAnthropicToolUse(t *testing.T
 	assertInterventionLogged(t, logs.Bytes(), managedMixedPrefixSerializedIntervention)
 }
 
+func TestBuildAnthropicAssistantMessageRetainsManagedBlockWhenUpstreamIDMissing(t *testing.T) {
+	assistantMessage, toolUses, err := parseAnthropicToolResponse([]byte(`{
+		"content":[
+			{"type":"text","text":"Checking managed context first."},
+			{"type":"tool_use","name":"trading-api.get_market_context","input":{}},
+			{"type":"tool_use","id":"toolu_native_1","name":"runner_local","input":{}}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("parse anthropic response: %v", err)
+	}
+	if len(toolUses) != 2 {
+		t.Fatalf("expected two parsed tool uses, got %d", len(toolUses))
+	}
+	if toolUses[0].ID != "toolu_2" {
+		t.Fatalf("expected synthetic id for id-less managed tool_use, got %q", toolUses[0].ID)
+	}
+
+	managedAssistant := buildAnthropicAssistantMessage(assistantMessage, toolUses[:1], true)
+	blocks, _ := managedAssistant["content"].([]any)
+	if len(blocks) != 2 {
+		t.Fatalf("expected text plus managed tool_use after filtering, got %+v", managedAssistant["content"])
+	}
+
+	first, _ := blocks[0].(map[string]any)
+	if first == nil || first["type"] != "text" {
+		t.Fatalf("expected leading text block preserved, got %+v", blocks[0])
+	}
+	second, _ := blocks[1].(map[string]any)
+	if second == nil || second["type"] != "tool_use" || second["name"] != "trading-api.get_market_context" {
+		t.Fatalf("expected managed tool_use preserved after synthetic-id filtering, got %+v", blocks[1])
+	}
+	if _, ok := second["id"]; ok {
+		t.Fatalf("expected filtered managed tool_use to preserve missing upstream id, got %+v", second)
+	}
+}
+
 func TestHandlerHandsOffNativeAnthropicToolUseAfterManagedRounds(t *testing.T) {
 	anthropicCalls := 0
 	toolCalls := 0
