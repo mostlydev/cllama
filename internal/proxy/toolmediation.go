@@ -38,6 +38,10 @@ var (
 
 const managedToolModeMessage = "This request is in mediated mode. Action required: re-emit only managed service tools for this turn, or respond in text."
 
+const mixedToolOrderMessage = "mixed managed and runner-native tool calls are only supported when managed service tools come first. Re-emit managed service tools first, then emit runner-native tool calls in a later response."
+
+const managedMixedPrefixSerializedIntervention = "managed_prefix_native_suffix_serialized"
+
 type capturedResponse struct {
 	StatusCode    int
 	Header        http.Header
@@ -116,6 +120,24 @@ type managedStreamKeepalive struct {
 	w       http.ResponseWriter
 	started bool
 }
+
+type openAIToolOwnership int
+
+const (
+	openAIToolsAllManaged openAIToolOwnership = iota
+	openAIToolsAllNative
+	openAIToolsManagedThenNative
+	openAIToolsUnsafeMixed
+)
+
+type anthropicToolOwnership int
+
+const (
+	anthropicToolsAllManaged anthropicToolOwnership = iota
+	anthropicToolsAllNative
+	anthropicToolsManagedThenNative
+	anthropicToolsUnsafeMixed
+)
 
 type limitedReadResult struct {
 	Body          []byte
@@ -219,8 +241,8 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			return
 		}
 
-		managedCalls, nativeCalls := partitionManagedOpenAIToolCalls(agentCtx, toolCalls)
-		if len(managedCalls) == 0 {
+		managedCalls, _, ownership := classifyOpenAIToolCalls(agentCtx, toolCalls)
+		if ownership == openAIToolsAllNative {
 			responseBytes := resp.Body
 			if downstreamStream {
 				sse, synthErr := synthesizeOpenAIToolCallStream(resp.Body, resp.UpstreamModel, usageAgg, downstreamIncludeUsage)
@@ -256,8 +278,8 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			return
 		}
 
-		if len(nativeCalls) > 0 {
-			msg := "mixed managed and runner-native tool calls are not supported in one model response"
+		if ownership == openAIToolsUnsafeMixed {
+			msg := mixedToolOrderMessage
 			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
 			if streamKeepalive != nil && downstreamStream {
 				streamKeepalive.writeOpenAIError(jsonErrorPayload(msg))
@@ -266,6 +288,9 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			}
 			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
 			return
+		}
+		if ownership == openAIToolsManagedThenNative {
+			h.logger.LogIntervention(agentID, requestedModel, managedMixedPrefixSerializedIntervention)
 		}
 
 		if len(toolTrace) >= policy.MaxRounds {
@@ -309,8 +334,12 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			})
 		}
 		toolTrace = append(toolTrace, roundTrace)
-		appendOpenAIAssistantAndToolMessages(payload, assistantMessage, toolMessages)
-		hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, assistantMessage, toolMessages)
+		managedAssistant := assistantMessage
+		if ownership == openAIToolsManagedThenNative {
+			managedAssistant = buildOpenAIAssistantMessage(assistantMessage, managedCalls, true)
+		}
+		appendOpenAIAssistantAndToolMessages(payload, managedAssistant, toolMessages)
+		hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, managedAssistant, toolMessages)
 	}
 }
 
@@ -410,8 +439,8 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			return
 		}
 
-		managedToolUses, nativeToolUses := partitionManagedAnthropicToolUses(agentCtx, toolUses)
-		if len(managedToolUses) == 0 {
+		managedToolUses, _, ownership := classifyAnthropicToolUses(agentCtx, toolUses)
+		if ownership == anthropicToolsAllNative {
 			responseBytes := resp.Body
 			if downstreamStream {
 				sse, synthErr := synthesizeAnthropicToolUseStream(resp.Body, resp.UpstreamModel, usageAgg)
@@ -447,8 +476,8 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			return
 		}
 
-		if len(nativeToolUses) > 0 {
-			msg := "mixed managed and runner-native tool calls are not supported in one model response"
+		if ownership == anthropicToolsUnsafeMixed {
+			msg := mixedToolOrderMessage
 			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
 			if streamKeepalive != nil && downstreamStream {
 				streamKeepalive.writeAnthropicError(msg)
@@ -457,6 +486,9 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			}
 			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
 			return
+		}
+		if ownership == anthropicToolsManagedThenNative {
+			h.logger.LogIntervention(agentID, requestedModel, managedMixedPrefixSerializedIntervention)
 		}
 
 		if len(toolTrace) >= policy.MaxRounds {
@@ -496,8 +528,12 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			toolResults = append(toolResults, anthropicToolResultBlock(call.ID, outcome.RawJSON))
 		}
 		toolTrace = append(toolTrace, roundTrace)
-		toolResultMessage := appendAnthropicAssistantAndToolResultMessages(payload, assistantMessage, toolResults)
-		hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, assistantMessage, toolResultMessage)
+		managedAssistant := assistantMessage
+		if ownership == anthropicToolsManagedThenNative {
+			managedAssistant = buildAnthropicAssistantMessage(assistantMessage, managedToolUses, true)
+		}
+		toolResultMessage := appendAnthropicAssistantAndToolResultMessages(payload, managedAssistant, toolResults)
+		hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, managedAssistant, toolResultMessage)
 	}
 }
 
@@ -1025,36 +1061,154 @@ func parseAnthropicToolResponse(body []byte) (map[string]any, []anthropicToolUse
 	}
 }
 
-func partitionManagedOpenAIToolCalls(agentCtx *agentctx.AgentContext, calls []openAIToolCall) ([]openAIToolCall, []openAIToolCall) {
+func classifyOpenAIToolCalls(agentCtx *agentctx.AgentContext, calls []openAIToolCall) ([]openAIToolCall, []openAIToolCall, openAIToolOwnership) {
 	if len(calls) == 0 {
-		return nil, nil
+		return nil, nil, openAIToolsAllManaged
 	}
 	managed := make([]openAIToolCall, 0, len(calls))
 	native := make([]openAIToolCall, 0, len(calls))
+	sawManaged := false
+	sawNative := false
 	for _, call := range calls {
 		if _, ok := resolveManagedTool(agentCtx, call.Name); ok {
+			if sawNative {
+				managed = append(managed, call)
+				return managed, native, openAIToolsUnsafeMixed
+			}
+			sawManaged = true
 			managed = append(managed, call)
 			continue
 		}
+		sawNative = true
 		native = append(native, call)
 	}
-	return managed, native
+	switch {
+	case sawManaged && sawNative:
+		return managed, native, openAIToolsManagedThenNative
+	case sawManaged:
+		return managed, nil, openAIToolsAllManaged
+	default:
+		return nil, native, openAIToolsAllNative
+	}
 }
 
-func partitionManagedAnthropicToolUses(agentCtx *agentctx.AgentContext, calls []anthropicToolUse) ([]anthropicToolUse, []anthropicToolUse) {
+func classifyAnthropicToolUses(agentCtx *agentctx.AgentContext, calls []anthropicToolUse) ([]anthropicToolUse, []anthropicToolUse, anthropicToolOwnership) {
 	if len(calls) == 0 {
-		return nil, nil
+		return nil, nil, anthropicToolsAllManaged
 	}
 	managed := make([]anthropicToolUse, 0, len(calls))
 	native := make([]anthropicToolUse, 0, len(calls))
+	sawManaged := false
+	sawNative := false
 	for _, call := range calls {
 		if _, ok := resolveManagedTool(agentCtx, call.Name); ok {
+			if sawNative {
+				managed = append(managed, call)
+				return managed, native, anthropicToolsUnsafeMixed
+			}
+			sawManaged = true
 			managed = append(managed, call)
 			continue
 		}
+		sawNative = true
 		native = append(native, call)
 	}
-	return managed, native
+	switch {
+	case sawManaged && sawNative:
+		return managed, native, anthropicToolsManagedThenNative
+	case sawManaged:
+		return managed, nil, anthropicToolsAllManaged
+	default:
+		return nil, native, anthropicToolsAllNative
+	}
+}
+
+func buildOpenAIAssistantMessage(base map[string]any, calls []openAIToolCall, includeContent bool) map[string]any {
+	msg := cloneAnyMap(base)
+	msg["role"] = "assistant"
+	if !includeContent {
+		delete(msg, "content")
+	}
+	delete(msg, "tool_calls")
+	delete(msg, "function_call")
+	msg["tool_calls"] = serializeOpenAIToolCalls(calls)
+	return msg
+}
+
+func buildAnthropicAssistantMessage(base map[string]any, calls []anthropicToolUse, includeText bool) map[string]any {
+	msg := cloneAnyMap(base)
+	msg["role"] = "assistant"
+	msg["content"] = filterAnthropicToolUseContent(base["content"], calls, includeText)
+	return msg
+}
+
+func serializeOpenAIToolCalls(calls []openAIToolCall) []any {
+	out := make([]any, 0, len(calls))
+	for _, call := range calls {
+		args := strings.TrimSpace(string(call.ArgumentsRaw))
+		if args == "" {
+			if len(call.Arguments) > 0 {
+				if raw, err := json.Marshal(call.Arguments); err == nil {
+					args = string(raw)
+				}
+			}
+			if args == "" {
+				args = "{}"
+			}
+		}
+		out = append(out, map[string]any{
+			"id":   call.ID,
+			"type": "function",
+			"function": map[string]any{
+				"name":      call.Name,
+				"arguments": args,
+			},
+		})
+	}
+	return out
+}
+
+func filterAnthropicToolUseContent(content any, calls []anthropicToolUse, includeText bool) []any {
+	selected := make(map[string]struct{}, len(calls))
+	for _, call := range calls {
+		if id := strings.TrimSpace(call.ID); id != "" {
+			selected[id] = struct{}{}
+		}
+	}
+	blocks, _ := content.([]any)
+	out := make([]any, 0, len(blocks))
+	for _, raw := range blocks {
+		block, _ := raw.(map[string]any)
+		if block == nil {
+			if includeText {
+				out = append(out, raw)
+			}
+			continue
+		}
+		blockType, _ := block["type"].(string)
+		if blockType == "tool_use" {
+			blockID, _ := block["id"].(string)
+			if _, ok := selected[strings.TrimSpace(blockID)]; ok {
+				out = append(out, cloneAnyMap(block))
+			}
+			continue
+		}
+		if includeText {
+			out = append(out, cloneAnyMap(block))
+		}
+	}
+	return out
+}
+
+func cloneAnyMap(in map[string]any) map[string]any {
+	if in == nil {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func appendOpenAIAssistantAndToolMessages(payload map[string]any, assistantMessage map[string]any, toolMessages []any) {
