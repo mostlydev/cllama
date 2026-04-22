@@ -72,7 +72,7 @@ type memoryBlock struct {
 	TS     string  `json:"ts,omitempty"`
 }
 
-func (h *Handler) recallOpenAIMemory(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any) {
+func (h *Handler) recallOpenAIMemory(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any) string {
 	block, err := h.recallMemory(reqCtx, agentID, agentCtx, requestedModel, memoryRecallRequest{
 		AgentID:  agentID,
 		Pod:      agentCtx.MetadataString("pod"),
@@ -80,14 +80,15 @@ func (h *Handler) recallOpenAIMemory(reqCtx context.Context, agentID string, age
 		Metadata: memoryMetadata(agentCtx, "openai", requestedModel),
 	})
 	if err != nil {
-		return
+		return ""
 	}
 	if block != "" {
 		feeds.InjectOpenAI(payload, block)
 	}
+	return block
 }
 
-func (h *Handler) recallAnthropicMemory(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any) {
+func (h *Handler) recallAnthropicMemory(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any) string {
 	block, err := h.recallMemory(reqCtx, agentID, agentCtx, requestedModel, memoryRecallRequest{
 		AgentID:  agentID,
 		Pod:      agentCtx.MetadataString("pod"),
@@ -96,11 +97,12 @@ func (h *Handler) recallAnthropicMemory(reqCtx context.Context, agentID string, 
 		Metadata: memoryMetadata(agentCtx, "anthropic", requestedModel),
 	})
 	if err != nil {
-		return
+		return ""
 	}
 	if block != "" {
 		feeds.InjectAnthropic(payload, block)
 	}
+	return block
 }
 
 func (h *Handler) recallMemory(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload memoryRecallRequest) (string, error) {

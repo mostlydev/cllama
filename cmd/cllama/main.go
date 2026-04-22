@@ -64,6 +64,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	logger := logging.New(stdout)
 	pricing := cost.DefaultPricing()
 	acc := cost.NewAccumulator()
+	snapshots := proxy.NewContextSnapshotStore()
 
 	var recorder *sessionhistory.Recorder
 	if cfg.SessionHistoryDir != "" {
@@ -72,12 +73,12 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 	apiServer := &http.Server{
 		Addr:              cfg.APIAddr,
-		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, recorder, cfg.UIToken),
+		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, recorder, cfg.UIToken, snapshots),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	uiServer := &http.Server{
 		Addr:              cfg.UIAddr,
-		Handler:           newUIHandler(reg, acc, cfg.ContextRoot, cfg.UIToken),
+		Handler:           newUIHandler(reg, acc, cfg.ContextRoot, cfg.UIToken, snapshots),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -114,9 +115,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder, adminToken string) http.Handler {
+func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder, adminToken string, snapshots *proxy.ContextSnapshotStore) http.Handler {
 	mux := http.NewServeMux()
-	opts := []proxy.HandlerOption{proxy.WithCostTracking(acc, pricing)}
+	opts := []proxy.HandlerOption{proxy.WithCostTracking(acc, pricing), proxy.WithSnapshotStore(snapshots)}
 	if podName != "" {
 		opts = append(opts, proxy.WithFeeds(podName))
 	}
@@ -139,9 +140,9 @@ func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.L
 	return mux
 }
 
-func newUIHandler(reg *provider.Registry, acc *cost.Accumulator, contextRoot, uiToken string) http.Handler {
+func newUIHandler(reg *provider.Registry, acc *cost.Accumulator, contextRoot, uiToken string, snapshots *proxy.ContextSnapshotStore) http.Handler {
 	mux := http.NewServeMux()
-	opts := []ui.UIOption{ui.WithAccumulator(acc), ui.WithContextRoot(contextRoot)}
+	opts := []ui.UIOption{ui.WithAccumulator(acc), ui.WithContextRoot(contextRoot), ui.WithSnapshotStore(snapshots)}
 	if uiToken != "" {
 		opts = append(opts, ui.WithUIToken(uiToken))
 	}

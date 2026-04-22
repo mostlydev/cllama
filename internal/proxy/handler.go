@@ -39,6 +39,7 @@ type Handler struct {
 	managedAnthropicTurns *managedAnthropicContinuityStore
 	sessionRecorder       *sessionhistory.Recorder
 	adminToken            string
+	snapshots             *ContextSnapshotStore
 }
 
 // HandlerOption configures optional Handler behaviour.
@@ -92,6 +93,19 @@ func WithAdminToken(token string) HandlerOption {
 	}
 }
 
+func WithSnapshotStore(store *ContextSnapshotStore) HandlerOption {
+	return func(h *Handler) {
+		if store != nil {
+			h.snapshots = store
+		}
+	}
+}
+
+type fetchedFeedContext struct {
+	Combined string
+	Blocks   []string
+}
+
 func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger *logging.Logger, opts ...HandlerOption) *Handler {
 	if registry == nil {
 		registry = provider.NewRegistry("")
@@ -111,6 +125,7 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 		logger:                logger,
 		managedTurns:          newManagedOpenAIContinuityStore(defaultManagedToolContinuityTurns),
 		managedAnthropicTurns: newManagedAnthropicContinuityStore(defaultManagedToolContinuityTurns),
+		snapshots:             NewContextSnapshotStore(),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -118,18 +133,19 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 	return h
 }
 
-func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext) string {
+func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext) fetchedFeedContext {
+	var out fetchedFeedContext
 	if h.feedFetcher == nil || agentCtx == nil || agentCtx.ContextDir == "" {
-		return ""
+		return out
 	}
 
 	entries, err := feeds.LoadManifest(agentCtx.ContextDir)
 	if err != nil {
 		h.logger.LogError(agentID, "", 0, 0, fmt.Errorf("load feed manifest: %w", err))
-		return ""
+		return out
 	}
 	if len(entries) == 0 {
-		return ""
+		return out
 	}
 
 	results := make([]feeds.FeedResult, 0, len(entries))
@@ -140,7 +156,13 @@ func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *a
 		}
 		results = append(results, result)
 	}
-	return feeds.FormatAllFeeds(results)
+	for _, result := range results {
+		if block := feeds.FormatFeedBlock(result); block != "" {
+			out.Blocks = append(out.Blocks, block)
+		}
+	}
+	out.Combined = feeds.FormatAllFeeds(results)
+	return out
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -198,18 +220,21 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	downstreamStream, downstreamIncludeUsage := requestedOpenAIStreamOptions(payload)
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
+	managedTool := hasManagedTools(agentCtx)
 	h.logToolManifestState(agentID, requestedModel, agentCtx)
-	if hasManagedTools(agentCtx) {
+	if managedTool {
 		// Continuity reinjection must happen before memory recall and feed/time
 		// injection so both the recall backend and the upstream model see the
 		// effective transcript that produced the runner-visible assistant reply.
 		h.managedTurns.Inject(agentID, payload)
 	}
-	h.recallOpenAIMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
-	if feedBlock := h.fetchFeeds(r.Context(), agentID, agentCtx); feedBlock != "" {
-		feeds.InjectOpenAI(payload, feedBlock)
+	memoryRecall := h.recallOpenAIMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
+	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx)
+	if feedCtx.Combined != "" {
+		feeds.InjectOpenAI(payload, feedCtx.Combined)
 	}
-	feeds.InjectOpenAI(payload, currentTimeLine(agentCtx, time.Now()))
+	timeContext := currentTimeLine(agentCtx, time.Now())
+	feeds.InjectOpenAI(payload, timeContext)
 	if err := injectManagedOpenAITools(payload, agentCtx); err != nil {
 		h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
 		return
@@ -223,6 +248,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		h.fail(w, status, err.Error(), agentID, requestedModel, start, err)
 		return
 	}
+	h.captureContextSnapshot(agentID, "openai", requestedModel, payload, resolution, feedCtx.Blocks, memoryRecall, timeContext, managedTool, 1)
 
 	if h.accumulator != nil && h.pricing != nil && isStreamingChatCompletions(r.URL.Path, payload) {
 		ensureStreamUsage(payload)
@@ -230,7 +256,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	if resolution.Intervention != "" {
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}
-	if hasManagedTools(agentCtx) {
+	if managedTool {
 		h.handleManagedOpenAI(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, downstreamStream, downstreamIncludeUsage, start)
 		return
 	}
@@ -280,20 +306,23 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	downstreamStream := requestedStream(payload)
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
+	managedTool := hasManagedTools(agentCtx)
 	h.logToolManifestState(agentID, requestedModel, agentCtx)
-	if hasManagedTools(agentCtx) {
+	if managedTool {
 		// Anthropic continuity reinjection follows the same rule as OpenAI:
 		// hidden mediated turns must be restored before recall/feed injection so
 		// the effective transcript seen by recall and the upstream model is the
 		// one that produced the runner-visible assistant reply.
 		h.managedAnthropicTurns.Inject(agentID, payload)
 	}
-	h.recallAnthropicMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
-	if feedBlock := h.fetchFeeds(r.Context(), agentID, agentCtx); feedBlock != "" {
-		feeds.InjectAnthropic(payload, feedBlock)
+	memoryRecall := h.recallAnthropicMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
+	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx)
+	if feedCtx.Combined != "" {
+		feeds.InjectAnthropic(payload, feedCtx.Combined)
 	}
-	feeds.InjectAnthropic(payload, currentTimeLine(agentCtx, time.Now()))
-	if hasManagedTools(agentCtx) {
+	timeContext := currentTimeLine(agentCtx, time.Now())
+	feeds.InjectAnthropic(payload, timeContext)
+	if managedTool {
 		if err := injectManagedAnthropicTools(payload, agentCtx); err != nil {
 			h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
 			return
@@ -308,10 +337,11 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		h.fail(w, status, err.Error(), agentID, requestedModel, start, err)
 		return
 	}
+	h.captureContextSnapshot(agentID, "anthropic", requestedModel, payload, resolution, feedCtx.Blocks, memoryRecall, timeContext, managedTool, 1)
 	if resolution.Intervention != "" {
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}
-	if hasManagedTools(agentCtx) {
+	if managedTool {
 		h.handleManagedAnthropic(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, downstreamStream, start)
 		return
 	}

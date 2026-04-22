@@ -17,6 +17,7 @@ import (
 	"github.com/mostlydev/cllama/internal/cost"
 	"github.com/mostlydev/cllama/internal/logging"
 	"github.com/mostlydev/cllama/internal/provider"
+	"github.com/mostlydev/cllama/internal/proxy"
 	"github.com/mostlydev/cllama/internal/sessionhistory"
 )
 
@@ -76,8 +77,9 @@ func TestDualServerIntegrationSmoke(t *testing.T) {
 	}
 	pricing := cost.DefaultPricing()
 	acc := cost.NewAccumulator()
-	apiHandler := newAPIHandler(contextRoot, reg, logging.New(io.Discard), acc, pricing, "test-pod", nil, "")
-	uiHandler := newUIHandler(reg, acc, contextRoot, "")
+	snapshots := proxy.NewContextSnapshotStore()
+	apiHandler := newAPIHandler(contextRoot, reg, logging.New(io.Discard), acc, pricing, "test-pod", nil, "", snapshots)
+	uiHandler := newUIHandler(reg, acc, contextRoot, "", snapshots)
 
 	apiServer := &http.Server{Handler: apiHandler}
 	uiServer := &http.Server{Handler: uiHandler}
@@ -145,6 +147,40 @@ func TestDualServerIntegrationSmoke(t *testing.T) {
 	if !bytes.Contains(uiBody, []byte("openai")) {
 		t.Fatalf("expected provider list in UI body: %s", string(uiBody))
 	}
+
+	indexResp, err := http.Get("http://" + uiLn.Addr().String() + "/internal/context")
+	if err != nil {
+		t.Fatalf("ui context index call failed: %v", err)
+	}
+	defer indexResp.Body.Close()
+	if indexResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected context index status 200, got %d", indexResp.StatusCode)
+	}
+	var index struct {
+		Agents []string `json:"agents"`
+	}
+	if err := json.NewDecoder(indexResp.Body).Decode(&index); err != nil {
+		t.Fatalf("decode context index: %v", err)
+	}
+	if len(index.Agents) != 1 || index.Agents[0] != "tiverton" {
+		t.Fatalf("unexpected context index payload: %+v", index)
+	}
+
+	snapshotResp, err := http.Get("http://" + uiLn.Addr().String() + "/internal/context/tiverton/snapshot")
+	if err != nil {
+		t.Fatalf("ui context snapshot call failed: %v", err)
+	}
+	defer snapshotResp.Body.Close()
+	if snapshotResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected context snapshot status 200, got %d", snapshotResp.StatusCode)
+	}
+	var snapshot proxy.ContextSnapshot
+	if err := json.NewDecoder(snapshotResp.Body).Decode(&snapshot); err != nil {
+		t.Fatalf("decode context snapshot: %v", err)
+	}
+	if snapshot.AgentID != "tiverton" || snapshot.Format != "openai" {
+		t.Fatalf("unexpected context snapshot payload: %+v", snapshot)
+	}
 }
 
 func TestConfigFromEnvSessionHistoryDir(t *testing.T) {
@@ -194,7 +230,7 @@ func TestAPIHistoryEndpointAllowsAgentAndDedicatedReplayAuth(t *testing.T) {
 		}
 	}
 
-	apiHandler := newAPIHandler(contextRoot, provider.NewRegistry(""), logging.New(io.Discard), cost.NewAccumulator(), cost.DefaultPricing(), "", recorder, "")
+	apiHandler := newAPIHandler(contextRoot, provider.NewRegistry(""), logging.New(io.Discard), cost.NewAccumulator(), cost.DefaultPricing(), "", recorder, "", nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/history/tiverton?limit=1", nil)
 	req.Header.Set("Authorization", "Bearer history-token")
@@ -273,7 +309,7 @@ func TestAPIHistoryEndpointAllowsAdminTokenAndRejectsWrongBearer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	apiHandler := newAPIHandler(contextRoot, provider.NewRegistry(""), logging.New(io.Discard), cost.NewAccumulator(), cost.DefaultPricing(), "", recorder, "ui-secret")
+	apiHandler := newAPIHandler(contextRoot, provider.NewRegistry(""), logging.New(io.Discard), cost.NewAccumulator(), cost.DefaultPricing(), "", recorder, "ui-secret", nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/history/tiverton", nil)
 	req.Header.Set("Authorization", "Bearer wrong-token")

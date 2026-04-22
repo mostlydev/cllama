@@ -12,6 +12,7 @@ import (
 
 	"github.com/mostlydev/cllama/internal/cost"
 	"github.com/mostlydev/cllama/internal/provider"
+	"github.com/mostlydev/cllama/internal/proxy"
 )
 
 func TestMaskKey(t *testing.T) {
@@ -161,6 +162,57 @@ func TestUITokenDisabledAllowsAll(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200 without token configured, got %d", w.Code)
+	}
+}
+
+func TestUIContextSnapshotEndpoints(t *testing.T) {
+	store := proxy.NewContextSnapshotStore()
+	store.Put(proxy.ContextSnapshot{
+		AgentID:        "alpha",
+		CapturedAt:     time.Date(2026, 4, 17, 20, 15, 0, 0, time.UTC),
+		Format:         "openai",
+		System:         "system prompt",
+		RequestedModel: "xai/grok-4.1-fast",
+		TurnCount:      2,
+	})
+
+	h := NewHandler(provider.NewRegistry(t.TempDir()), WithSnapshotStore(store))
+
+	req := httptest.NewRequest(http.MethodGet, "/internal/context", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for index, got %d: %s", w.Code, w.Body.String())
+	}
+	var index struct {
+		Agents []string `json:"agents"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &index); err != nil {
+		t.Fatalf("unmarshal index: %v", err)
+	}
+	if len(index.Agents) != 1 || index.Agents[0] != "alpha" {
+		t.Fatalf("unexpected index payload: %+v", index)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/internal/context/alpha/snapshot", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for snapshot, got %d: %s", w.Code, w.Body.String())
+	}
+	var snapshot proxy.ContextSnapshot
+	if err := json.Unmarshal(w.Body.Bytes(), &snapshot); err != nil {
+		t.Fatalf("unmarshal snapshot: %v", err)
+	}
+	if snapshot.AgentID != "alpha" || snapshot.TurnCount != 2 || snapshot.Format != "openai" {
+		t.Fatalf("unexpected snapshot payload: %+v", snapshot)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/internal/context/missing/snapshot", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing snapshot, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"github.com/mostlydev/cllama/internal/agentctx"
 	"github.com/mostlydev/cllama/internal/cost"
 	"github.com/mostlydev/cllama/internal/provider"
+	"github.com/mostlydev/cllama/internal/proxy"
 )
 
 //go:embed templates/*.html
@@ -45,12 +46,21 @@ func WithUIToken(token string) UIOption {
 	}
 }
 
+func WithSnapshotStore(store *proxy.ContextSnapshotStore) UIOption {
+	return func(h *Handler) {
+		if store != nil {
+			h.snapshotStore = store
+		}
+	}
+}
+
 type Handler struct {
-	registry    *provider.Registry
-	accumulator *cost.Accumulator
-	contextRoot string
-	uiToken     string
-	tpl         *template.Template
+	registry      *provider.Registry
+	accumulator   *cost.Accumulator
+	contextRoot   string
+	uiToken       string
+	snapshotStore *proxy.ContextSnapshotStore
+	tpl           *template.Template
 }
 
 type providerRow struct {
@@ -125,6 +135,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.renderDashboard(w)
 	case r.Method == http.MethodGet && r.URL.Path == "/events":
 		h.handleSSE(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/internal/context":
+		h.handleContextIndex(w)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/internal/context/") && strings.HasSuffix(r.URL.Path, "/snapshot"):
+		h.handleContextSnapshot(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/costs/api":
 		h.handleCostsAPI(w)
 	case r.Method == http.MethodPost && r.URL.Path == "/providers/add":
@@ -184,6 +198,33 @@ func (h *Handler) handleCostsAPI(w http.ResponseWriter) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(resp)
+}
+
+func (h *Handler) handleContextIndex(w http.ResponseWriter) {
+	resp := struct {
+		Agents []string `json:"agents"`
+	}{
+		Agents: h.snapshotStore.AgentIDs(),
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (h *Handler) handleContextSnapshot(w http.ResponseWriter, r *http.Request) {
+	agentID := strings.TrimPrefix(r.URL.Path, "/internal/context/")
+	agentID = strings.TrimSuffix(agentID, "/snapshot")
+	agentID = strings.Trim(agentID, "/")
+	if agentID == "" || strings.Contains(agentID, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	snapshot, ok := h.snapshotStore.Get(agentID)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(snapshot)
 }
 
 func (h *Handler) buildCostsAPIResponse() costsAPIResponse {

@@ -152,6 +152,11 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 	streamKeepalive := newManagedStreamKeepalive(w, downstreamStream)
 
 	usageAgg := managedUsageAggregate{LoggedCostKnown: true}
+	defer func() {
+		if usageAgg.TotalRounds > 0 {
+			h.updateContextSnapshotTurnCount(agentID, usageAgg.TotalRounds)
+		}
+	}()
 	var toolTrace []sessionhistory.ToolRoundTrace
 	var hiddenMessages []json.RawMessage
 	var requestEffective []byte
@@ -352,6 +357,11 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 	streamKeepalive := newManagedStreamKeepalive(w, downstreamStream)
 
 	usageAgg := managedUsageAggregate{LoggedCostKnown: true}
+	defer func() {
+		if usageAgg.TotalRounds > 0 {
+			h.updateContextSnapshotTurnCount(agentID, usageAgg.TotalRounds)
+		}
+	}()
 	var toolTrace []sessionhistory.ToolRoundTrace
 	var hiddenMessages []json.RawMessage
 	var requestEffective []byte
