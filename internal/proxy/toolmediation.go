@@ -41,6 +41,7 @@ const managedToolModeMessage = "This request is in mediated mode. Action require
 const mixedToolOrderMessage = "mixed managed and runner-native tool calls are not supported in one model response unless managed service tools come first. Re-emit managed service tools first, then emit runner-native tool calls in a later response."
 
 const managedMixedPrefixSerializedIntervention = "managed_prefix_native_suffix_serialized"
+const mixedToolOrderInternalRetryIntervention = "mixed_tool_order_internal_retry"
 
 type capturedResponse struct {
 	StatusCode    int
@@ -283,22 +284,21 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			return
 		}
 
-		if ownership == openAIToolsUnsafeMixed {
-			msg := mixedToolOrderMessage
-			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
-			if streamKeepalive != nil && downstreamStream {
-				streamKeepalive.writeOpenAIError(jsonErrorPayload(msg))
-				h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), fmt.Errorf(msg))
-				return
-			}
-			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
-			return
-		}
 		if len(toolTrace) >= policy.MaxRounds {
 			msg := fmt.Sprintf("managed tool max rounds exceeded (%d)", policy.MaxRounds)
 			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
 			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
 			return
+		}
+
+		if ownership == openAIToolsUnsafeMixed {
+			h.logger.LogIntervention(agentID, requestedModel, mixedToolOrderInternalRetryIntervention)
+			toolMessages, roundTrace := buildOpenAIUnsafeMixedRetryRound(agentCtx, toolCalls, usage)
+			roundTrace.Round = len(toolTrace) + 1
+			toolTrace = append(toolTrace, roundTrace)
+			appendOpenAIAssistantAndToolMessages(payload, assistantMessage, toolMessages)
+			hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, assistantMessage, toolMessages)
+			continue
 		}
 		if ownership == openAIToolsManagedThenNative {
 			h.logger.LogIntervention(agentID, requestedModel, managedMixedPrefixSerializedIntervention)
@@ -488,22 +488,21 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			return
 		}
 
-		if ownership == anthropicToolsUnsafeMixed {
-			msg := mixedToolOrderMessage
-			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
-			if streamKeepalive != nil && downstreamStream {
-				streamKeepalive.writeAnthropicError(msg)
-				h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), fmt.Errorf(msg))
-				return
-			}
-			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
-			return
-		}
 		if len(toolTrace) >= policy.MaxRounds {
 			msg := fmt.Sprintf("managed tool max rounds exceeded (%d)", policy.MaxRounds)
 			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
 			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
 			return
+		}
+
+		if ownership == anthropicToolsUnsafeMixed {
+			h.logger.LogIntervention(agentID, requestedModel, mixedToolOrderInternalRetryIntervention)
+			toolResults, roundTrace := buildAnthropicUnsafeMixedRetryRound(agentCtx, toolUses, usage)
+			roundTrace.Round = len(toolTrace) + 1
+			toolTrace = append(toolTrace, roundTrace)
+			toolResultMessage := appendAnthropicAssistantAndToolResultMessages(payload, assistantMessage, toolResults)
+			hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, assistantMessage, toolResultMessage)
+			continue
 		}
 		if ownership == anthropicToolsManagedThenNative {
 			h.logger.LogIntervention(agentID, requestedModel, managedMixedPrefixSerializedIntervention)
@@ -1154,6 +1153,64 @@ func buildAnthropicAssistantMessage(base map[string]any, calls []anthropicToolUs
 	msg["role"] = "assistant"
 	msg["content"] = filterAnthropicToolUseContent(base["content"], calls, includeText)
 	return msg
+}
+
+func buildOpenAIUnsafeMixedRetryRound(agentCtx *agentctx.AgentContext, calls []openAIToolCall, usage cost.Usage) ([]any, sessionhistory.ToolRoundTrace) {
+	raw := mixedToolOrderRetryPayload()
+	toolMessages := make([]any, 0, len(calls))
+	roundTrace := sessionhistory.ToolRoundTrace{
+		RoundUsage: sessionhistory.Usage{
+			PromptTokens:     usage.PromptTokens,
+			CompletionTokens: usage.CompletionTokens,
+			ReportedCostUSD:  usage.ReportedCostUSD,
+		},
+	}
+	for _, call := range calls {
+		toolMessages = append(toolMessages, map[string]any{
+			"role":         "tool",
+			"tool_call_id": call.ID,
+			"content":      string(raw),
+		})
+		roundTrace.ToolCalls = append(roundTrace.ToolCalls, buildRejectedToolTrace(agentCtx, call.Name, call.ArgumentsRaw, raw))
+	}
+	return toolMessages, roundTrace
+}
+
+func buildAnthropicUnsafeMixedRetryRound(agentCtx *agentctx.AgentContext, calls []anthropicToolUse, usage cost.Usage) ([]map[string]any, sessionhistory.ToolRoundTrace) {
+	raw := mixedToolOrderRetryPayload()
+	toolResults := make([]map[string]any, 0, len(calls))
+	roundTrace := sessionhistory.ToolRoundTrace{
+		RoundUsage: sessionhistory.Usage{
+			PromptTokens:     usage.PromptTokens,
+			CompletionTokens: usage.CompletionTokens,
+			ReportedCostUSD:  usage.ReportedCostUSD,
+		},
+	}
+	for _, call := range calls {
+		toolResults = append(toolResults, anthropicToolResultBlock(call.ID, raw))
+		roundTrace.ToolCalls = append(roundTrace.ToolCalls, buildRejectedToolTrace(agentCtx, call.Name, call.ArgumentsRaw, raw))
+	}
+	return toolResults, roundTrace
+}
+
+func buildRejectedToolTrace(agentCtx *agentctx.AgentContext, name string, args json.RawMessage, raw []byte) sessionhistory.ToolCallTrace {
+	traceName := strings.TrimSpace(name)
+	service := ""
+	if resolved, ok := resolveManagedTool(agentCtx, name); ok {
+		traceName = resolved.CanonicalName
+		service = resolved.Manifest.Execution.Service
+	}
+	return sessionhistory.ToolCallTrace{
+		Name:       traceName,
+		Arguments:  append(json.RawMessage(nil), args...),
+		Result:     append(json.RawMessage(nil), raw...),
+		Service:    service,
+		StatusCode: http.StatusConflict,
+	}
+}
+
+func mixedToolOrderRetryPayload() []byte {
+	return toolErrorPayload("mixed_tool_order", mixedToolOrderMessage, http.StatusConflict, nil)
 }
 
 func serializeOpenAIToolCalls(calls []openAIToolCall) []any {
