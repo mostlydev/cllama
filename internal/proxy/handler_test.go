@@ -324,9 +324,11 @@ func TestHandlerPassesThroughNativeOpenAIToolCallsWhenManagedToolsArePresent(t *
 	}
 }
 
-func TestHandlerRejectsMixedManagedAndNativeOpenAIToolCalls(t *testing.T) {
+func TestHandlerRetriesUnsafeMixedOpenAIToolCallsInternally(t *testing.T) {
 	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
+	xaiCalls := 0
 	toolCalls := 0
+	var logs bytes.Buffer
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		toolCalls++
 		w.Header().Set("Content-Type", "application/json")
@@ -335,20 +337,76 @@ func TestHandlerRejectsMixedManagedAndNativeOpenAIToolCalls(t *testing.T) {
 	defer toolSrv.Close()
 
 	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		xaiCalls++
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"id":"chatcmpl-mixed",
-			"choices":[{
-				"finish_reason":"tool_calls",
-				"message":{
-					"role":"assistant",
-					"tool_calls":[
-						{"id":"call_native_1","type":"function","function":{"name":"runner_local","arguments":"{}"}},
-						{"id":"call_managed_1","type":"function","function":{"name":"` + presentedName + `","arguments":"{}"}}
-					]
+		switch xaiCalls {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-mixed",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"content":"I will use the local runner first, then get market context.",
+						"tool_calls":[
+							{"id":"call_native_1","type":"function","function":{"name":"runner_local","arguments":"{}"}},
+							{"id":"call_managed_1","type":"function","function":{"name":"` + presentedName + `","arguments":"{}"}}
+						]
+					}
+				}]
+			}`))
+		case 2:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read xai body: %v", err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal xai request: %v", err)
+			}
+			rawMessages, _ := payload["messages"].([]any)
+			conversation := make([]map[string]any, 0, len(rawMessages))
+			for _, raw := range rawMessages {
+				msg, _ := raw.(map[string]any)
+				if msg == nil {
+					continue
 				}
-			}]
-		}`))
+				if role, _ := msg["role"].(string); role == "system" {
+					continue
+				}
+				conversation = append(conversation, msg)
+			}
+			if len(conversation) != 4 {
+				t.Fatalf("expected unsafe mixed retry round to stay internal, got %+v", payload)
+			}
+			if conversation[0]["role"] != "user" || conversation[0]["content"] != "hi" {
+				t.Fatalf("unexpected first conversation message: %+v", conversation[0])
+			}
+			mixedAssistant := conversation[1]
+			mixedToolCalls, _ := mixedAssistant["tool_calls"].([]any)
+			if mixedAssistant["role"] != "assistant" || len(mixedToolCalls) != 2 {
+				t.Fatalf("expected full mixed tool-call assistant message, got %+v", mixedAssistant)
+			}
+			if mixedAssistant["content"] != "I will use the local runner first, then get market context." {
+				t.Fatalf("expected assistant content preserved, got %+v", mixedAssistant)
+			}
+			rejectedNative := conversation[2]
+			if rejectedNative["role"] != "tool" || rejectedNative["tool_call_id"] != "call_native_1" {
+				t.Fatalf("expected native tool rejection message, got %+v", rejectedNative)
+			}
+			assertToolErrorContains(t, rejectedNative["content"], mixedToolOrderMessage)
+			rejectedManaged := conversation[3]
+			if rejectedManaged["role"] != "tool" || rejectedManaged["tool_call_id"] != "call_managed_1" {
+				t.Fatalf("expected managed tool rejection message, got %+v", rejectedManaged)
+			}
+			assertToolErrorContains(t, rejectedManaged["content"], mixedToolOrderMessage)
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-replanned",
+				"choices":[{"message":{"role":"assistant","content":"Understood. I need to fetch managed context before I ask for local runner work."}}]
+			}`))
+		default:
+			t.Fatalf("unexpected xai round %d", xaiCalls)
+		}
 	}))
 	defer xaiBackend.Close()
 
@@ -357,7 +415,7 @@ func TestHandlerRejectsMixedManagedAndNativeOpenAIToolCalls(t *testing.T) {
 		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
 	})
 
-	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(&logs))
 	body := `{
 		"model":"xai/grok-4.1-fast",
 		"messages":[{"role":"user","content":"hi"}],
@@ -370,15 +428,19 @@ func TestHandlerRejectsMixedManagedAndNativeOpenAIToolCalls(t *testing.T) {
 
 	h.ServeHTTP(w, req)
 
-	if w.Code != http.StatusBadGateway {
-		t.Fatalf("expected 502, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "managed service tools come first") {
-		t.Fatalf("expected mixed tool-call error, got %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), "Understood. I need to fetch managed context before I ask for local runner work.") {
+		t.Fatalf("expected internal retry reply, got %s", w.Body.String())
 	}
 	if toolCalls != 0 {
-		t.Fatalf("expected no managed tool execution on mixed tool-call failure, got %d", toolCalls)
+		t.Fatalf("expected no managed tool execution during unsafe mixed retry, got %d", toolCalls)
 	}
+	if xaiCalls != 2 {
+		t.Fatalf("expected one internal retry round, got %d model calls", xaiCalls)
+	}
+	assertInterventionLogged(t, logs.Bytes(), mixedToolOrderInternalRetryIntervention)
 }
 
 func TestHandlerSerializesManagedPrefixBeforeNativeOpenAIToolCalls(t *testing.T) {
@@ -2422,9 +2484,11 @@ func TestHandlerPassesThroughNativeAnthropicToolUseWhenManagedToolsArePresent(t 
 	}
 }
 
-func TestHandlerRejectsMixedManagedAndNativeAnthropicToolUse(t *testing.T) {
+func TestHandlerRetriesUnsafeMixedAnthropicToolUsesInternally(t *testing.T) {
 	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
+	anthropicCalls := 0
 	toolCalls := 0
+	var logs bytes.Buffer
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		toolCalls++
 		w.Header().Set("Content-Type", "application/json")
@@ -2433,17 +2497,72 @@ func TestHandlerRejectsMixedManagedAndNativeAnthropicToolUse(t *testing.T) {
 	defer toolSrv.Close()
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		anthropicCalls++
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"id":"msg_mixed",
-			"type":"message",
-			"content":[
-				{"type":"tool_use","id":"toolu_native_1","name":"runner_local","input":{}},
-				{"type":"tool_use","id":"toolu_managed_1","name":"` + presentedName + `","input":{}}
-			],
-			"stop_reason":"tool_use",
-			"usage":{"input_tokens":8,"output_tokens":3}
-		}`))
+		switch anthropicCalls {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_unsafe_mixed",
+				"type":"message",
+				"role":"assistant",
+				"content":[
+					{"type":"text","text":"I will use the local runner first, then fetch managed context."},
+					{"type":"tool_use","id":"toolu_native_1","name":"runner_local","input":{}},
+					{"type":"tool_use","id":"toolu_managed_1","name":"` + presentedName + `","input":{}}
+				],
+				"stop_reason":"tool_use",
+				"usage":{"input_tokens":8,"output_tokens":3}
+			}`))
+		case 2:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read anthropic body: %v", err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal anthropic request: %v", err)
+			}
+			rawMessages, _ := payload["messages"].([]any)
+			if len(rawMessages) != 3 {
+				t.Fatalf("expected unsafe mixed retry messages to stay internal, got %+v", payload)
+			}
+			mixedAssistant, _ := rawMessages[1].(map[string]any)
+			if mixedAssistant["role"] != "assistant" {
+				t.Fatalf("expected mixed assistant message preserved, got %+v", mixedAssistant)
+			}
+			assistantBlocks, _ := mixedAssistant["content"].([]any)
+			if len(assistantBlocks) != 3 {
+				t.Fatalf("expected assistant content plus both tool_use blocks, got %+v", mixedAssistant)
+			}
+			rejectedResultMsg, _ := rawMessages[2].(map[string]any)
+			if rejectedResultMsg["role"] != "user" {
+				t.Fatalf("expected user tool_result message, got %+v", rejectedResultMsg)
+			}
+			resultBlocks, _ := rejectedResultMsg["content"].([]any)
+			if len(resultBlocks) != 2 {
+				t.Fatalf("expected two rejection tool_result blocks, got %+v", rejectedResultMsg)
+			}
+			rejectedNative, _ := resultBlocks[0].(map[string]any)
+			if rejectedNative["type"] != "tool_result" || rejectedNative["tool_use_id"] != "toolu_native_1" || rejectedNative["is_error"] != true {
+				t.Fatalf("expected native rejection tool_result, got %+v", rejectedNative)
+			}
+			assertToolErrorContains(t, rejectedNative["content"], mixedToolOrderMessage)
+			rejectedManaged, _ := resultBlocks[1].(map[string]any)
+			if rejectedManaged["type"] != "tool_result" || rejectedManaged["tool_use_id"] != "toolu_managed_1" || rejectedManaged["is_error"] != true {
+				t.Fatalf("expected managed rejection tool_result, got %+v", rejectedManaged)
+			}
+			assertToolErrorContains(t, rejectedManaged["content"], mixedToolOrderMessage)
+			_, _ = w.Write([]byte(`{
+				"id":"msg_replanned",
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"text","text":"Understood. I need to fetch managed context before I ask for local runner work."}],
+				"stop_reason":"end_turn",
+				"usage":{"input_tokens":12,"output_tokens":4}
+			}`))
+		default:
+			t.Fatalf("unexpected anthropic round %d", anthropicCalls)
+		}
 	}))
 	defer backend.Close()
 
@@ -2452,7 +2571,7 @@ func TestHandlerRejectsMixedManagedAndNativeAnthropicToolUse(t *testing.T) {
 		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
 	})
 
-	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(&logs))
 	body := `{
 		"model":"claude-sonnet-4-20250514",
 		"messages":[{"role":"user","content":"hi"}],
@@ -2466,15 +2585,19 @@ func TestHandlerRejectsMixedManagedAndNativeAnthropicToolUse(t *testing.T) {
 
 	h.ServeHTTP(w, req)
 
-	if w.Code != http.StatusBadGateway {
-		t.Fatalf("expected 502, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "managed service tools come first") {
-		t.Fatalf("expected mixed anthropic tool-use error, got %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), "Understood. I need to fetch managed context before I ask for local runner work.") {
+		t.Fatalf("expected internal anthropic retry reply, got %s", w.Body.String())
 	}
 	if toolCalls != 0 {
-		t.Fatalf("expected no managed tool execution on mixed anthropic failure, got %d", toolCalls)
+		t.Fatalf("expected no managed tool execution during unsafe mixed retry, got %d", toolCalls)
 	}
+	if anthropicCalls != 2 {
+		t.Fatalf("expected one internal anthropic retry round, got %d model calls", anthropicCalls)
+	}
+	assertInterventionLogged(t, logs.Bytes(), mixedToolOrderInternalRetryIntervention)
 }
 
 func TestHandlerSerializesManagedPrefixBeforeNativeAnthropicToolUse(t *testing.T) {
@@ -4565,6 +4688,29 @@ func assertInterventionLogged(t *testing.T, raw []byte, reason string) {
 		}
 	}
 	t.Fatalf("expected intervention %q in logs, got %v", reason, entries)
+}
+
+func assertToolErrorContains(t *testing.T, raw any, want string) {
+	t.Helper()
+	text, ok := raw.(string)
+	if !ok {
+		t.Fatalf("expected tool payload string, got %T", raw)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatalf("unmarshal tool payload: %v", err)
+	}
+	if okValue, _ := payload["ok"].(bool); okValue {
+		t.Fatalf("expected tool error payload, got %+v", payload)
+	}
+	errPayload, _ := payload["error"].(map[string]any)
+	if errPayload == nil {
+		t.Fatalf("expected nested error payload, got %+v", payload)
+	}
+	message, _ := errPayload["message"].(string)
+	if !strings.Contains(message, want) {
+		t.Fatalf("expected tool error message to contain %q, got %+v", want, payload)
+	}
 }
 
 func parseLogEntries(t *testing.T, raw []byte) []map[string]any {
