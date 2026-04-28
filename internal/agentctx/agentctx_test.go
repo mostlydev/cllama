@@ -269,3 +269,54 @@ func TestLoadReadsToolsManifest(t *testing.T) {
 		t.Fatalf("unexpected tool policy: %+v", ctx.Tools.Policy)
 	}
 }
+
+func TestLoadReadsMCPToolManifest(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"tiverton:secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tools := `{
+		"version": 1,
+		"tools": [
+			{
+				"name": "perplexity-mcp.search",
+				"description": "Search the web",
+				"inputSchema": {"type": "object"},
+				"execution": {
+					"transport": "mcp",
+					"service": "perplexity-mcp",
+					"base_url": "http://perplexity-mcp:8080",
+					"path": "/mcp",
+					"tool_name": "search"
+				}
+			}
+		],
+		"policy": {
+			"max_rounds": 8,
+			"timeout_per_tool_ms": 30000,
+			"total_timeout_ms": 120000
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(agentDir, "tools.json"), []byte(tools), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "tiverton")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	tool := ctx.Tools.Tools[0]
+	if tool.Execution.Transport != "mcp" || tool.Execution.ToolName != "search" || tool.Execution.Method != "" {
+		t.Fatalf("unexpected MCP tool execution: %+v", tool.Execution)
+	}
+}

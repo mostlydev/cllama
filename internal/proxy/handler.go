@@ -18,6 +18,7 @@ import (
 	"github.com/mostlydev/cllama/internal/feeds"
 	"github.com/mostlydev/cllama/internal/identity"
 	"github.com/mostlydev/cllama/internal/logging"
+	"github.com/mostlydev/cllama/internal/mcp"
 	"github.com/mostlydev/cllama/internal/provider"
 	"github.com/mostlydev/cllama/internal/sessionhistory"
 )
@@ -35,6 +36,7 @@ type Handler struct {
 	accumulator           *cost.Accumulator
 	pricing               *cost.Pricing
 	feedFetcher           *feeds.Fetcher
+	mcpClient             *mcp.Client
 	managedTurns          *managedOpenAIContinuityStore
 	managedAnthropicTurns *managedAnthropicContinuityStore
 	sessionRecorder       *sessionhistory.Recorder
@@ -130,6 +132,7 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 	for _, opt := range opts {
 		opt(h)
 	}
+	h.mcpClient = mcp.NewClient(h.client, maxManagedToolResultBytes)
 	return h
 }
 

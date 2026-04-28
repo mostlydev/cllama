@@ -17,6 +17,7 @@ import (
 	"github.com/mostlydev/cllama/internal/alert"
 	"github.com/mostlydev/cllama/internal/cost"
 	"github.com/mostlydev/cllama/internal/logging"
+	"github.com/mostlydev/cllama/internal/mcp"
 	"github.com/mostlydev/cllama/internal/provider"
 	"github.com/mostlydev/cllama/internal/sessionhistory"
 )
@@ -745,7 +746,7 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 	start := time.Now()
 	childCtx, cancel := context.WithTimeout(ctx, policy.PerToolTimeout)
 	defer cancel()
-	raw, statusCode, err := h.callManagedHTTPTool(childCtx, agentID, resolved.Manifest, call.Arguments)
+	raw, statusCode, err := h.dispatchManagedTool(childCtx, agentID, resolved.Manifest, call.Arguments)
 	trace.LatencyMS = time.Since(start).Milliseconds()
 	if errors.Is(err, errManagedToolBudget) {
 		return managedToolOutcome{}, err
@@ -799,7 +800,7 @@ func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID strin
 	start := time.Now()
 	childCtx, cancel := context.WithTimeout(ctx, policy.PerToolTimeout)
 	defer cancel()
-	raw, statusCode, err := h.callManagedHTTPTool(childCtx, agentID, resolved.Manifest, call.Arguments)
+	raw, statusCode, err := h.dispatchManagedTool(childCtx, agentID, resolved.Manifest, call.Arguments)
 	trace.LatencyMS = time.Since(start).Milliseconds()
 	if errors.Is(err, errManagedToolBudget) {
 		return managedToolOutcome{}, err
@@ -873,6 +874,105 @@ func (h *Handler) callManagedHTTPTool(ctx context.Context, agentID string, tool 
 		return toolErrorPayload(fmt.Sprintf("http_%d", resp.StatusCode), fmt.Sprintf("Service returned HTTP %d", resp.StatusCode), resp.StatusCode, details), resp.StatusCode, nil
 	}
 	return toolSuccessPayload(resp.StatusCode, details), resp.StatusCode, nil
+}
+
+func (h *Handler) dispatchManagedTool(ctx context.Context, agentID string, tool agentctx.ToolManifestEntry, args map[string]any) ([]byte, int, error) {
+	switch strings.ToLower(strings.TrimSpace(tool.Execution.Transport)) {
+	case "http":
+		return h.callManagedHTTPTool(ctx, agentID, tool, args)
+	case "mcp":
+		return h.callManagedMCPTool(ctx, agentID, tool, args)
+	default:
+		return toolErrorPayload("unsupported_transport", fmt.Sprintf("Managed tool transport %q is unsupported", tool.Execution.Transport), 0, nil), 0, nil
+	}
+}
+
+func (h *Handler) callManagedMCPTool(ctx context.Context, agentID string, tool agentctx.ToolManifestEntry, args map[string]any) ([]byte, int, error) {
+	toolName := strings.TrimSpace(tool.Execution.ToolName)
+	if toolName == "" {
+		toolName = strings.TrimPrefix(strings.TrimSpace(tool.Name), strings.TrimSpace(tool.Execution.Service)+".")
+	}
+	if toolName == "" {
+		return toolErrorPayload("request_build_failed", "MCP tool_name is required", 0, nil), 0, nil
+	}
+	client := h.mcpClient
+	if client == nil {
+		client = mcp.NewClient(h.client, maxManagedToolResultBytes)
+		h.mcpClient = client
+	}
+	result, statusCode, err := client.Call(ctx, mcp.Target{
+		BaseURL: tool.Execution.BaseURL,
+		Path:    tool.Execution.Path,
+		Auth:    mcpAuthFromManifest(tool.Execution.Auth),
+	}, toolName, args)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return nil, 0, err
+		}
+		switch typed := err.(type) {
+		case *mcp.HTTPStatusError:
+			details := decodeManagedToolBody(limitedReadResult{
+				Body:          typed.Body,
+				ObservedBytes: len(typed.Body),
+			}, "application/json")
+			return toolErrorPayload(fmt.Sprintf("http_%d", typed.StatusCode), fmt.Sprintf("MCP service returned HTTP %d", typed.StatusCode), typed.StatusCode, details), typed.StatusCode, nil
+		case *mcp.RPCError:
+			message := strings.TrimSpace(typed.Message)
+			if message == "" {
+				message = typed.Error()
+			}
+			details := map[string]any{"code": typed.Code}
+			if typed.Data != nil {
+				details["data"] = typed.Data
+			}
+			return toolErrorPayload("mcp_error", message, 0, details), 0, nil
+		default:
+			return toolErrorPayload("request_failed", err.Error(), statusCode, nil), statusCode, nil
+		}
+	}
+	details, isError := decodeMCPToolResult(result)
+	if isError {
+		return toolErrorPayload("tool_error", mcpToolErrorMessage(details), statusCode, details), statusCode, nil
+	}
+	return toolSuccessPayload(statusCode, details), statusCode, nil
+}
+
+func mcpAuthFromManifest(auth *agentctx.AuthEntry) *mcp.Auth {
+	if auth == nil {
+		return nil
+	}
+	return &mcp.Auth{
+		Type:  auth.Type,
+		Token: auth.Token,
+	}
+}
+
+func decodeMCPToolResult(raw json.RawMessage) (map[string]any, bool) {
+	var result map[string]any
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return map[string]any{"raw": string(raw)}, false
+	}
+	isError, _ := result["isError"].(bool)
+	return result, isError
+}
+
+func mcpToolErrorMessage(result map[string]any) string {
+	var parts []string
+	if content, _ := result["content"].([]any); len(content) > 0 {
+		for _, raw := range content {
+			block, _ := raw.(map[string]any)
+			if block == nil {
+				continue
+			}
+			if text, _ := block["text"].(string); strings.TrimSpace(text) != "" {
+				parts = append(parts, strings.TrimSpace(text))
+			}
+		}
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, "\n")
+	}
+	return "MCP tool returned an error"
 }
 
 func renderManagedToolPath(path string, agentID string, args map[string]any) (string, map[string]any, error) {
