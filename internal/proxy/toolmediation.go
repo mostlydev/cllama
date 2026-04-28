@@ -43,6 +43,7 @@ const mixedToolOrderMessage = "mixed managed and runner-native tool calls are no
 
 const managedMixedPrefixSerializedIntervention = "managed_prefix_native_suffix_serialized"
 const mixedToolOrderInternalRetryIntervention = "mixed_tool_order_internal_retry"
+const duplicateManagedToolCallIntervention = "duplicate_managed_tool_call"
 
 type capturedResponse struct {
 	StatusCode    int
@@ -87,6 +88,23 @@ type managedToolPolicy struct {
 	MaxRounds      int
 	PerToolTimeout time.Duration
 	TotalTimeout   time.Duration
+}
+
+type managedToolDuplicateTracker struct {
+	seen map[string]managedToolSeen
+}
+
+type managedToolSeen struct {
+	Round int
+	Count int
+}
+
+type managedToolDuplicate struct {
+	CanonicalName string
+	Service       string
+	Arguments     json.RawMessage
+	FirstRound    int
+	Count         int
 }
 
 type managedUsageAggregate struct {
@@ -164,6 +182,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 	var requestEffective []byte
 	var lastProvider string
 	var lastUpstreamModel string
+	duplicates := newManagedToolDuplicateTracker()
 
 	for {
 		dispatchResult := waitWithManagedKeepalive(streamKeepalive, managedModelWaitComment(len(toolTrace)+1), func() managedDispatchResult {
@@ -315,6 +334,17 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			},
 		}
 		for _, call := range managedCalls {
+			if duplicate := duplicates.ObserveOpenAI(agentCtx, call, len(toolTrace)+1); duplicate != nil {
+				outcome := duplicateManagedToolOutcome(duplicate)
+				h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallIntervention+":"+duplicate.CanonicalName)
+				roundTrace.ToolCalls = append(roundTrace.ToolCalls, outcome.Trace)
+				toolMessages = append(toolMessages, map[string]any{
+					"role":         "tool",
+					"tool_call_id": call.ID,
+					"content":      string(outcome.RawJSON),
+				})
+				continue
+			}
 			execResult := waitWithManagedKeepalive(streamKeepalive, managedToolWaitComment(len(toolTrace)+1, managedToolDisplayName(agentCtx, call.Name)), func() managedOpenAIToolExecResult {
 				outcome, execErr := h.executeManagedOpenAITool(loopCtx, agentID, agentCtx, call, policy)
 				return managedOpenAIToolExecResult{Outcome: outcome, Err: execErr}
@@ -368,6 +398,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 	var requestEffective []byte
 	var lastProvider string
 	var lastUpstreamModel string
+	duplicates := newManagedToolDuplicateTracker()
 
 	for {
 		dispatchResult := waitWithManagedKeepalive(streamKeepalive, managedModelWaitComment(len(toolTrace)+1), func() managedDispatchResult {
@@ -519,6 +550,13 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			},
 		}
 		for _, call := range managedToolUses {
+			if duplicate := duplicates.ObserveAnthropic(agentCtx, call, len(toolTrace)+1); duplicate != nil {
+				outcome := duplicateManagedToolOutcome(duplicate)
+				h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallIntervention+":"+duplicate.CanonicalName)
+				roundTrace.ToolCalls = append(roundTrace.ToolCalls, outcome.Trace)
+				toolResults = append(toolResults, anthropicToolResultBlock(call.ID, outcome.RawJSON))
+				continue
+			}
 			execResult := waitWithManagedKeepalive(streamKeepalive, managedToolWaitComment(len(toolTrace)+1, managedToolDisplayName(agentCtx, call.Name)), func() managedAnthropicToolExecResult {
 				outcome, execErr := h.executeManagedAnthropicTool(loopCtx, agentID, agentCtx, call, policy)
 				return managedAnthropicToolExecResult{Outcome: outcome, Err: execErr}
@@ -722,6 +760,100 @@ func resolveManagedToolPolicy(agentCtx *agentctx.AgentContext) managedToolPolicy
 		PerToolTimeout: perTool,
 		TotalTimeout:   total,
 	}
+}
+
+func newManagedToolDuplicateTracker() *managedToolDuplicateTracker {
+	return &managedToolDuplicateTracker{seen: make(map[string]managedToolSeen)}
+}
+
+func (t *managedToolDuplicateTracker) ObserveOpenAI(agentCtx *agentctx.AgentContext, call openAIToolCall, round int) *managedToolDuplicate {
+	if t == nil || call.ParseErr != nil {
+		return nil
+	}
+	resolved, ok := resolveManagedTool(agentCtx, call.Name)
+	if !ok {
+		return nil
+	}
+	return t.observe(resolved.CanonicalName, resolved.Manifest.Execution.Service, call.ArgumentsRaw, call.Arguments, round)
+}
+
+func (t *managedToolDuplicateTracker) ObserveAnthropic(agentCtx *agentctx.AgentContext, call anthropicToolUse, round int) *managedToolDuplicate {
+	if t == nil || call.ParseErr != nil {
+		return nil
+	}
+	resolved, ok := resolveManagedTool(agentCtx, call.Name)
+	if !ok {
+		return nil
+	}
+	return t.observe(resolved.CanonicalName, resolved.Manifest.Execution.Service, call.ArgumentsRaw, call.Arguments, round)
+}
+
+func (t *managedToolDuplicateTracker) observe(canonicalName, service string, rawArgs json.RawMessage, args map[string]any, round int) *managedToolDuplicate {
+	canonicalArgs, ok := canonicalManagedToolArguments(rawArgs, args)
+	if !ok {
+		return nil
+	}
+	signature := canonicalName + "\x00" + string(canonicalArgs)
+	seen, ok := t.seen[signature]
+	if !ok {
+		t.seen[signature] = managedToolSeen{Round: round, Count: 1}
+		return nil
+	}
+	seen.Count++
+	t.seen[signature] = seen
+	return &managedToolDuplicate{
+		CanonicalName: canonicalName,
+		Service:       service,
+		Arguments:     canonicalArgs,
+		FirstRound:    seen.Round,
+		Count:         seen.Count,
+	}
+}
+
+func canonicalManagedToolArguments(raw json.RawMessage, args map[string]any) (json.RawMessage, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		var err error
+		trimmed, err = json.Marshal(args)
+		if err != nil {
+			return nil, false
+		}
+	}
+	var decoded any
+	if err := json.Unmarshal(trimmed, &decoded); err != nil {
+		return nil, false
+	}
+	canonical, err := json.Marshal(decoded)
+	if err != nil {
+		return nil, false
+	}
+	return json.RawMessage(canonical), true
+}
+
+func duplicateManagedToolOutcome(duplicate *managedToolDuplicate) managedToolOutcome {
+	if duplicate == nil {
+		raw := toolErrorPayload("duplicate_tool_call", "Duplicate managed tool call skipped.", http.StatusConflict, nil)
+		return managedToolOutcome{RawJSON: raw}
+	}
+	details := map[string]any{
+		"tool":             duplicate.CanonicalName,
+		"first_round":      duplicate.FirstRound,
+		"duplicate_count":  duplicate.Count,
+		"reuse_prior_call": true,
+	}
+	message := fmt.Sprintf("This exact managed tool call already ran in round %d. Reuse the earlier result instead of calling it again.", duplicate.FirstRound)
+	raw := toolErrorPayload("duplicate_tool_call", message, http.StatusConflict, details)
+	trace := sessionhistory.ToolCallTrace{
+		Name:             duplicate.CanonicalName,
+		Arguments:        append(json.RawMessage(nil), duplicate.Arguments...),
+		Result:           append(json.RawMessage(nil), raw...),
+		Service:          duplicate.Service,
+		StatusCode:       http.StatusConflict,
+		Duplicate:        true,
+		DuplicateOfRound: duplicate.FirstRound,
+		DuplicateCount:   duplicate.Count,
+	}
+	return managedToolOutcome{RawJSON: raw, Trace: trace}
 }
 
 func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, agentCtx *agentctx.AgentContext, call openAIToolCall, policy managedToolPolicy) (managedToolOutcome, error) {
