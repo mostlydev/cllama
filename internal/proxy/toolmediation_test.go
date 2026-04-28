@@ -109,3 +109,43 @@ func TestDispatchManagedToolExecutesMCPTransport(t *testing.T) {
 		t.Fatalf("unexpected managed MCP payload: %s", raw)
 	}
 }
+
+func TestManagedToolDuplicateTrackerCanonicalizesArguments(t *testing.T) {
+	agentCtx := &agentctx.AgentContext{Tools: managedToolManifest()}
+	tracker := newManagedToolDuplicateTracker()
+
+	first := openAIToolCall{
+		Name:         "trading-api.get_market_context",
+		Arguments:    map[string]any{"ticker": "NVDA", "window": "1d"},
+		ArgumentsRaw: json.RawMessage(`{"ticker":"NVDA","window":"1d"}`),
+	}
+	if duplicate := tracker.ObserveOpenAI(agentCtx, first, 1); duplicate != nil {
+		t.Fatalf("first call should not be duplicate: %+v", duplicate)
+	}
+
+	second := openAIToolCall{
+		Name:         managedToolPresentedNameForCanonical("trading-api.get_market_context"),
+		Arguments:    map[string]any{"window": "1d", "ticker": "NVDA"},
+		ArgumentsRaw: json.RawMessage(`{"window":"1d","ticker":"NVDA"}`),
+	}
+	duplicate := tracker.ObserveOpenAI(agentCtx, second, 2)
+	if duplicate == nil {
+		t.Fatal("expected duplicate for same canonical name and arguments")
+	}
+	if duplicate.CanonicalName != "trading-api.get_market_context" || duplicate.FirstRound != 1 || duplicate.Count != 2 {
+		t.Fatalf("unexpected duplicate metadata: %+v", duplicate)
+	}
+
+	anthropicTracker := newManagedToolDuplicateTracker()
+	use := anthropicToolUse{
+		Name:         "trading-api.get_market_context",
+		Arguments:    map[string]any{"ticker": "NVDA"},
+		ArgumentsRaw: json.RawMessage(`{"ticker":"NVDA"}`),
+	}
+	if duplicate := anthropicTracker.ObserveAnthropic(agentCtx, use, 1); duplicate != nil {
+		t.Fatalf("first anthropic call should not be duplicate: %+v", duplicate)
+	}
+	if duplicate := anthropicTracker.ObserveAnthropic(agentCtx, use, 2); duplicate == nil || duplicate.FirstRound != 1 {
+		t.Fatalf("expected anthropic duplicate metadata, got %+v", duplicate)
+	}
+}

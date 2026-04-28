@@ -27,12 +27,15 @@ type Usage struct {
 }
 
 type ToolCallTrace struct {
-	Name       string          `json:"name"`
-	Arguments  json.RawMessage `json:"arguments,omitempty"`
-	Result     json.RawMessage `json:"result,omitempty"`
-	LatencyMS  int64           `json:"latency_ms,omitempty"`
-	Service    string          `json:"service,omitempty"`
-	StatusCode int             `json:"status_code,omitempty"`
+	Name             string          `json:"name"`
+	Arguments        json.RawMessage `json:"arguments,omitempty"`
+	Result           json.RawMessage `json:"result,omitempty"`
+	LatencyMS        int64           `json:"latency_ms,omitempty"`
+	Service          string          `json:"service,omitempty"`
+	StatusCode       int             `json:"status_code,omitempty"`
+	Duplicate        bool            `json:"duplicate,omitempty"`
+	DuplicateOfRound int             `json:"duplicate_of_round,omitempty"`
+	DuplicateCount   int             `json:"duplicate_count,omitempty"`
 }
 
 type ToolRoundTrace struct {

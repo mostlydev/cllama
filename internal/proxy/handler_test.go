@@ -1285,6 +1285,132 @@ func TestHandlerManagedToolMaxRoundsFailsClosed(t *testing.T) {
 	}
 }
 
+func TestHandlerSkipsDuplicateManagedOpenAIToolCalls(t *testing.T) {
+	var xaiBodies [][]byte
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":"fresh"}`))
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read xai body: %v", err)
+		}
+		xaiBodies = append(xaiBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(xaiBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-1",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{\"ticker\":\"NVDA\",\"window\":\"1d\"}"}}]
+					}
+				}]
+			}`))
+		case 2:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-2",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_2","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{\"window\":\"1d\",\"ticker\":\"NVDA\"}"}}]
+					}
+				}]
+			}`))
+		case 3:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal third xai request: %v", err)
+			}
+			messages, _ := payload["messages"].([]any)
+			if len(messages) == 0 {
+				t.Fatalf("expected mediated messages in third request, got %+v", payload)
+			}
+			last := messages[len(messages)-1].(map[string]any)
+			if last["role"] != "tool" {
+				t.Fatalf("expected duplicate result as last message, got %+v", last)
+			}
+			assertToolErrorContains(t, last["content"].(string), "already ran in round 1")
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-3",
+				"choices":[{"message":{"role":"assistant","content":"using the first result"}}]
+			}`))
+		default:
+			t.Fatalf("unexpected xai round %d", len(xaiBodies))
+		}
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	histDir := t.TempDir()
+	logs := &lockedBuffer{}
+	h := NewHandler(reg, stubContextLoaderWithTools("agent", "agent:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(logs),
+		WithSessionHistory(histDir))
+	body := `{"model":"xai/grok-4.1-fast","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer agent:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "using the first result") {
+		t.Fatalf("expected final text response, got %s", w.Body.String())
+	}
+	if len(xaiBodies) != 3 {
+		t.Fatalf("expected 3 xai rounds, got %d", len(xaiBodies))
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected duplicate tool call to be skipped, tool executions=%d", toolCalls)
+	}
+
+	histFile := filepath.Join(histDir, "agent", "history.jsonl")
+	rawHist, err := os.ReadFile(histFile)
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(rawHist, "\n"), &entry); err != nil {
+		t.Fatalf("unmarshal history entry: %v", err)
+	}
+	trace, _ := entry["tool_trace"].([]any)
+	if len(trace) != 2 {
+		t.Fatalf("expected two tool trace rounds, got %+v", trace)
+	}
+	duplicateRound := trace[1].(map[string]any)
+	duplicateCalls := duplicateRound["tool_calls"].([]any)
+	duplicate := duplicateCalls[0].(map[string]any)
+	if duplicate["duplicate"] != true || duplicate["duplicate_of_round"].(float64) != 1 || duplicate["status_code"].(float64) != http.StatusConflict {
+		t.Fatalf("expected duplicate trace metadata, got %+v", duplicate)
+	}
+
+	entries := parseLogEntries(t, logs.Bytes())
+	foundIntervention := false
+	for _, entry := range entries {
+		if entry["type"] == "intervention" && strings.Contains(fmt.Sprint(entry["intervention"]), "duplicate_managed_tool_call:trading-api.get_market_context") {
+			foundIntervention = true
+		}
+	}
+	if !foundIntervention {
+		t.Fatalf("expected duplicate intervention log, got %+v", entries)
+	}
+}
+
 func TestHandlerRejectsMissingBearer(t *testing.T) {
 	h := NewHandler(provider.NewRegistry(""), nil, nil)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
