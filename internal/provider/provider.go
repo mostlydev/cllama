@@ -79,6 +79,7 @@ var knownProviders = map[string]string{
 	"openrouter": "https://openrouter.ai/api/v1",
 	"google":     "https://generativelanguage.googleapis.com/v1beta/openai",
 	"ollama":     "http://ollama:11434/v1",
+	"vercel":     "https://ai-gateway.vercel.sh/v1",
 }
 
 // envKeyMap maps env var → provider name → indexed backup suffix.
@@ -96,6 +97,9 @@ var envKeyMap = map[string]string{
 	"GEMINI_API_KEY":       "google",
 	"GEMINI_API_KEY_1":     "google",
 	"GOOGLE_API_KEY":       "google",
+	"AI_GATEWAY_API_KEY":   "vercel",
+	"AI_GATEWAY_API_KEY_1": "vercel",
+	"AI_GATEWAY_API_KEY_2": "vercel",
 }
 
 var envBaseURLMap = map[string]string{
@@ -105,6 +109,7 @@ var envBaseURLMap = map[string]string{
 	"OPENROUTER_BASE_URL": "openrouter",
 	"GOOGLE_BASE_URL":     "google",
 	"OLLAMA_BASE_URL":     "ollama",
+	"AI_GATEWAY_BASE_URL": "vercel",
 }
 
 func NewRegistry(authDir string) *Registry {
@@ -279,6 +284,11 @@ func (r *Registry) LoadFromEnv() {
 			{"GEMINI_API_KEY", "seed:GEMINI_API_KEY", "primary"},
 			{"GEMINI_API_KEY_1", "seed:GEMINI_API_KEY_1", "backup-1"},
 			{"GOOGLE_API_KEY", "seed:GOOGLE_API_KEY", "backup-2"},
+		},
+		"vercel": {
+			{"AI_GATEWAY_API_KEY", "seed:AI_GATEWAY_API_KEY", "primary"},
+			{"AI_GATEWAY_API_KEY_1", "seed:AI_GATEWAY_API_KEY_1", "backup-1"},
+			{"AI_GATEWAY_API_KEY_2", "seed:AI_GATEWAY_API_KEY_2", "backup-2"},
 		},
 	}
 

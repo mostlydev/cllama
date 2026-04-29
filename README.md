@@ -109,8 +109,15 @@ docker run -p 8080:8080 -p 8081:8081 \
 | `GEMINI_API_KEY` | | Primary Google Gemini provider key override |
 | `GOOGLE_API_KEY` | | Lower-priority alias for the Google Gemini provider key |
 | `GOOGLE_BASE_URL` | | Override for Google's OpenAI-compatible base URL |
+| `AI_GATEWAY_API_KEY` | | Vercel AI Gateway provider key override |
+| `AI_GATEWAY_BASE_URL` | `https://ai-gateway.vercel.sh/v1` | Override for Vercel AI Gateway's OpenAI-compatible base URL |
 
 Environment variables override keys saved via the web UI.
+
+For Vercel AI Gateway routing, declare models as `vercel/<provider>/<model>`,
+for example `vercel/anthropic/claude-sonnet-4.6`. cllama forwards the model
+suffix to Vercel's OpenAI-compatible endpoint. The Anthropic `/v1/messages`
+path remains native Anthropic-only.
 
 ### Agent context
 

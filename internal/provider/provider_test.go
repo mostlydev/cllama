@@ -147,6 +147,82 @@ func TestLoadFromEnvAppliesXAIBaseURLOverride(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnvSeedsVercelProvider(t *testing.T) {
+	t.Setenv("AI_GATEWAY_API_KEY", "vck_test")
+
+	r := NewRegistry("")
+	r.LoadFromEnv()
+
+	p, err := r.Get("vercel")
+	if err != nil {
+		t.Fatalf("vercel: %v", err)
+	}
+	if p.APIKey != "vck_test" {
+		t.Fatalf("expected vercel key, got %q", p.APIKey)
+	}
+	if p.BaseURL != "https://ai-gateway.vercel.sh/v1" {
+		t.Fatalf("unexpected vercel base URL: %q", p.BaseURL)
+	}
+	if p.Auth != "bearer" {
+		t.Fatalf("expected vercel auth=bearer, got %q", p.Auth)
+	}
+	if p.APIFormat != "openai" {
+		t.Fatalf("expected vercel api_format=openai, got %q", p.APIFormat)
+	}
+
+	state := r.All()["vercel"]
+	if state == nil {
+		t.Fatal("expected vercel provider state")
+	}
+	if state.ActiveKeyID != "seed:AI_GATEWAY_API_KEY" {
+		t.Fatalf("active_key_id = %q, want seed:AI_GATEWAY_API_KEY", state.ActiveKeyID)
+	}
+	if len(state.Keys) != 1 || state.Keys[0].ID != "seed:AI_GATEWAY_API_KEY" {
+		t.Fatalf("expected single vercel seed key, got %+v", state.Keys)
+	}
+}
+
+func TestLoadFromEnvVercelKeyPool(t *testing.T) {
+	t.Setenv("AI_GATEWAY_API_KEY", "vck_primary")
+	t.Setenv("AI_GATEWAY_API_KEY_1", "vck_backup")
+
+	r := NewRegistry("")
+	r.LoadFromEnv()
+
+	state := r.All()["vercel"]
+	if state == nil {
+		t.Fatal("expected vercel provider state")
+	}
+	if state.ActiveKeyID != "seed:AI_GATEWAY_API_KEY" {
+		t.Fatalf("active_key_id = %q, want seed:AI_GATEWAY_API_KEY", state.ActiveKeyID)
+	}
+	if len(state.Keys) != 2 {
+		t.Fatalf("expected 2 vercel keys, got %+v", state.Keys)
+	}
+	if state.Keys[0].ID != "seed:AI_GATEWAY_API_KEY" || state.Keys[0].Label != "primary" {
+		t.Fatalf("unexpected primary key entry: %+v", state.Keys[0])
+	}
+	if state.Keys[1].ID != "seed:AI_GATEWAY_API_KEY_1" || state.Keys[1].Label != "backup-1" {
+		t.Fatalf("unexpected backup key entry: %+v", state.Keys[1])
+	}
+}
+
+func TestLoadFromEnvAppliesAIGatewayBaseURLOverride(t *testing.T) {
+	t.Setenv("AI_GATEWAY_API_KEY", "vck_test")
+	t.Setenv("AI_GATEWAY_BASE_URL", "https://gateway.example.test/v1")
+
+	r := NewRegistry("")
+	r.LoadFromEnv()
+
+	p, err := r.Get("vercel")
+	if err != nil {
+		t.Fatalf("vercel: %v", err)
+	}
+	if p.BaseURL != "https://gateway.example.test/v1" {
+		t.Fatalf("expected vercel base URL override, got %q", p.BaseURL)
+	}
+}
+
 func TestLoadFromEnvSeedsGoogleProviderFromGeminiKey(t *testing.T) {
 	t.Setenv("GEMINI_API_KEY", "sk-gemini-primary")
 
