@@ -45,6 +45,27 @@ func TestReadEntriesAppliesAfterAndLimit(t *testing.T) {
 	}
 }
 
+func TestReadEntriesHandlesLineLargerThanScannerDefault(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "agent-big")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bigPayload := strings.Repeat("x", 200_000)
+	raw := `{"version":1,"ts":"2026-04-01T00:00:00Z","claw_id":"agent-big","response":{"format":"json","json":{"big":"` + bigPayload + `"}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(agentDir, "history.jsonl"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := ReadEntries(dir, "agent-big", nil, 1)
+	if err != nil {
+		t.Fatalf("ReadEntries on >64KB line: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+}
+
 func TestReadEntriesMissingFileReturnsEmpty(t *testing.T) {
 	entries, err := ReadEntries(t.TempDir(), "missing-agent", nil, 100)
 	if err != nil {
