@@ -26,6 +26,9 @@ func TestFormatFeedBlock(t *testing.T) {
 	if !strings.Contains(block, "trading-api") {
 		t.Error("missing source attribution")
 	}
+	if strings.Contains(block, "refreshed") || strings.Contains(block, "2026-03-22T14:30:00Z") {
+		t.Error("feed block should not include volatile fetched-at timestamp")
+	}
 }
 
 func TestFormatFeedBlockStale(t *testing.T) {
@@ -228,5 +231,65 @@ func TestInjectAnthropicExistingBlockSystem(t *testing.T) {
 	second := blocks[1].(map[string]any)
 	if second["text"] != "feed data" {
 		t.Errorf("expected feed data second, got %q", second["text"])
+	}
+}
+
+func TestAppendLateContextDoesNotMutateOpenAISystem(t *testing.T) {
+	payload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "system", "content": "stable contract"},
+			map[string]any{"role": "user", "content": "hello"},
+		},
+	}
+	if !AppendLateContext(payload, "dynamic context") {
+		t.Fatal("expected late context append")
+	}
+	messages := payload["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(messages))
+	}
+	first := messages[0].(map[string]any)
+	if first["content"] != "stable contract" {
+		t.Fatalf("system message mutated: %+v", first)
+	}
+	contextMsg := messages[1].(map[string]any)
+	if contextMsg["role"] != "system" || !strings.Contains(contextMsg["content"].(string), "dynamic context") {
+		t.Fatalf("unexpected context message: %+v", contextMsg)
+	}
+}
+
+func TestAppendLateContextNoUserAppends(t *testing.T) {
+	payload := map[string]any{
+		"messages": []any{map[string]any{"role": "assistant", "content": "done"}},
+	}
+	if !AppendLateContext(payload, "dynamic context") {
+		t.Fatal("expected late context append")
+	}
+	messages := payload["messages"].([]any)
+	if len(messages) != 2 || messages[1].(map[string]any)["role"] != "system" {
+		t.Fatalf("expected appended system context, got %+v", messages)
+	}
+}
+
+func TestAppendAnthropicLateContextDoesNotMutateSystem(t *testing.T) {
+	payload := map[string]any{
+		"system": "stable contract",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hello"},
+		},
+	}
+	if !AppendAnthropicLateContext(payload, "dynamic context") {
+		t.Fatal("expected late context append")
+	}
+	if payload["system"] != "stable contract" {
+		t.Fatalf("system field mutated: %+v", payload["system"])
+	}
+	messages := payload["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("expected context message to be inserted, got %+v", messages)
+	}
+	content := messages[1].(map[string]any)["content"].([]any)
+	if !strings.Contains(content[0].(map[string]any)["text"].(string), "dynamic context") {
+		t.Fatalf("expected dynamic context in context content block, got %+v", content)
 	}
 }

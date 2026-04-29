@@ -78,7 +78,7 @@ func TestDualServerIntegrationSmoke(t *testing.T) {
 	pricing := cost.DefaultPricing()
 	acc := cost.NewAccumulator()
 	snapshots := proxy.NewContextSnapshotStore()
-	apiHandler := newAPIHandler(contextRoot, reg, logging.New(io.Discard), acc, pricing, "test-pod", nil, "", snapshots)
+	apiHandler := newAPIHandler(contextRoot, reg, logging.New(io.Discard), acc, pricing, "test-pod", nil, "", "", snapshots)
 	uiHandler := newUIHandler(reg, acc, contextRoot, "", snapshots)
 
 	apiServer := &http.Server{Handler: apiHandler}
@@ -185,9 +185,22 @@ func TestDualServerIntegrationSmoke(t *testing.T) {
 
 func TestConfigFromEnvSessionHistoryDir(t *testing.T) {
 	t.Setenv("CLAW_SESSION_HISTORY_DIR", "/claw/session-history")
+	t.Setenv("CLAW_CONTEXT_LEDGER_DIR", "")
 	cfg := configFromEnv()
 	if cfg.SessionHistoryDir != "/claw/session-history" {
 		t.Errorf("SessionHistoryDir = %q; want /claw/session-history", cfg.SessionHistoryDir)
+	}
+	if cfg.ContextLedgerDir != "/claw/session-history/context-ledger" {
+		t.Errorf("ContextLedgerDir = %q; want /claw/session-history/context-ledger", cfg.ContextLedgerDir)
+	}
+}
+
+func TestConfigFromEnvContextLedgerDirOverride(t *testing.T) {
+	t.Setenv("CLAW_SESSION_HISTORY_DIR", "/claw/session-history")
+	t.Setenv("CLAW_CONTEXT_LEDGER_DIR", "/custom/context-ledger")
+	cfg := configFromEnv()
+	if cfg.ContextLedgerDir != "/custom/context-ledger" {
+		t.Errorf("ContextLedgerDir = %q; want /custom/context-ledger", cfg.ContextLedgerDir)
 	}
 }
 
@@ -230,7 +243,7 @@ func TestAPIHistoryEndpointAllowsAgentAndDedicatedReplayAuth(t *testing.T) {
 		}
 	}
 
-	apiHandler := newAPIHandler(contextRoot, provider.NewRegistry(""), logging.New(io.Discard), cost.NewAccumulator(), cost.DefaultPricing(), "", recorder, "", nil)
+	apiHandler := newAPIHandler(contextRoot, provider.NewRegistry(""), logging.New(io.Discard), cost.NewAccumulator(), cost.DefaultPricing(), "", recorder, "", "", nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/history/tiverton?limit=1", nil)
 	req.Header.Set("Authorization", "Bearer history-token")
@@ -309,7 +322,7 @@ func TestAPIHistoryEndpointAllowsAdminTokenAndRejectsWrongBearer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	apiHandler := newAPIHandler(contextRoot, provider.NewRegistry(""), logging.New(io.Discard), cost.NewAccumulator(), cost.DefaultPricing(), "", recorder, "ui-secret", nil)
+	apiHandler := newAPIHandler(contextRoot, provider.NewRegistry(""), logging.New(io.Discard), cost.NewAccumulator(), cost.DefaultPricing(), "", recorder, "", "ui-secret", nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/history/tiverton", nil)
 	req.Header.Set("Authorization", "Bearer wrong-token")

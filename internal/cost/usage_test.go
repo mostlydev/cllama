@@ -72,6 +72,55 @@ func TestExtractUsageIncludesReportedCost(t *testing.T) {
 	}
 }
 
+func TestExtractUsageIncludesCacheTokenDetails(t *testing.T) {
+	body := []byte(`{
+		"id": "chatcmpl-1",
+		"usage": {
+			"prompt_tokens": 120,
+			"completion_tokens": 30,
+			"prompt_tokens_details": {
+				"cached_tokens": 100,
+				"cache_write_tokens": 20
+			}
+		}
+	}`)
+
+	u, err := ExtractUsage(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.CachedTokens == nil || *u.CachedTokens != 100 {
+		t.Fatalf("expected cached_tokens=100, got %+v", u.CachedTokens)
+	}
+	if u.CacheWriteTokens == nil || *u.CacheWriteTokens != 20 {
+		t.Fatalf("expected cache_write_tokens=20, got %+v", u.CacheWriteTokens)
+	}
+}
+
+func TestExtractUsageIncludesAnthropicCacheTokenDetails(t *testing.T) {
+	body := []byte(`{
+		"id": "msg_01",
+		"type": "message",
+		"usage": {
+			"input_tokens": 321,
+			"output_tokens": 89,
+			"cache_read_input_tokens": 300,
+			"cache_creation_input_tokens": 21
+		}
+	}`)
+
+	u, err := ExtractUsage(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.CachedTokens == nil || *u.CachedTokens != 300 {
+		t.Fatalf("expected cached_tokens=300, got %+v", u.CachedTokens)
+	}
+	if u.CacheWriteTokens == nil || *u.CacheWriteTokens != 21 {
+		t.Fatalf("expected cache_write_tokens=21, got %+v", u.CacheWriteTokens)
+	}
+}
+
 func TestExtractUsageMissing(t *testing.T) {
 	body := []byte(`{"id": "chatcmpl-1", "choices": []}`)
 	u, err := ExtractUsage(body)

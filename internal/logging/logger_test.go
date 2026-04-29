@@ -29,6 +29,26 @@ func TestLogRequestEmitsJSON(t *testing.T) {
 	}
 }
 
+func TestLogRequestIncludesPromptHashes(t *testing.T) {
+	var buf bytes.Buffer
+	l := New(&buf)
+	l.LogRequestWithInfo("tiverton", "openai/gpt-4o", &RequestInfo{
+		StaticSystemHash:   "static",
+		FirstSystemHash:    "first-system",
+		FirstNonSystemHash: "first-user",
+		DynamicContextHash: "dynamic",
+		ToolsHash:          "tools",
+	})
+
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if entry["static_system_hash"] != "static" || entry["dynamic_context_hash"] != "dynamic" || entry["tools_hash"] != "tools" {
+		t.Fatalf("missing prompt hashes: %+v", entry)
+	}
+}
+
 func TestLogResponseIncludesLatency(t *testing.T) {
 	var buf bytes.Buffer
 	l := New(&buf)
@@ -68,6 +88,26 @@ func TestLogResponseIncludesCostFields(t *testing.T) {
 	}
 	if entry["cost_usd"].(float64) < 0.01 || entry["cost_usd"].(float64) > 0.02 {
 		t.Errorf("expected cost_usd ~0.0105, got %v", entry["cost_usd"])
+	}
+}
+
+func TestLogResponseIncludesCacheTokenFields(t *testing.T) {
+	var buf bytes.Buffer
+	l := New(&buf)
+	cached := 100
+	writes := 20
+	l.LogResponseWithCost("tiverton", "openrouter/model", 200, 1250,
+		&CostInfo{InputTokens: 100, OutputTokens: 50, CachedTokens: &cached, CacheWriteTokens: &writes})
+
+	var entry map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if entry["cached_tokens"].(float64) != 100 {
+		t.Fatalf("expected cached_tokens=100, got %+v", entry)
+	}
+	if entry["cache_write_tokens"].(float64) != 20 {
+		t.Fatalf("expected cache_write_tokens=20, got %+v", entry)
 	}
 }
 

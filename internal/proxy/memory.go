@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/mostlydev/cllama/internal/agentctx"
-	"github.com/mostlydev/cllama/internal/feeds"
 	"github.com/mostlydev/cllama/internal/logging"
 	"github.com/mostlydev/cllama/internal/sessionhistory"
 )
@@ -82,9 +81,6 @@ func (h *Handler) recallOpenAIMemory(reqCtx context.Context, agentID string, age
 	if err != nil {
 		return ""
 	}
-	if block != "" {
-		feeds.InjectOpenAI(payload, block)
-	}
 	return block
 }
 
@@ -98,9 +94,6 @@ func (h *Handler) recallAnthropicMemory(reqCtx context.Context, agentID string, 
 	})
 	if err != nil {
 		return ""
-	}
-	if block != "" {
-		feeds.InjectAnthropic(payload, block)
 	}
 	return block
 }

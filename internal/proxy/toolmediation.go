@@ -110,6 +110,10 @@ type managedToolDuplicate struct {
 type managedUsageAggregate struct {
 	PromptTokens     int
 	CompletionTokens int
+	CachedTokens     int
+	CacheWriteTokens int
+	HasCachedTokens  bool
+	HasCacheWrites   bool
 	TotalTokens      int
 	ReportedCostUSD  float64
 	HasReportedCost  bool
@@ -165,7 +169,7 @@ type limitedReadResult struct {
 	ObservedBytes int
 }
 
-func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, downstreamStream bool, downstreamIncludeUsage bool, start time.Time) {
+func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, downstreamStream bool, downstreamIncludeUsage bool, start time.Time, pendingCursor *pendingChannelCursorCommit, requestInfo *logging.RequestInfo) {
 	policy := resolveManagedToolPolicy(agentCtx)
 	loopCtx, cancel := context.WithTimeout(r.Context(), policy.TotalTimeout)
 	defer cancel()
@@ -186,7 +190,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 
 	for {
 		dispatchResult := waitWithManagedKeepalive(streamKeepalive, managedModelWaitComment(len(toolTrace)+1), func() managedDispatchResult {
-			resp, status, msg, err := h.dispatchCandidatesJSON(loopCtx, r, agentID, requestedModel, payload, candidates)
+			resp, status, msg, err := h.dispatchCandidatesJSON(loopCtx, r, agentID, requestedModel, payload, candidates, requestInfo)
 			return managedDispatchResult{
 				Response: resp,
 				Status:   status,
@@ -263,7 +267,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				}
 			}
 			h.managedTurns.ObserveTerminalAssistant(agentID, assistantMessage, hiddenMessages)
-			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds())
+			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
 			return
 		}
 
@@ -293,14 +297,14 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			}
 			if len(toolTrace) > 0 || len(hiddenMessages) > 0 {
 				h.managedTurns.ObserveNativeToolCallAssistant(agentID, assistantMessage, hiddenMessages)
-				h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds())
+				h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
 				return
 			}
 			responseHeader := resp.Header.Clone()
 			if downstreamStream {
 				responseHeader = syntheticSSEHeader()
 			}
-			h.recordResponse(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseHeader, responseBytes, start)
+			h.recordResponse(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseHeader, responseBytes, start, pendingCursor)
 			return
 		}
 
@@ -381,7 +385,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 	}
 }
 
-func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, downstreamStream bool, start time.Time) {
+func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, downstreamStream bool, start time.Time, pendingCursor *pendingChannelCursorCommit, requestInfo *logging.RequestInfo) {
 	policy := resolveManagedToolPolicy(agentCtx)
 	loopCtx, cancel := context.WithTimeout(r.Context(), policy.TotalTimeout)
 	defer cancel()
@@ -402,7 +406,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 
 	for {
 		dispatchResult := waitWithManagedKeepalive(streamKeepalive, managedModelWaitComment(len(toolTrace)+1), func() managedDispatchResult {
-			resp, status, msg, err := h.dispatchCandidatesJSON(loopCtx, r, agentID, requestedModel, payload, candidates)
+			resp, status, msg, err := h.dispatchCandidatesJSON(loopCtx, r, agentID, requestedModel, payload, candidates, requestInfo)
 			return managedDispatchResult{
 				Response: resp,
 				Status:   status,
@@ -479,7 +483,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				}
 			}
 			h.managedAnthropicTurns.ObserveTerminalAssistant(agentID, assistantMessage, hiddenMessages)
-			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds())
+			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
 			return
 		}
 
@@ -509,14 +513,14 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			}
 			if len(toolTrace) > 0 || len(hiddenMessages) > 0 {
 				h.managedAnthropicTurns.ObserveNativeToolUseAssistant(agentID, assistantMessage, hiddenMessages)
-				h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds())
+				h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
 				return
 			}
 			responseHeader := resp.Header.Clone()
 			if downstreamStream {
 				responseHeader = syntheticSSEHeader()
 			}
-			h.recordResponse(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseHeader, responseBytes, start)
+			h.recordResponse(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseHeader, responseBytes, start, pendingCursor)
 			return
 		}
 
@@ -589,7 +593,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 	}
 }
 
-func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, agentID string, requestedModel string, payload map[string]any, candidates []dispatchCandidate) (*capturedResponse, int, string, error) {
+func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, agentID string, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestInfo *logging.RequestInfo) (*capturedResponse, int, string, error) {
 	sawCooldown := false
 	for i, candidate := range candidates {
 		payload["model"] = candidate.UpstreamModel
@@ -597,7 +601,7 @@ func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, a
 		if err != nil {
 			return nil, http.StatusInternalServerError, "failed to encode upstream body", err
 		}
-		result := h.dispatchJSONWithRetry(ctx, r, agentID, requestedModel, candidate, outBody)
+		result := h.dispatchJSONWithRetry(ctx, r, agentID, requestedModel, candidate, outBody, requestInfo)
 		if result.Response != nil {
 			return result.Response, 0, "", nil
 		}
@@ -618,7 +622,7 @@ func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, a
 	return nil, http.StatusBadGateway, "no usable declared provider key after retries", err
 }
 
-func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, agentID string, requestedModel string, candidate dispatchCandidate, outBody []byte) dispatchJSONAttemptResult {
+func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, agentID string, requestedModel string, candidate dispatchCandidate, outBody []byte, requestInfo *logging.RequestInfo) dispatchJSONAttemptResult {
 	const maxKeyAttempts = 5
 	sawCooldown := false
 
@@ -663,7 +667,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			}
 		}
 
-		h.logger.LogRequest(agentID, requestedModel)
+		h.logger.LogRequestWithInfo(agentID, requestedModel, requestInfo)
 		resp, err := h.client.Do(outReq)
 		if err != nil {
 			return dispatchJSONAttemptResult{
@@ -2369,6 +2373,14 @@ func (a *managedUsageAggregate) AddRound(agentID string, usage cost.Usage, provi
 	a.TotalRounds++
 	a.PromptTokens += usage.PromptTokens
 	a.CompletionTokens += usage.CompletionTokens
+	if usage.CachedTokens != nil {
+		a.HasCachedTokens = true
+		a.CachedTokens += *usage.CachedTokens
+	}
+	if usage.CacheWriteTokens != nil {
+		a.HasCacheWrites = true
+		a.CacheWriteTokens += *usage.CacheWriteTokens
+	}
 	if usage.TotalTokens > 0 {
 		a.TotalTokens += usage.TotalTokens
 	} else {
@@ -2410,17 +2422,23 @@ func (a managedUsageAggregate) costInfo() *logging.CostInfo {
 		InputTokens:  a.PromptTokens,
 		OutputTokens: a.CompletionTokens,
 	}
+	if a.HasCachedTokens {
+		ci.CachedTokens = &a.CachedTokens
+	}
+	if a.HasCacheWrites {
+		ci.CacheWriteTokens = &a.CacheWriteTokens
+	}
 	if a.SawCostUsage && a.LoggedCostKnown {
 		total := a.LoggedCostUSD
 		ci.CostUSD = &total
 	}
-	if ci.InputTokens == 0 && ci.OutputTokens == 0 && ci.CostUSD == nil {
+	if ci.InputTokens == 0 && ci.OutputTokens == 0 && ci.CostUSD == nil && ci.CachedTokens == nil && ci.CacheWriteTokens == nil {
 		return nil
 	}
 	return ci
 }
 
-func (h *Handler) recordManagedSuccess(agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, captured []byte, usage managedUsageAggregate, toolTrace []sessionhistory.ToolRoundTrace, downstreamStream bool, latencyMS int64) {
+func (h *Handler) recordManagedSuccess(agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, captured []byte, usage managedUsageAggregate, toolTrace []sessionhistory.ToolRoundTrace, downstreamStream bool, latencyMS int64, pendingCursor *pendingChannelCursorCommit) {
 	if statusCode < 200 || statusCode >= 300 {
 		return
 	}
@@ -2459,6 +2477,9 @@ func (h *Handler) recordManagedSuccess(agentID string, agentCtx *agentctx.AgentC
 		if err := h.sessionRecorder.Record(agentID, entry); err != nil {
 			h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("session history write: %w", err))
 		}
+	}
+	if pendingCursor != nil {
+		pendingCursor.Commit(h, agentID, requestedModel)
 	}
 	h.retainMemory(agentID, agentCtx, entry)
 

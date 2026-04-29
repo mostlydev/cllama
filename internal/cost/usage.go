@@ -12,6 +12,8 @@ type Usage struct {
 	CompletionTokens int      `json:"completion_tokens"`
 	TotalTokens      int      `json:"total_tokens"`
 	ReportedCostUSD  *float64 `json:"-"`
+	CachedTokens     *int     `json:"-"`
+	CacheWriteTokens *int     `json:"-"`
 }
 
 // ExtractUsage parses usage from a non-streamed JSON response body.
@@ -70,12 +72,27 @@ func parseUsageObject(raw any) Usage {
 		total = prompt + completion
 	}
 
-	return Usage{
+	usage := Usage{
 		PromptTokens:     prompt,
 		CompletionTokens: completion,
 		TotalTokens:      total,
 		ReportedCostUSD:  floatPtrFromAny(obj["cost"]),
 	}
+	if details, ok := obj["prompt_tokens_details"].(map[string]any); ok {
+		if v, ok := intPtrFromAny(details["cached_tokens"]); ok {
+			usage.CachedTokens = v
+		}
+		if v, ok := intPtrFromAny(details["cache_write_tokens"]); ok {
+			usage.CacheWriteTokens = v
+		}
+	}
+	if v, ok := intPtrFromAny(obj["cache_read_input_tokens"]); ok {
+		usage.CachedTokens = v
+	}
+	if v, ok := intPtrFromAny(obj["cache_creation_input_tokens"]); ok {
+		usage.CacheWriteTokens = v
+	}
+	return usage
 }
 
 func mergeUsage(base, next Usage) Usage {
@@ -95,6 +112,18 @@ func mergeUsage(base, next Usage) Usage {
 		if base.ReportedCostUSD == nil || *next.ReportedCostUSD > *base.ReportedCostUSD {
 			cost := *next.ReportedCostUSD
 			base.ReportedCostUSD = &cost
+		}
+	}
+	if next.CachedTokens != nil {
+		if base.CachedTokens == nil || *next.CachedTokens > *base.CachedTokens {
+			v := *next.CachedTokens
+			base.CachedTokens = &v
+		}
+	}
+	if next.CacheWriteTokens != nil {
+		if base.CacheWriteTokens == nil || *next.CacheWriteTokens > *base.CacheWriteTokens {
+			v := *next.CacheWriteTokens
+			base.CacheWriteTokens = &v
 		}
 	}
 	return base
@@ -135,6 +164,43 @@ func intFromAny(v any) int {
 		}
 	}
 	return 0
+}
+
+func intPtrFromAny(v any) (*int, bool) {
+	switch t := v.(type) {
+	case nil:
+		return nil, false
+	case float64:
+		out := int(t)
+		return &out, true
+	case float32:
+		out := int(t)
+		return &out, true
+	case int:
+		out := t
+		return &out, true
+	case int64:
+		out := int(t)
+		return &out, true
+	case int32:
+		out := int(t)
+		return &out, true
+	case json.Number:
+		n, err := t.Int64()
+		if err != nil {
+			return nil, false
+		}
+		out := int(n)
+		return &out, true
+	case string:
+		n, err := strconv.Atoi(t)
+		if err != nil {
+			return nil, false
+		}
+		return &n, true
+	default:
+		return nil, false
+	}
 }
 
 func floatPtrFromAny(v any) *float64 {

@@ -14,21 +14,30 @@ type Logger struct {
 }
 
 type entry struct {
-	TS              string   `json:"ts"`
-	ClawID          string   `json:"claw_id,omitempty"`
-	Type            string   `json:"type"`
-	Model           string   `json:"model,omitempty"`
-	ManifestPresent *bool    `json:"manifest_present,omitempty"`
-	ToolsCount      *int     `json:"tools_count,omitempty"`
-	FeedName        string   `json:"feed_name,omitempty"`
-	FeedURL         string   `json:"feed_url,omitempty"`
-	LatencyMS       *int64   `json:"latency_ms,omitempty"`
-	StatusCode      *int     `json:"status_code,omitempty"`
-	TokensIn        *int     `json:"tokens_in,omitempty"`
-	TokensOut       *int     `json:"tokens_out,omitempty"`
-	CostUSD         *float64 `json:"cost_usd,omitempty"`
-	Intervention    *string  `json:"intervention"`
-	Error           string   `json:"error,omitempty"`
+	TS                 string   `json:"ts"`
+	ClawID             string   `json:"claw_id,omitempty"`
+	Type               string   `json:"type"`
+	Model              string   `json:"model,omitempty"`
+	StaticSystemHash   string   `json:"static_system_hash,omitempty"`
+	FirstSystemHash    string   `json:"first_system_hash,omitempty"`
+	FirstNonSystemHash string   `json:"first_non_system_hash,omitempty"`
+	DynamicContextHash string   `json:"dynamic_context_hash,omitempty"`
+	ToolsHash          string   `json:"tools_hash,omitempty"`
+	ManifestPresent    *bool    `json:"manifest_present,omitempty"`
+	ToolsCount         *int     `json:"tools_count,omitempty"`
+	FeedName           string   `json:"feed_name,omitempty"`
+	FeedURL            string   `json:"feed_url,omitempty"`
+	FeedFetchedAt      string   `json:"feed_fetched_at,omitempty"`
+	FeedCached         *bool    `json:"feed_cached,omitempty"`
+	LatencyMS          *int64   `json:"latency_ms,omitempty"`
+	StatusCode         *int     `json:"status_code,omitempty"`
+	TokensIn           *int     `json:"tokens_in,omitempty"`
+	TokensOut          *int     `json:"tokens_out,omitempty"`
+	CachedTokens       *int     `json:"cached_tokens,omitempty"`
+	CacheWriteTokens   *int     `json:"cache_write_tokens,omitempty"`
+	CostUSD            *float64 `json:"cost_usd,omitempty"`
+	Intervention       *string  `json:"intervention"`
+	Error              string   `json:"error,omitempty"`
 	// memory_op event fields
 	MemoryService *string `json:"memory_service,omitempty"`
 	MemoryOp      *string `json:"memory_op,omitempty"`
@@ -46,9 +55,19 @@ type entry struct {
 
 // CostInfo holds token counts and estimated cost for a single LLM request.
 type CostInfo struct {
-	InputTokens  int
-	OutputTokens int
-	CostUSD      *float64
+	InputTokens      int
+	OutputTokens     int
+	CachedTokens     *int
+	CacheWriteTokens *int
+	CostUSD          *float64
+}
+
+type RequestInfo struct {
+	StaticSystemHash   string
+	FirstSystemHash    string
+	FirstNonSystemHash string
+	DynamicContextHash string
+	ToolsHash          string
 }
 
 // MemoryOpInfo holds structured telemetry for memory recall/retain hooks.
@@ -74,13 +93,25 @@ func New(w io.Writer) *Logger {
 }
 
 func (l *Logger) LogRequest(clawID, model string) {
-	l.log(entry{
+	l.LogRequestWithInfo(clawID, model, nil)
+}
+
+func (l *Logger) LogRequestWithInfo(clawID, model string, info *RequestInfo) {
+	e := entry{
 		TS:           time.Now().UTC().Format(time.RFC3339),
 		ClawID:       clawID,
 		Type:         "request",
 		Model:        model,
 		Intervention: nil,
-	})
+	}
+	if info != nil {
+		e.StaticSystemHash = info.StaticSystemHash
+		e.FirstSystemHash = info.FirstSystemHash
+		e.FirstNonSystemHash = info.FirstNonSystemHash
+		e.DynamicContextHash = info.DynamicContextHash
+		e.ToolsHash = info.ToolsHash
+	}
+	l.log(e)
 }
 
 func (l *Logger) LogResponse(clawID, model string, statusCode int, latencyMS int64) {
@@ -125,6 +156,8 @@ func (l *Logger) LogResponseWithCost(clawID, model string, statusCode int, laten
 	if ci != nil {
 		e.TokensIn = ptrInt(ci.InputTokens)
 		e.TokensOut = ptrInt(ci.OutputTokens)
+		e.CachedTokens = ci.CachedTokens
+		e.CacheWriteTokens = ci.CacheWriteTokens
 		if ci.CostUSD != nil {
 			e.CostUSD = ci.CostUSD
 		}
@@ -144,6 +177,10 @@ func (l *Logger) LogIntervention(clawID, model, reason string) {
 }
 
 func (l *Logger) LogFeedFetch(clawID, feedName, feedURL string, statusCode int, latencyMS int64, err error) {
+	l.LogFeedFetchWithInfo(clawID, feedName, feedURL, statusCode, latencyMS, nil, "", err)
+}
+
+func (l *Logger) LogFeedFetchWithInfo(clawID, feedName, feedURL string, statusCode int, latencyMS int64, cached *bool, fetchedAt string, err error) {
 	e := entry{
 		TS:           time.Now().UTC().Format(time.RFC3339),
 		ClawID:       clawID,
@@ -153,6 +190,8 @@ func (l *Logger) LogFeedFetch(clawID, feedName, feedURL string, statusCode int, 
 		LatencyMS:    ptrI64(latencyMS),
 		Intervention: nil,
 	}
+	e.FeedCached = cached
+	e.FeedFetchedAt = fetchedAt
 	if statusCode > 0 {
 		e.StatusCode = ptrInt(statusCode)
 	}

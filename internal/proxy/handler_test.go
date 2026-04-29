@@ -2649,6 +2649,7 @@ func TestHandlerRetriesUnsafeMixedAnthropicToolUsesInternally(t *testing.T) {
 				t.Fatalf("unmarshal anthropic request: %v", err)
 			}
 			rawMessages, _ := payload["messages"].([]any)
+			rawMessages = stripRuntimeContextMessages(rawMessages)
 			if len(rawMessages) != 3 {
 				t.Fatalf("expected unsafe mixed retry messages to stay internal, got %+v", payload)
 			}
@@ -2764,6 +2765,7 @@ func TestHandlerSerializesManagedPrefixBeforeNativeAnthropicToolUse(t *testing.T
 				t.Fatalf("unmarshal anthropic request: %v", err)
 			}
 			rawMessages, _ := payload["messages"].([]any)
+			rawMessages = stripRuntimeContextMessages(rawMessages)
 			if len(rawMessages) != 3 {
 				t.Fatalf("expected only managed prefix to be serialized before rerun, got %+v", payload)
 			}
@@ -2801,6 +2803,7 @@ func TestHandlerSerializesManagedPrefixBeforeNativeAnthropicToolUse(t *testing.T
 				t.Fatalf("unmarshal anthropic request: %v", err)
 			}
 			rawMessages, _ := payload["messages"].([]any)
+			rawMessages = stripRuntimeContextMessages(rawMessages)
 			if len(rawMessages) < 5 {
 				t.Fatalf("expected managed handoff continuity injection, got %+v", payload)
 			}
@@ -3431,6 +3434,124 @@ func TestHandlerInjectsFeedsIntoOpenAI(t *testing.T) {
 	}
 }
 
+func TestHandlerCommitsChannelContextCursorAfterSuccessfulResponse(t *testing.T) {
+	var feedQueries []string
+	feedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		feedQueries = append(feedQueries, r.URL.RawQuery)
+		_, _ = w.Write([]byte("[channel-context] mode=tail since=24h channels=chan-1 messages=1 available=1 omitted=0 cursor=chan-1:101 range=2026-04-29T05:00Z..2026-04-29T05:01Z\n\n[2026-04-29 05:01] alice: hello"))
+	}))
+	defer feedSrv.Close()
+
+	ctxDir := t.TempDir()
+	agentDir := filepath.Join(ctxDir, "weston")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	feedsJSON := fmt.Sprintf(`[{"name":"channel-context","source":"claw-wall","path":"/channel-context","ttl":30,"url":"%s/channel-context?channels=chan-1&mode=tail&since=24h"}]`, feedSrv.URL)
+	for name, content := range map[string]string{
+		"AGENTS.md":     "# C",
+		"CLAWDAPUS.md":  "# I",
+		"metadata.json": `{"token":"weston:secret","timezone":"UTC"}`,
+		"feeds.json":    feedsJSON,
+	} {
+		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+	h := NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
+		return agentctx.Load(ctxDir, agentID)
+	}, logging.New(io.Discard), WithFeeds("test-pod"), WithChannelCursorLedger(t.TempDir()))
+
+	send := func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"openrouter/anthropic/claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Authorization", "Bearer weston:secret")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+	}
+
+	send()
+	cursors, err := h.channelCursors.Load("weston")
+	if err != nil {
+		t.Fatalf("load cursors: %v", err)
+	}
+	if cursors["chan-1"].LastMessageID != "101" {
+		t.Fatalf("expected committed cursor chan-1:101, got %+v", cursors)
+	}
+	send()
+	if len(feedQueries) != 2 {
+		t.Fatalf("expected two feed fetches, got %+v", feedQueries)
+	}
+	if strings.Contains(feedQueries[0], "after=") || !strings.Contains(feedQueries[1], "after=chan-1%3A101") {
+		t.Fatalf("unexpected feed queries: %+v", feedQueries)
+	}
+}
+
+func TestHandlerDoesNotCommitChannelContextCursorOnUpstreamFailure(t *testing.T) {
+	feedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("[channel-context] mode=tail since=24h channels=chan-1 messages=1 available=1 omitted=0 cursor=chan-1:101 range=2026-04-29T05:00Z..2026-04-29T05:01Z\n\n[2026-04-29 05:01] alice: hello"))
+	}))
+	defer feedSrv.Close()
+
+	ctxDir := t.TempDir()
+	agentDir := filepath.Join(ctxDir, "weston")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	feedsJSON := fmt.Sprintf(`[{"name":"channel-context","source":"claw-wall","path":"/channel-context","ttl":30,"url":"%s/channel-context?channels=chan-1&mode=tail&since=24h"}]`, feedSrv.URL)
+	for name, content := range map[string]string{
+		"AGENTS.md":     "# C",
+		"CLAWDAPUS.md":  "# I",
+		"metadata.json": `{"token":"weston:secret","timezone":"UTC"}`,
+		"feeds.json":    feedsJSON,
+	} {
+		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "upstream down", http.StatusBadGateway)
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+	h := NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
+		return agentctx.Load(ctxDir, agentID)
+	}, logging.New(io.Discard), WithFeeds("test-pod"), WithChannelCursorLedger(t.TempDir()))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"openrouter/anthropic/claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer weston:secret")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", w.Code, w.Body.String())
+	}
+	cursors, err := h.channelCursors.Load("weston")
+	if err != nil {
+		t.Fatalf("load cursors: %v", err)
+	}
+	if len(cursors) != 0 {
+		t.Fatalf("expected cursor to remain uncommitted, got %+v", cursors)
+	}
+}
+
 func TestHandlerInjectsFeedsIntoAnthropic(t *testing.T) {
 	feedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("Fleet nominal"))
@@ -3494,16 +3615,28 @@ func TestHandlerInjectsFeedsIntoAnthropic(t *testing.T) {
 	if err := json.Unmarshal(gotBody, &payload); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	sys, _ := payload["system"].(string)
-	if !strings.Contains(sys, "Current time: ") {
-		t.Errorf("expected current time in system content, got: %q", sys)
+	if _, ok := payload["system"]; ok {
+		t.Fatalf("expected volatile context outside top-level system, got system=%+v", payload["system"])
 	}
-	if !strings.Contains(sys, "Fleet nominal") {
-		t.Errorf("expected feed in system field, got: %q", sys)
+	messages, _ := payload["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("expected original user plus runtime context, got %+v", messages)
+	}
+	contextMsg := messages[1].(map[string]any)
+	blocks, _ := contextMsg["content"].([]any)
+	if contextMsg["role"] != "user" || len(blocks) != 1 {
+		t.Fatalf("expected runtime context user message, got %+v", contextMsg)
+	}
+	contextText := blocks[0].(map[string]any)["text"].(string)
+	if !strings.Contains(contextText, "Current time: ") {
+		t.Errorf("expected current time in runtime context, got: %q", contextText)
+	}
+	if !strings.Contains(contextText, "Fleet nominal") {
+		t.Errorf("expected feed in runtime context, got: %q", contextText)
 	}
 	// Feed content should appear before time (feeds set first, time appended).
-	feedIdx := strings.Index(sys, "BEGIN FEED:")
-	timeIdx := strings.Index(sys, "Current time:")
+	feedIdx := strings.Index(contextText, "BEGIN FEED:")
+	timeIdx := strings.Index(contextText, "Current time:")
 	if feedIdx > timeIdx {
 		t.Errorf("expected feeds before time (append order), feed@%d time@%d", feedIdx, timeIdx)
 	}
@@ -3571,8 +3704,8 @@ func TestHandlerNoFeedsStillWorks(t *testing.T) {
 		t.Fatalf("expected first message to be system, got %q", first["role"])
 	}
 	content, _ := first["content"].(string)
-	if !strings.HasPrefix(content, "Current time: ") {
-		t.Errorf("expected current time system message, got: %q", content)
+	if !strings.Contains(content, "Runtime context for this invocation") || !strings.Contains(content, "Current time: ") {
+		t.Errorf("expected runtime context system message, got: %q", content)
 	}
 }
 
@@ -4837,6 +4970,30 @@ func assertToolErrorContains(t *testing.T, raw any, want string) {
 	if !strings.Contains(message, want) {
 		t.Fatalf("expected tool error message to contain %q, got %+v", want, payload)
 	}
+}
+
+func stripRuntimeContextMessages(messages []any) []any {
+	out := make([]any, 0, len(messages))
+	for _, raw := range messages {
+		msg, _ := raw.(map[string]any)
+		if msg != nil && msg["role"] == "user" {
+			switch content := msg["content"].(type) {
+			case string:
+				if strings.Contains(content, "Runtime context for this invocation") {
+					continue
+				}
+			case []any:
+				if len(content) == 1 {
+					block, _ := content[0].(map[string]any)
+					if text, _ := block["text"].(string); strings.Contains(text, "Runtime context for this invocation") {
+						continue
+					}
+				}
+			}
+		}
+		out = append(out, raw)
+	}
+	return out
 }
 
 func parseLogEntries(t *testing.T, raw []byte) []map[string]any {

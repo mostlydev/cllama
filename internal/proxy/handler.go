@@ -40,6 +40,7 @@ type Handler struct {
 	managedTurns          *managedOpenAIContinuityStore
 	managedAnthropicTurns *managedAnthropicContinuityStore
 	sessionRecorder       *sessionhistory.Recorder
+	channelCursors        *channelCursorStore
 	adminToken            string
 	snapshots             *ContextSnapshotStore
 }
@@ -87,6 +88,12 @@ func WithSessionRecorder(r *sessionhistory.Recorder) HandlerOption {
 	}
 }
 
+func WithChannelCursorLedger(dir string) HandlerOption {
+	return func(h *Handler) {
+		h.channelCursors = newChannelCursorStore(dir)
+	}
+}
+
 // WithAdminToken enables an operator-scoped bearer token for non-chat API
 // routes such as history export.
 func WithAdminToken(token string) HandlerOption {
@@ -104,8 +111,9 @@ func WithSnapshotStore(store *ContextSnapshotStore) HandlerOption {
 }
 
 type fetchedFeedContext struct {
-	Combined string
-	Blocks   []string
+	Combined      string
+	Blocks        []string
+	PendingCommit *pendingChannelCursorCommit
 }
 
 func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger *logging.Logger, opts ...HandlerOption) *Handler {
@@ -127,6 +135,7 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 		logger:                logger,
 		managedTurns:          newManagedOpenAIContinuityStore(defaultManagedToolContinuityTurns),
 		managedAnthropicTurns: newManagedAnthropicContinuityStore(defaultManagedToolContinuityTurns),
+		channelCursors:        newChannelCursorStore(""),
 		snapshots:             NewContextSnapshotStore(),
 	}
 	for _, opt := range opts {
@@ -153,9 +162,30 @@ func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *a
 
 	results := make([]feeds.FeedResult, 0, len(entries))
 	for _, entry := range entries {
+		channelContextAppliedAfter := false
+		if isChannelContextFeed(entry) {
+			var err error
+			entry, channelContextAppliedAfter, err = h.prepareChannelContextFeed(agentID, entry)
+			if err != nil {
+				h.logger.LogError(agentID, "", 0, 0, err)
+			}
+			entry.NoCache = true
+		}
 		result, err := h.feedFetcher.Fetch(reqCtx, agentID, entry)
 		if err != nil {
 			continue
+		}
+		if isChannelContextFeed(entry) {
+			metadata := parseChannelContextMetadata(result.Content)
+			if channelContextAppliedAfter && metadata.Omitted > 0 {
+				result.Content = appendChannelContextPartialAnnotation(result.Content, metadata)
+			}
+			if len(metadata.Cursor) > 0 {
+				if out.PendingCommit == nil {
+					out.PendingCommit = &pendingChannelCursorCommit{}
+				}
+				out.PendingCommit.Merge(metadata.Cursor)
+			}
 		}
 		results = append(results, result)
 	}
@@ -233,15 +263,14 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	}
 	memoryRecall := h.recallOpenAIMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
 	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx)
-	if feedCtx.Combined != "" {
-		feeds.InjectOpenAI(payload, feedCtx.Combined)
-	}
 	timeContext := currentTimeLine(agentCtx, time.Now())
-	feeds.InjectOpenAI(payload, timeContext)
+	dynamicContext := joinRuntimeContext(memoryRecall, feedCtx.Combined, timeContext)
+	feeds.AppendLateContext(payload, dynamicContext)
 	if err := injectManagedOpenAITools(payload, agentCtx); err != nil {
 		h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
 		return
 	}
+	requestInfo := requestTelemetry("openai", payload, dynamicContext)
 	resolution, err := h.resolveOpenAIExecution(agentCtx, requestedModel)
 	if err != nil {
 		status := http.StatusBadGateway
@@ -260,11 +289,11 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}
 	if managedTool {
-		h.handleManagedOpenAI(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, downstreamStream, downstreamIncludeUsage, start)
+		h.handleManagedOpenAI(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, downstreamStream, downstreamIncludeUsage, start, feedCtx.PendingCommit, requestInfo)
 		return
 	}
 
-	h.dispatchCandidates(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, start)
+	h.dispatchCandidates(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, start, requestInfo, feedCtx.PendingCommit)
 }
 
 // resolveOpenAIProvider maps a parsed provider name to the actual provider name
@@ -320,17 +349,16 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	}
 	memoryRecall := h.recallAnthropicMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
 	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx)
-	if feedCtx.Combined != "" {
-		feeds.InjectAnthropic(payload, feedCtx.Combined)
-	}
 	timeContext := currentTimeLine(agentCtx, time.Now())
-	feeds.InjectAnthropic(payload, timeContext)
+	dynamicContext := joinRuntimeContext(memoryRecall, feedCtx.Combined, timeContext)
+	feeds.AppendAnthropicLateContext(payload, dynamicContext)
 	if managedTool {
 		if err := injectManagedAnthropicTools(payload, agentCtx); err != nil {
 			h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
 			return
 		}
 	}
+	requestInfo := requestTelemetry("anthropic", payload, dynamicContext)
 	resolution, err := h.resolveAnthropicExecution(agentCtx, requestedModel)
 	if err != nil {
 		status := http.StatusBadGateway
@@ -345,14 +373,14 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}
 	if managedTool {
-		h.handleManagedAnthropic(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, downstreamStream, start)
+		h.handleManagedAnthropic(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, downstreamStream, start, feedCtx.PendingCommit, requestInfo)
 		return
 	}
 
-	h.dispatchCandidates(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, start)
+	h.dispatchCandidates(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, start, requestInfo, feedCtx.PendingCommit)
 }
 
-func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, start time.Time) {
+func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit) {
 	sawCooldown := false
 	for i, candidate := range candidates {
 		payload["model"] = candidate.UpstreamModel
@@ -361,7 +389,7 @@ func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, age
 			h.fail(w, http.StatusInternalServerError, "failed to encode upstream body", agentID, requestedModel, start, err)
 			return
 		}
-		tryNextCandidate, candidateCooldown := h.dispatchWithRetry(w, r, agentID, agentCtx, requestedModel, candidate, outBody, requestOriginal, start)
+		tryNextCandidate, candidateCooldown := h.dispatchWithRetry(w, r, agentID, agentCtx, requestedModel, candidate, outBody, requestOriginal, start, requestInfo, pendingCursor)
 		if !tryNextCandidate {
 			return
 		}
@@ -382,7 +410,7 @@ func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, age
 // failures (401/403/402/quota-429 → dead, rate-limit-429 → cooldown).
 // 5xx and transport errors do NOT cause key state changes.
 // It returns (advanceToNextCandidate, candidateSawCooldown).
-func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, candidate dispatchCandidate, outBody []byte, requestOriginal []byte, start time.Time) (bool, bool) {
+func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, candidate dispatchCandidate, outBody []byte, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit) (bool, bool) {
 	const maxKeyAttempts = 5
 	sawCooldown := false
 
@@ -423,7 +451,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			return false, sawCooldown
 		}
 
-		h.logger.LogRequest(agentID, requestedModel)
+		h.logger.LogRequestWithInfo(agentID, requestedModel, requestInfo)
 		resp, err := h.client.Do(outReq)
 		if err != nil {
 			// Transport error — no key state change, return 502.
@@ -469,7 +497,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 
 		default:
 			// Success or 5xx: forward response back, no key state change.
-			h.forwardResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start)
+			h.forwardResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start, pendingCursor)
 			return false, sawCooldown
 		}
 	}
@@ -563,15 +591,15 @@ func applyProviderAuth(outReq *http.Request, prov *provider.Provider) error {
 }
 
 // streamResponse forwards the upstream response to the client and logs it.
-func (h *Handler) forwardResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time) {
+func (h *Handler) forwardResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) {
 	if hasManagedTools(agentCtx) && resp.StatusCode >= 200 && resp.StatusCode < 300 && !isSSE(resp.Header) {
-		h.forwardManagedToolAwareResponse(w, resp, agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, start)
+		h.forwardManagedToolAwareResponse(w, resp, agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, start, pendingCursor)
 		return
 	}
-	h.streamResponse(w, resp, agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, start)
+	h.streamResponse(w, resp, agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, start, pendingCursor)
 }
 
-func (h *Handler) forwardManagedToolAwareResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time) {
+func (h *Handler) forwardManagedToolAwareResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) {
 	defer resp.Body.Close()
 
 	captured, err := io.ReadAll(resp.Body)
@@ -593,11 +621,11 @@ func (h *Handler) forwardManagedToolAwareResponse(w http.ResponseWriter, resp *h
 		}
 	}
 
-	h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, captured, start)
+	h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, captured, start, pendingCursor)
 }
 
 // streamResponse forwards the upstream response to the client and logs it.
-func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time) {
+func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) {
 	defer resp.Body.Close()
 
 	copyResponseHeaders(w.Header(), resp.Header)
@@ -611,10 +639,10 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 	}
 
 	captured := responseBuf.Bytes()
-	h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, captured, start)
+	h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, captured, start, pendingCursor)
 }
 
-func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, responseHeader http.Header, captured []byte, start time.Time) {
+func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, responseHeader http.Header, captured []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) {
 	var usage cost.Usage
 	if h.accumulator != nil || h.sessionRecorder != nil {
 		if isSSE(responseHeader) {
@@ -634,9 +662,11 @@ func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext
 			loggedCostUSD = &costUSD
 		}
 		costInfo = &logging.CostInfo{
-			InputTokens:  usage.PromptTokens,
-			OutputTokens: usage.CompletionTokens,
-			CostUSD:      loggedCostUSD,
+			InputTokens:      usage.PromptTokens,
+			OutputTokens:     usage.CompletionTokens,
+			CachedTokens:     usage.CachedTokens,
+			CacheWriteTokens: usage.CacheWriteTokens,
+			CostUSD:          loggedCostUSD,
 		}
 	}
 
@@ -674,6 +704,9 @@ func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext
 			if err := h.sessionRecorder.Record(agentID, entry); err != nil {
 				h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("session history write: %w", err))
 			}
+		}
+		if pendingCursor != nil {
+			pendingCursor.Commit(h, agentID, requestedModel)
 		}
 		h.retainMemory(agentID, agentCtx, entry)
 	}

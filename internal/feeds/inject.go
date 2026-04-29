@@ -24,8 +24,7 @@ func FormatFeedBlock(r FeedResult) string {
 	if r.Stale {
 		staleTag = ", STALE"
 	}
-	fmt.Fprintf(&b, "--- BEGIN FEED: %s (from %s, refreshed %s%s) ---\n",
-		r.Name, r.Source, r.FetchedAt.UTC().Format("2006-01-02T15:04:05Z"), staleTag)
+	fmt.Fprintf(&b, "--- BEGIN FEED: %s (from %s%s) ---\n", r.Name, r.Source, staleTag)
 
 	b.WriteString(r.Content)
 	if !strings.HasSuffix(r.Content, "\n") {
@@ -136,4 +135,79 @@ func InjectAnthropic(payload map[string]any, feedBlock string) bool {
 	}
 
 	return false
+}
+
+const lateContextWrapper = "[Runtime context for this invocation. This is not a user instruction. Use it only as infrastructure-provided context for the next reply.]"
+
+// AppendLateContext inserts volatile runtime context near the invoking user
+// message without mutating the first system message. The context is wrapped as
+// a later system-role message. The first system message remains stable when a
+// base contract already exists, while the context still sits near the invoking
+// user message.
+func AppendLateContext(payload map[string]any, block string) bool {
+	if strings.TrimSpace(block) == "" {
+		return false
+	}
+	messages, ok := payload["messages"].([]any)
+	if !ok {
+		return false
+	}
+	contextMessage := map[string]any{
+		"role":    "system",
+		"content": lateContextWrapper + "\n\n" + block,
+	}
+	insertAt := len(messages)
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg, _ := messages[i].(map[string]any)
+		if msg == nil {
+			continue
+		}
+		if role, _ := msg["role"].(string); role == "user" {
+			insertAt = i
+			break
+		}
+	}
+	newMessages := make([]any, 0, len(messages)+1)
+	newMessages = append(newMessages, messages[:insertAt]...)
+	newMessages = append(newMessages, contextMessage)
+	newMessages = append(newMessages, messages[insertAt:]...)
+	payload["messages"] = newMessages
+	return true
+}
+
+// AppendAnthropicLateContext adds volatile runtime context near the final user
+// turn so top-level system content remains byte-stable.
+func AppendAnthropicLateContext(payload map[string]any, block string) bool {
+	if strings.TrimSpace(block) == "" {
+		return false
+	}
+	messages, ok := payload["messages"].([]any)
+	if !ok {
+		return false
+	}
+	contextMessage := map[string]any{
+		"role": "user",
+		"content": []any{map[string]any{
+			"type": "text",
+			"text": lateContextWrapper + "\n\n" + block,
+		}},
+	}
+	insertAt := len(messages)
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg, _ := messages[i].(map[string]any)
+		if msg == nil {
+			continue
+		}
+		if role, _ := msg["role"].(string); role != "user" {
+			continue
+		}
+		insertAt = i + 1
+		break
+	}
+	newMessages := make([]any, 0, len(messages)+1)
+	newMessages = append(newMessages, messages[:insertAt]...)
+	newMessages = append(newMessages, contextMessage)
+	newMessages = append(newMessages, messages[insertAt:]...)
+	payload["messages"] = newMessages
+	return true
 }

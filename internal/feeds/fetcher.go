@@ -72,7 +72,11 @@ func (f *Fetcher) Fetch(ctx context.Context, agentID string, entry FeedEntry) (F
 	cached, hasCached := f.cache[key]
 	f.mu.RUnlock()
 
-	if hasCached && now.Before(cached.expiresAt) {
+	if !entry.NoCache && hasCached && now.Before(cached.expiresAt) {
+		if f.logger != nil {
+			cachedFlag := true
+			f.logger.LogFeedFetchWithInfo(agentID, entry.Name, entry.URL, http.StatusOK, 0, &cachedFlag, cached.fetchedAt.UTC().Format(time.RFC3339), nil)
+		}
 		return FeedResult{
 			Name:      entry.Name,
 			Source:    entry.Source,
@@ -101,20 +105,22 @@ func (f *Fetcher) Fetch(ctx context.Context, agentID string, entry FeedEntry) (F
 		}, nil
 	}
 
-	ttl := entry.TTL
-	if ttl <= 0 {
-		ttl = DefaultTTLSeconds
-	}
+	if !entry.NoCache {
+		ttl := entry.TTL
+		if ttl <= 0 {
+			ttl = DefaultTTLSeconds
+		}
 
-	newEntry := &cacheEntry{
-		content:   content,
-		fetchedAt: now,
-		expiresAt: now.Add(time.Duration(ttl) * time.Second),
-		truncated: truncated,
+		newEntry := &cacheEntry{
+			content:   content,
+			fetchedAt: now,
+			expiresAt: now.Add(time.Duration(ttl) * time.Second),
+			truncated: truncated,
+		}
+		f.mu.Lock()
+		f.cache[key] = newEntry
+		f.mu.Unlock()
 	}
-	f.mu.Lock()
-	f.cache[key] = newEntry
-	f.mu.Unlock()
 
 	return FeedResult{
 		Name:      entry.Name,
@@ -130,7 +136,8 @@ func (f *Fetcher) doFetch(ctx context.Context, agentID string, entry FeedEntry) 
 	statusCode := 0
 	defer func() {
 		if f.logger != nil {
-			f.logger.LogFeedFetch(agentID, entry.Name, entry.URL, statusCode, time.Since(start).Milliseconds(), err)
+			cachedFlag := false
+			f.logger.LogFeedFetchWithInfo(agentID, entry.Name, entry.URL, statusCode, time.Since(start).Milliseconds(), &cachedFlag, time.Now().UTC().Format(time.RFC3339), err)
 		}
 	}()
 

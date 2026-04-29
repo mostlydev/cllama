@@ -245,15 +245,9 @@ func contextPlacements(format string, payload map[string]any, system any, feedBl
 
 	switch format {
 	case "openai":
-		text, _ := system.(string)
-		return textContextPlacements(segments, text, "openai.messages[0].content", "system", openAISystemMessageIndex(payload), -1)
+		return textLocationContextPlacements(segments, openAITextLocations(payload), "openai.messages")
 	case "anthropic":
-		if text, ok := system.(string); ok {
-			return textContextPlacements(segments, text, "anthropic.system", "system", -1, -1)
-		}
-		if blocks, ok := system.([]any); ok {
-			return blockContextPlacements(segments, blocks)
-		}
+		return textLocationContextPlacements(segments, anthropicTextLocations(payload, system), "anthropic.messages")
 	}
 	return nil
 }
@@ -299,6 +293,129 @@ func textContextPlacements(segments []contextPlacementSegment, text, carrier, ro
 		placements = append(placements, newContextPlacement(len(placements)+1, segment, carrier, role, messageIndex, blockIndex, start, end, countOccurrences(text, segment.Text)))
 	}
 	return placements
+}
+
+type textContextLocation struct {
+	Text         string
+	Carrier      string
+	Role         string
+	MessageIndex int
+	BlockIndex   int
+}
+
+func textLocationContextPlacements(segments []contextPlacementSegment, locations []textContextLocation, fallbackCarrier string) []ContextPlacement {
+	placements := make([]ContextPlacement, 0, len(segments))
+	locationIndex := -1
+	cursor := 0
+	for _, segment := range segments {
+		foundIndex, start := findSegmentInTextLocations(locations, segment.Text, locationIndex, cursor)
+		end := -1
+		location := textContextLocation{
+			Carrier:      fallbackCarrier,
+			MessageIndex: -1,
+			BlockIndex:   -1,
+		}
+		text := ""
+		if foundIndex >= 0 {
+			location = locations[foundIndex]
+			text = location.Text
+			end = start + len(segment.Text)
+			locationIndex = foundIndex
+			cursor = end
+		}
+		placements = append(placements, newContextPlacement(len(placements)+1, segment, location.Carrier, location.Role, location.MessageIndex, location.BlockIndex, start, end, countOccurrences(text, segment.Text)))
+	}
+	return placements
+}
+
+func findSegmentInTextLocations(locations []textContextLocation, segment string, locationIndex, cursor int) (int, int) {
+	if locationIndex >= 0 && locationIndex < len(locations) {
+		text := locations[locationIndex].Text
+		if cursor < 0 || cursor > len(text) {
+			cursor = 0
+		}
+		if idx := strings.Index(text[cursor:], segment); idx >= 0 {
+			return locationIndex, cursor + idx
+		}
+	}
+	for i, location := range locations {
+		if idx := strings.Index(location.Text, segment); idx >= 0 {
+			return i, idx
+		}
+	}
+	return -1, -1
+}
+
+func openAITextLocations(payload map[string]any) []textContextLocation {
+	messages, _ := payload["messages"].([]any)
+	return messageTextLocations("openai", messages)
+}
+
+func anthropicTextLocations(payload map[string]any, system any) []textContextLocation {
+	var locations []textContextLocation
+	switch v := system.(type) {
+	case string:
+		locations = append(locations, textContextLocation{
+			Text:         v,
+			Carrier:      "anthropic.system",
+			Role:         "system",
+			MessageIndex: -1,
+			BlockIndex:   -1,
+		})
+	case []any:
+		for i, block := range v {
+			text := anthropicTextBlock(block)
+			if text == "" {
+				continue
+			}
+			locations = append(locations, textContextLocation{
+				Text:         text,
+				Carrier:      "anthropic.system[" + strconv.Itoa(i) + "].text",
+				Role:         "system",
+				MessageIndex: -1,
+				BlockIndex:   i,
+			})
+		}
+	}
+	messages, _ := payload["messages"].([]any)
+	locations = append(locations, messageTextLocations("anthropic", messages)...)
+	return locations
+}
+
+func messageTextLocations(format string, messages []any) []textContextLocation {
+	var locations []textContextLocation
+	for i, raw := range messages {
+		msg, _ := raw.(map[string]any)
+		if msg == nil {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		switch content := msg["content"].(type) {
+		case string:
+			locations = append(locations, textContextLocation{
+				Text:         content,
+				Carrier:      format + ".messages[" + strconv.Itoa(i) + "].content",
+				Role:         role,
+				MessageIndex: i,
+				BlockIndex:   -1,
+			})
+		case []any:
+			for j, block := range content {
+				text := anthropicTextBlock(block)
+				if text == "" {
+					continue
+				}
+				locations = append(locations, textContextLocation{
+					Text:         text,
+					Carrier:      format + ".messages[" + strconv.Itoa(i) + "].content[" + strconv.Itoa(j) + "].text",
+					Role:         role,
+					MessageIndex: i,
+					BlockIndex:   j,
+				})
+			}
+		}
+	}
+	return locations
 }
 
 func blockContextPlacements(segments []contextPlacementSegment, blocks []any) []ContextPlacement {

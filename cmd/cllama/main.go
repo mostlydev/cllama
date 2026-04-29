@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -32,6 +33,7 @@ type config struct {
 	PodName           string
 	UIToken           string
 	SessionHistoryDir string
+	ContextLedgerDir  string
 }
 
 func main() {
@@ -73,7 +75,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 	apiServer := &http.Server{
 		Addr:              cfg.APIAddr,
-		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, recorder, cfg.UIToken, snapshots),
+		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, recorder, cfg.ContextLedgerDir, cfg.UIToken, snapshots),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	uiServer := &http.Server{
@@ -115,7 +117,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder, adminToken string, snapshots *proxy.ContextSnapshotStore) http.Handler {
+func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder, contextLedgerDir string, adminToken string, snapshots *proxy.ContextSnapshotStore) http.Handler {
 	mux := http.NewServeMux()
 	opts := []proxy.HandlerOption{proxy.WithCostTracking(acc, pricing), proxy.WithSnapshotStore(snapshots)}
 	if podName != "" {
@@ -124,6 +126,7 @@ func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.L
 	if recorder != nil {
 		opts = append(opts, proxy.WithSessionRecorder(recorder))
 	}
+	opts = append(opts, proxy.WithChannelCursorLedger(contextLedgerDir))
 	if adminToken != "" {
 		opts = append(opts, proxy.WithAdminToken(adminToken))
 	}
@@ -191,6 +194,11 @@ func healthcheckURL(addr string) string {
 }
 
 func configFromEnv() config {
+	sessionHistoryDir := os.Getenv("CLAW_SESSION_HISTORY_DIR")
+	contextLedgerDir := os.Getenv("CLAW_CONTEXT_LEDGER_DIR")
+	if contextLedgerDir == "" && sessionHistoryDir != "" {
+		contextLedgerDir = filepath.Join(sessionHistoryDir, "context-ledger")
+	}
 	return config{
 		APIAddr:           envOr("LISTEN_ADDR", ":8080"),
 		UIAddr:            envOr("UI_ADDR", ":8081"),
@@ -198,7 +206,8 @@ func configFromEnv() config {
 		AuthDir:           envOr("CLAW_AUTH_DIR", "/claw/auth"),
 		PodName:           os.Getenv("CLAW_POD"),
 		UIToken:           os.Getenv("CLLAMA_UI_TOKEN"),
-		SessionHistoryDir: os.Getenv("CLAW_SESSION_HISTORY_DIR"),
+		SessionHistoryDir: sessionHistoryDir,
+		ContextLedgerDir:  contextLedgerDir,
 	}
 }
 

@@ -225,22 +225,18 @@ func TestHandlerCapturesAnthropicContextSnapshotWithBlockSystem(t *testing.T) {
 	}
 
 	blocks, ok := snapshot.System.([]any)
-	if !ok || len(blocks) != 2 {
-		t.Fatalf("expected 2 anthropic system blocks, got %#v", snapshot.System)
+	if !ok || len(blocks) != 1 {
+		t.Fatalf("expected stable anthropic system block only, got %#v", snapshot.System)
 	}
 	first, _ := blocks[0].(map[string]any)
 	if first["text"] != "You are a trader." {
 		t.Fatalf("unexpected first system block: %+v", first)
 	}
-	second, _ := blocks[1].(map[string]any)
-	if second["type"] != "text" || !strings.Contains(second["text"].(string), "Current time:") {
-		t.Fatalf("unexpected appended system block: %+v", second)
-	}
 	if len(snapshot.Placements) != 1 {
 		t.Fatalf("expected time placement, got %+v", snapshot.Placements)
 	}
 	placement := snapshot.Placements[0]
-	if placement.Kind != "time" || placement.Carrier != "anthropic.system[1].text" || placement.BlockIndex != 1 || placement.StartChar != 0 {
+	if placement.Kind != "time" || placement.Carrier != "anthropic.messages[1].content[0].text" || placement.Role != "user" || placement.MessageIndex != 1 || placement.BlockIndex != 0 || placement.StartChar <= 0 {
 		t.Fatalf("unexpected anthropic placement: %+v", placement)
 	}
 }

@@ -24,6 +24,9 @@ type FeedEntry struct {
 	TTL    int    `json:"ttl"`
 	URL    string `json:"url"`
 	Auth   string `json:"auth,omitempty"` // bearer token for authenticated feeds
+	// NoCache is set internally for invocation-time streams such as live channel
+	// context. It is not part of the on-disk manifest contract.
+	NoCache bool `json:"-"`
 }
 
 // LoadManifest reads feeds.json from contextDir. Returns nil, nil if the file
