@@ -135,6 +135,7 @@ func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.L
 	}, logger, opts...)
 	mux.Handle("POST /v1/chat/completions", proxyHandler)
 	mux.Handle("POST /v1/messages", proxyHandler)
+	mux.HandleFunc("GET /history", proxyHandler.HandleSelfHistory)
 	mux.HandleFunc("GET /history/{agentID}", proxyHandler.HandleHistory)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
