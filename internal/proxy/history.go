@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mostlydev/cllama/internal/agentctx"
+	"github.com/mostlydev/cllama/internal/identity"
 	"github.com/mostlydev/cllama/internal/sessionhistory"
 )
 
@@ -44,6 +45,45 @@ func (h *Handler) HandleHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.writeHistoryEntries(w, r, targetAgentID)
+}
+
+func (h *Handler) HandleSelfHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.sessionRecorder == nil || h.sessionRecorder.BaseDir() == "" {
+		http.Error(w, "history not configured", http.StatusNotFound)
+		return
+	}
+
+	agentAuth := r.Header.Get("Authorization")
+	if strings.TrimSpace(agentAuth) == "" {
+		if xAPIKey := strings.TrimSpace(r.Header.Get("x-api-key")); xAPIKey != "" {
+			agentAuth = "Bearer " + xAPIKey
+		}
+	}
+	agentID, secret, err := identity.ParseBearer(agentAuth)
+	if err != nil {
+		http.Error(w, "invalid bearer token", http.StatusUnauthorized)
+		return
+	}
+
+	targetCtx, err := h.loadContext(agentID)
+	if err != nil {
+		http.Error(w, "agent context not found", http.StatusForbidden)
+		return
+	}
+	if err := validateSecret(targetCtx, agentID, secret); err != nil {
+		http.Error(w, "invalid agent secret", http.StatusForbidden)
+		return
+	}
+
+	h.writeHistoryEntries(w, r, agentID)
+}
+
+func (h *Handler) writeHistoryEntries(w http.ResponseWriter, r *http.Request, agentID string) {
 	after, err := parseAfterParam(r.URL.Query().Get("after"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -55,7 +95,7 @@ func (h *Handler) HandleHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entries, err := sessionhistory.ReadEntries(h.sessionRecorder.BaseDir(), targetAgentID, after, limit)
+	entries, err := sessionhistory.ReadEntries(h.sessionRecorder.BaseDir(), agentID, after, limit)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("read history: %v", err), http.StatusInternalServerError)
 		return

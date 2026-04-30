@@ -292,6 +292,107 @@ func TestAPIHistoryEndpointAllowsAgentAndDedicatedReplayAuth(t *testing.T) {
 	}
 }
 
+func TestAPIHistoryEndpointSelfRouteAllowsAgentBearer(t *testing.T) {
+	contextRoot := t.TempDir()
+	agentDir := filepath.Join(contextRoot, "tiverton")
+	if err := os.MkdirAll(filepath.Join(agentDir, "service-auth"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"AGENTS.md":     "# contract",
+		"CLAWDAPUS.md":  "# infra",
+		"metadata.json": `{"token":"tiverton:dummy123"}`,
+	} {
+		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "service-auth", "cllama-history.json"), []byte(`{"service":"cllama-history","auth_type":"bearer","token":"history-token","principal":"team-memory"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	histDir := t.TempDir()
+	recorder := sessionhistory.New(histDir)
+	base := time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 2; i++ {
+		if err := recorder.Record("tiverton", sessionhistory.Entry{
+			Version: 1,
+			TS:      base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+			ClawID:  "tiverton",
+			Response: sessionhistory.Payload{
+				Format: "json",
+				JSON:   json.RawMessage(`{}`),
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	apiHandler := newAPIHandler(contextRoot, provider.NewRegistry(""), logging.New(io.Discard), cost.NewAccumulator(), cost.DefaultPricing(), "", recorder, "", "ui-secret", nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/history", nil)
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	rec := httptest.NewRecorder()
+	apiHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for agent self-history auth, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	lines := strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected two ndjson lines, got %q", rec.Body.String())
+	}
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("unmarshal self-history entry: %v", err)
+	}
+	if entry["claw_id"] != "tiverton" {
+		t.Fatalf("expected self-history entry for tiverton, got %+v", entry)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/history?limit=1&after=2026-03-31T12:00:00Z", nil)
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	rec = httptest.NewRecorder()
+	apiHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for filtered self-history auth, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	lines = strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected one filtered ndjson line, got %q", rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/history", nil)
+	req.Header.Set("Authorization", "Bearer wrong:secret")
+	rec = httptest.NewRecorder()
+	apiHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for unknown agent bearer, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/history", nil)
+	req.Header.Set("Authorization", "Bearer history-token")
+	rec = httptest.NewRecorder()
+	apiHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for service history token, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/history", nil)
+	req.Header.Set("Authorization", "Bearer ui-secret")
+	rec = httptest.NewRecorder()
+	apiHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for admin token, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/history", nil)
+	rec = httptest.NewRecorder()
+	apiHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for missing auth, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestAPIHistoryEndpointAllowsAdminTokenAndRejectsWrongBearer(t *testing.T) {
 	contextRoot := t.TempDir()
 	agentDir := filepath.Join(contextRoot, "tiverton")
