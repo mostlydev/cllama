@@ -16,6 +16,13 @@ type channelContextMetadata struct {
 	RangeEnd  string
 }
 
+type channelContextPrepareDecision struct {
+	AppliedAfter  bool
+	Bootstrapped  bool
+	PriorEpoch    string
+	IncomingEpoch string
+}
+
 func isChannelContextFeed(entry feeds.FeedEntry) bool {
 	if entry.Name == "channel-context" {
 		return true
@@ -27,31 +34,40 @@ func isChannelContextFeed(entry feeds.FeedEntry) bool {
 	return strings.HasSuffix(u.Path, "/channel-context") || u.Path == "/channel-context"
 }
 
-func (h *Handler) prepareChannelContextFeed(agentID string, entry feeds.FeedEntry) (feeds.FeedEntry, bool, error) {
+func (h *Handler) prepareChannelContextFeed(agentID string, entry feeds.FeedEntry, incomingEpoch string) (feeds.FeedEntry, channelContextPrepareDecision, error) {
+	var decision channelContextPrepareDecision
+	incomingEpoch = strings.TrimSpace(incomingEpoch)
 	if h == nil || h.channelCursors == nil {
-		return entry, false, nil
+		return entry, decision, nil
 	}
 	u, err := url.Parse(entry.URL)
 	if err != nil {
-		return entry, false, err
+		return entry, decision, err
 	}
 	q := u.Query()
 	channels := splitCSV(q.Get("channels"))
 	if len(channels) == 0 {
-		return entry, false, nil
+		return entry, decision, nil
 	}
-	cursors, err := h.channelCursors.Load(agentID)
+	snapshot, err := h.channelCursors.LoadSnapshot(agentID)
 	if err != nil {
-		return entry, false, fmt.Errorf("load channel context cursor: %w", err)
+		return entry, decision, fmt.Errorf("load channel context cursor: %w", err)
 	}
-	after := encodeAfterCursors(channels, cursors)
+	decision.PriorEpoch = snapshot.Epoch
+	if incomingEpoch != "" && incomingEpoch != snapshot.Epoch {
+		decision.Bootstrapped = true
+		decision.IncomingEpoch = incomingEpoch
+		return entry, decision, nil
+	}
+	after := encodeAfterCursors(channels, snapshot.Cursors)
 	if after == "" {
-		return entry, false, nil
+		return entry, decision, nil
 	}
 	q.Set("after", after)
 	u.RawQuery = q.Encode()
 	entry.URL = u.String()
-	return entry, true, nil
+	decision.AppliedAfter = true
+	return entry, decision, nil
 }
 
 func parseChannelContextMetadata(content string) channelContextMetadata {

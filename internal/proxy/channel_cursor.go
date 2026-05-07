@@ -16,8 +16,20 @@ type channelCursor struct {
 }
 
 type channelCursorLedger struct {
-	Version  int                      `json:"version"`
-	Channels map[string]channelCursor `json:"channels"`
+	Version      int                      `json:"version"`
+	SessionEpoch string                   `json:"session_epoch,omitempty"`
+	Channels     map[string]channelCursor `json:"channels"`
+}
+
+type channelLedgerSnapshot struct {
+	Epoch   string
+	Cursors map[string]channelCursor
+}
+
+type ledgerCommitInput struct {
+	ExpectedPreviousEpoch *string
+	NewEpoch              string
+	CursorUpdates         map[string]channelCursor
 }
 
 type channelCursorStore struct {
@@ -34,25 +46,39 @@ func newChannelCursorStore(dir string) *channelCursorStore {
 }
 
 func (s *channelCursorStore) Load(agentID string) (map[string]channelCursor, error) {
+	snapshot, err := s.LoadSnapshot(agentID)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.Cursors, nil
+}
+
+func (s *channelCursorStore) LoadSnapshot(agentID string) (channelLedgerSnapshot, error) {
 	if s == nil || strings.TrimSpace(agentID) == "" {
-		return nil, nil
+		return channelLedgerSnapshot{}, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ledger, err := s.loadLocked(agentID)
 	if err != nil {
-		return nil, err
+		return channelLedgerSnapshot{}, err
 	}
 	out := make(map[string]channelCursor, len(ledger.Channels))
 	for channelID, cursor := range ledger.Channels {
 		out[channelID] = cursor
 	}
-	return out, nil
+	return channelLedgerSnapshot{Epoch: ledger.SessionEpoch, Cursors: out}, nil
 }
 
-func (s *channelCursorStore) Commit(agentID string, updates map[string]channelCursor) error {
-	if s == nil || strings.TrimSpace(agentID) == "" || len(updates) == 0 {
+func (s *channelCursorStore) Commit(agentID string, in ledgerCommitInput) error {
+	if s == nil || strings.TrimSpace(agentID) == "" {
 		return nil
+	}
+	if strings.TrimSpace(in.NewEpoch) == "" && len(in.CursorUpdates) == 0 {
+		return nil
+	}
+	if strings.TrimSpace(in.NewEpoch) != "" && in.ExpectedPreviousEpoch == nil {
+		return fmt.Errorf("channel cursor epoch commit requires expected previous epoch")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -66,7 +92,11 @@ func (s *channelCursorStore) Commit(agentID string, updates map[string]channelCu
 	if ledger.Channels == nil {
 		ledger.Channels = make(map[string]channelCursor)
 	}
-	for channelID, next := range updates {
+	newEpoch := strings.TrimSpace(in.NewEpoch)
+	if newEpoch != "" && in.ExpectedPreviousEpoch != nil && ledger.SessionEpoch == *in.ExpectedPreviousEpoch {
+		ledger.SessionEpoch = newEpoch
+	}
+	for channelID, next := range in.CursorUpdates {
 		channelID = strings.TrimSpace(channelID)
 		next.LastMessageID = strings.TrimSpace(next.LastMessageID)
 		if channelID == "" || next.LastMessageID == "" {
@@ -147,7 +177,22 @@ func (s *channelCursorStore) cursorPath(agentID string) string {
 }
 
 type pendingChannelCursorCommit struct {
-	updates map[string]channelCursor
+	newEpoch              string
+	expectedPreviousEpoch *string
+	updates               map[string]channelCursor
+}
+
+func (p *pendingChannelCursorCommit) SetEpoch(previousEpoch, newEpoch string) {
+	if p == nil {
+		return
+	}
+	newEpoch = strings.TrimSpace(newEpoch)
+	if newEpoch == "" {
+		return
+	}
+	previous := previousEpoch
+	p.expectedPreviousEpoch = &previous
+	p.newEpoch = newEpoch
 }
 
 func (p *pendingChannelCursorCommit) Merge(updates map[string]channelCursor) {
@@ -166,10 +211,18 @@ func (p *pendingChannelCursorCommit) Merge(updates map[string]channelCursor) {
 }
 
 func (p *pendingChannelCursorCommit) Commit(h *Handler, agentID, model string) {
-	if p == nil || len(p.updates) == 0 || h == nil || h.channelCursors == nil {
+	if p == nil || h == nil || h.channelCursors == nil {
 		return
 	}
-	if err := h.channelCursors.Commit(agentID, p.updates); err != nil {
+	if p.newEpoch == "" && len(p.updates) == 0 {
+		return
+	}
+	in := ledgerCommitInput{
+		ExpectedPreviousEpoch: p.expectedPreviousEpoch,
+		NewEpoch:              p.newEpoch,
+		CursorUpdates:         p.updates,
+	}
+	if err := h.channelCursors.Commit(agentID, in); err != nil {
 		h.logger.LogError(agentID, model, 0, 0, fmt.Errorf("channel context cursor commit: %w", err))
 	}
 }

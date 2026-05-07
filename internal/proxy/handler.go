@@ -145,7 +145,7 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 	return h
 }
 
-func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext) fetchedFeedContext {
+func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, incomingEpoch string) fetchedFeedContext {
 	var out fetchedFeedContext
 	if h.feedFetcher == nil || agentCtx == nil || agentCtx.ContextDir == "" {
 		return out
@@ -162,10 +162,10 @@ func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *a
 
 	results := make([]feeds.FeedResult, 0, len(entries))
 	for _, entry := range entries {
-		channelContextAppliedAfter := false
+		var channelContextDecision channelContextPrepareDecision
 		if isChannelContextFeed(entry) {
 			var err error
-			entry, channelContextAppliedAfter, err = h.prepareChannelContextFeed(agentID, entry)
+			entry, channelContextDecision, err = h.prepareChannelContextFeed(agentID, entry, incomingEpoch)
 			if err != nil {
 				h.logger.LogError(agentID, "", 0, 0, err)
 			}
@@ -176,8 +176,14 @@ func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *a
 			continue
 		}
 		if isChannelContextFeed(entry) {
+			if channelContextDecision.Bootstrapped && !result.Unavailable {
+				if out.PendingCommit == nil {
+					out.PendingCommit = &pendingChannelCursorCommit{}
+				}
+				out.PendingCommit.SetEpoch(channelContextDecision.PriorEpoch, channelContextDecision.IncomingEpoch)
+			}
 			metadata := parseChannelContextMetadata(result.Content)
-			if channelContextAppliedAfter && metadata.Omitted > 0 {
+			if channelContextDecision.AppliedAfter && metadata.Omitted > 0 {
 				result.Content = appendChannelContextPartialAnnotation(result.Content, metadata)
 			}
 			if len(metadata.Cursor) > 0 {
@@ -262,7 +268,8 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		h.managedTurns.Inject(agentID, payload)
 	}
 	memoryRecall := h.recallOpenAIMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
-	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx)
+	incomingEpoch := strings.TrimSpace(r.Header.Get("X-Claw-Consumer-Session-Epoch"))
+	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx, incomingEpoch)
 	timeContext := currentTimeLine(agentCtx, time.Now())
 	dynamicContext := joinRuntimeContext(memoryRecall, feedCtx.Combined, timeContext)
 	feeds.AppendLateContext(payload, dynamicContext)
@@ -348,7 +355,8 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		h.managedAnthropicTurns.Inject(agentID, payload)
 	}
 	memoryRecall := h.recallAnthropicMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
-	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx)
+	incomingEpoch := strings.TrimSpace(r.Header.Get("X-Claw-Consumer-Session-Epoch"))
+	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx, incomingEpoch)
 	timeContext := currentTimeLine(agentCtx, time.Now())
 	dynamicContext := joinRuntimeContext(memoryRecall, feedCtx.Combined, timeContext)
 	feeds.AppendAnthropicLateContext(payload, dynamicContext)
