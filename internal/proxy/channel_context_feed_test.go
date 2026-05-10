@@ -9,25 +9,105 @@ import (
 
 func TestPrepareChannelContextFeedAddsAfterCursor(t *testing.T) {
 	h := NewHandler(nil, nil, nil, WithChannelCursorLedger(""))
-	if err := h.channelCursors.Commit("agent-1", map[string]channelCursor{
+	if err := h.channelCursors.Commit("agent-1", ledgerCommitInput{CursorUpdates: map[string]channelCursor{
 		"chan-a": {LastMessageID: "101"},
 		"chan-b": {LastMessageID: "201"},
+	}}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	entry, decision, err := h.prepareChannelContextFeed("agent-1", feeds.FeedEntry{
+		Name: "channel-context",
+		URL:  "http://claw-wall:8080/channel-context?channels=chan-b,chan-a&mode=tail&since=24h",
+	}, "")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if !decision.AppliedAfter {
+		t.Fatal("expected after cursor to be applied")
+	}
+	if decision.Bootstrapped {
+		t.Fatalf("did not expect bootstrap decision: %+v", decision)
+	}
+	if !strings.Contains(entry.URL, "after=chan-b%3A201%2Cchan-a%3A101") {
+		t.Fatalf("unexpected URL: %s", entry.URL)
+	}
+}
+
+func TestPrepareChannelContextFeedBootstrapsWhenEpochMissing(t *testing.T) {
+	h := NewHandler(nil, nil, nil, WithChannelCursorLedger(""))
+	if err := h.channelCursors.Commit("agent-1", ledgerCommitInput{CursorUpdates: map[string]channelCursor{
+		"chan-a": {LastMessageID: "101"},
+	}}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	entry, decision, err := h.prepareChannelContextFeed("agent-1", feeds.FeedEntry{
+		Name: "channel-context",
+		URL:  "http://claw-wall:8080/channel-context?channels=chan-a&mode=tail&since=24h",
+	}, "epoch-1")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if strings.Contains(entry.URL, "after=") {
+		t.Fatalf("bootstrap should not include after cursor: %s", entry.URL)
+	}
+	if !decision.Bootstrapped || decision.AppliedAfter || decision.PriorEpoch != "" || decision.IncomingEpoch != "epoch-1" {
+		t.Fatalf("unexpected decision: %+v", decision)
+	}
+}
+
+func TestPrepareChannelContextFeedAppliesAfterWhenEpochMatches(t *testing.T) {
+	h := NewHandler(nil, nil, nil, WithChannelCursorLedger(""))
+	if err := h.channelCursors.Commit("agent-1", ledgerCommitInput{
+		ExpectedPreviousEpoch: stringPtr(""),
+		NewEpoch:              "epoch-1",
+		CursorUpdates: map[string]channelCursor{
+			"chan-a": {LastMessageID: "101"},
+		},
 	}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
-	entry, applied, err := h.prepareChannelContextFeed("agent-1", feeds.FeedEntry{
+	entry, decision, err := h.prepareChannelContextFeed("agent-1", feeds.FeedEntry{
 		Name: "channel-context",
-		URL:  "http://claw-wall:8080/channel-context?channels=chan-b,chan-a&mode=tail&since=24h",
-	})
+		URL:  "http://claw-wall:8080/channel-context?channels=chan-a&mode=tail&since=24h",
+	}, "epoch-1")
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	if !applied {
-		t.Fatal("expected after cursor to be applied")
+	if !decision.AppliedAfter || decision.Bootstrapped {
+		t.Fatalf("unexpected decision: %+v", decision)
 	}
-	if !strings.Contains(entry.URL, "after=chan-b%3A201%2Cchan-a%3A101") {
-		t.Fatalf("unexpected URL: %s", entry.URL)
+	if !strings.Contains(entry.URL, "after=chan-a%3A101") {
+		t.Fatalf("expected after cursor, got %s", entry.URL)
+	}
+}
+
+func TestPrepareChannelContextFeedBootstrapsWhenEpochDiffers(t *testing.T) {
+	h := NewHandler(nil, nil, nil, WithChannelCursorLedger(""))
+	if err := h.channelCursors.Commit("agent-1", ledgerCommitInput{
+		ExpectedPreviousEpoch: stringPtr(""),
+		NewEpoch:              "epoch-1",
+		CursorUpdates: map[string]channelCursor{
+			"chan-a": {LastMessageID: "101"},
+		},
+	}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	entry, decision, err := h.prepareChannelContextFeed("agent-1", feeds.FeedEntry{
+		Name: "channel-context",
+		URL:  "http://claw-wall:8080/channel-context?channels=chan-a&mode=tail&since=24h",
+	}, "epoch-2")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if strings.Contains(entry.URL, "after=") {
+		t.Fatalf("bootstrap should not include after cursor: %s", entry.URL)
+	}
+	if !decision.Bootstrapped || decision.AppliedAfter || decision.PriorEpoch != "epoch-1" || decision.IncomingEpoch != "epoch-2" {
+		t.Fatalf("unexpected decision: %+v", decision)
 	}
 }
 

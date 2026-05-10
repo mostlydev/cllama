@@ -24,9 +24,11 @@ import (
 
 func TestHandlerForwardsAndSwapsAuth(t *testing.T) {
 	var gotAuth string
+	var gotEpoch string
 	var gotBody []byte
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
+		gotEpoch = r.Header.Get("X-Claw-Consumer-Session-Epoch")
 		var err error
 		gotBody, err = io.ReadAll(r.Body)
 		if err != nil {
@@ -47,6 +49,7 @@ func TestHandlerForwardsAndSwapsAuth(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Claw-Consumer-Session-Epoch", "internal-epoch")
 	w := httptest.NewRecorder()
 
 	h.ServeHTTP(w, req)
@@ -56,6 +59,9 @@ func TestHandlerForwardsAndSwapsAuth(t *testing.T) {
 	}
 	if gotAuth != "Bearer sk-real" {
 		t.Errorf("expected real key forwarded, got %q", gotAuth)
+	}
+	if gotEpoch != "" {
+		t.Errorf("expected consumer session epoch header to stay internal, got %q", gotEpoch)
 	}
 	if len(gotBody) == 0 {
 		t.Fatal("backend received empty body")
@@ -3549,6 +3555,223 @@ func TestHandlerDoesNotCommitChannelContextCursorOnUpstreamFailure(t *testing.T)
 	}
 	if len(cursors) != 0 {
 		t.Fatalf("expected cursor to remain uncommitted, got %+v", cursors)
+	}
+}
+
+func TestHandlerBootstrapsChannelContextEpochOnMismatch(t *testing.T) {
+	var feedQueries []string
+	feedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		feedQueries = append(feedQueries, r.URL.RawQuery)
+		_, _ = w.Write([]byte("[channel-context] mode=tail since=24h channels=chan-1 messages=1 available=1 omitted=0 cursor=chan-1:105 range=2026-04-29T05:00Z..2026-04-29T05:05Z\n\n[2026-04-29 05:05] alice: hello again"))
+	}))
+	defer feedSrv.Close()
+
+	ctxDir := t.TempDir()
+	agentDir := filepath.Join(ctxDir, "weston")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	feedsJSON := fmt.Sprintf(`[{"name":"channel-context","source":"claw-wall","path":"/channel-context","ttl":30,"url":"%s/channel-context?channels=chan-1&mode=tail&since=24h"}]`, feedSrv.URL)
+	for name, content := range map[string]string{
+		"AGENTS.md":     "# C",
+		"CLAWDAPUS.md":  "# I",
+		"metadata.json": `{"token":"weston:secret","timezone":"UTC"}`,
+		"feeds.json":    feedsJSON,
+	} {
+		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+	h := NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
+		return agentctx.Load(ctxDir, agentID)
+	}, logging.New(io.Discard), WithFeeds("test-pod"), WithChannelCursorLedger(t.TempDir()))
+	if err := h.channelCursors.Commit("weston", ledgerCommitInput{
+		ExpectedPreviousEpoch: stringPtr(""),
+		NewEpoch:              "epoch-old",
+		CursorUpdates: map[string]channelCursor{
+			"chan-1": {LastMessageID: "101"},
+		},
+	}); err != nil {
+		t.Fatalf("seed cursor: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"openrouter/anthropic/claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer weston:secret")
+	req.Header.Set("X-Claw-Consumer-Session-Epoch", "epoch-new")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(feedQueries) != 1 || strings.Contains(feedQueries[0], "after=") {
+		t.Fatalf("expected bootstrap fetch without after, got %+v", feedQueries)
+	}
+	snapshot, err := h.channelCursors.LoadSnapshot("weston")
+	if err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+	if snapshot.Epoch != "epoch-new" {
+		t.Fatalf("expected epoch-new, got %q", snapshot.Epoch)
+	}
+	if snapshot.Cursors["chan-1"].LastMessageID != "105" {
+		t.Fatalf("expected cursor chan-1:105, got %+v", snapshot.Cursors)
+	}
+}
+
+func TestHandlerDoesNotCommitChannelContextEpochWhenFeedFetchFails(t *testing.T) {
+	feedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "wall down", http.StatusBadGateway)
+	}))
+	defer feedSrv.Close()
+
+	ctxDir := t.TempDir()
+	agentDir := filepath.Join(ctxDir, "weston")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	feedsJSON := fmt.Sprintf(`[{"name":"channel-context","source":"claw-wall","path":"/channel-context","ttl":30,"url":"%s/channel-context?channels=chan-1&mode=tail&since=24h"}]`, feedSrv.URL)
+	for name, content := range map[string]string{
+		"AGENTS.md":     "# C",
+		"CLAWDAPUS.md":  "# I",
+		"metadata.json": `{"token":"weston:secret","timezone":"UTC"}`,
+		"feeds.json":    feedsJSON,
+	} {
+		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+	h := NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
+		return agentctx.Load(ctxDir, agentID)
+	}, logging.New(io.Discard), WithFeeds("test-pod"), WithChannelCursorLedger(t.TempDir()))
+	if err := h.channelCursors.Commit("weston", ledgerCommitInput{
+		ExpectedPreviousEpoch: stringPtr(""),
+		NewEpoch:              "epoch-old",
+		CursorUpdates: map[string]channelCursor{
+			"chan-1": {LastMessageID: "101"},
+		},
+	}); err != nil {
+		t.Fatalf("seed cursor: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"openrouter/anthropic/claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer weston:secret")
+	req.Header.Set("X-Claw-Consumer-Session-Epoch", "epoch-new")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected provider success despite feed failure, got %d: %s", w.Code, w.Body.String())
+	}
+	snapshot, err := h.channelCursors.LoadSnapshot("weston")
+	if err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+	if snapshot.Epoch != "epoch-old" {
+		t.Fatalf("feed failure should not commit epoch, got %q", snapshot.Epoch)
+	}
+	if snapshot.Cursors["chan-1"].LastMessageID != "101" {
+		t.Fatalf("cursor should stay unchanged: %+v", snapshot.Cursors)
+	}
+}
+
+func TestHandlerCommitsChannelContextEpochWithoutCursorUpdates(t *testing.T) {
+	var feedQueries []string
+	feedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		feedQueries = append(feedQueries, r.URL.RawQuery)
+		_, _ = w.Write([]byte("[channel-context] mode=tail since=24h channels=chan-1 messages=0 available=0 omitted=0 range=2026-04-29T05:00Z..2026-04-29T05:00Z\n\n"))
+	}))
+	defer feedSrv.Close()
+
+	ctxDir := t.TempDir()
+	agentDir := filepath.Join(ctxDir, "weston")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	feedsJSON := fmt.Sprintf(`[{"name":"channel-context","source":"claw-wall","path":"/channel-context","ttl":30,"url":"%s/channel-context?channels=chan-1&mode=tail&since=24h"}]`, feedSrv.URL)
+	for name, content := range map[string]string{
+		"AGENTS.md":     "# C",
+		"CLAWDAPUS.md":  "# I",
+		"metadata.json": `{"token":"weston:secret","timezone":"UTC"}`,
+		"feeds.json":    feedsJSON,
+	} {
+		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+	h := NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
+		return agentctx.Load(ctxDir, agentID)
+	}, logging.New(io.Discard), WithFeeds("test-pod"), WithChannelCursorLedger(t.TempDir()))
+	if err := h.channelCursors.Commit("weston", ledgerCommitInput{
+		ExpectedPreviousEpoch: stringPtr(""),
+		NewEpoch:              "epoch-old",
+		CursorUpdates: map[string]channelCursor{
+			"chan-1": {LastMessageID: "101"},
+		},
+	}); err != nil {
+		t.Fatalf("seed cursor: %v", err)
+	}
+
+	send := func(epoch string) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"openrouter/anthropic/claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Authorization", "Bearer weston:secret")
+		req.Header.Set("X-Claw-Consumer-Session-Epoch", epoch)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+	}
+
+	send("epoch-new")
+	snapshot, err := h.channelCursors.LoadSnapshot("weston")
+	if err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+	if snapshot.Epoch != "epoch-new" {
+		t.Fatalf("expected epoch-new, got %q", snapshot.Epoch)
+	}
+	if snapshot.Cursors["chan-1"].LastMessageID != "101" {
+		t.Fatalf("epoch-only commit should preserve cursor: %+v", snapshot.Cursors)
+	}
+
+	send("epoch-new")
+	if len(feedQueries) != 2 {
+		t.Fatalf("expected two feed fetches, got %+v", feedQueries)
+	}
+	if strings.Contains(feedQueries[0], "after=") || !strings.Contains(feedQueries[1], "after=chan-1%3A101") {
+		t.Fatalf("unexpected feed queries: %+v", feedQueries)
 	}
 }
 
