@@ -832,7 +832,10 @@ func providerReportedCostIsUSD(providerName string) bool {
 
 func copyRequestHeaders(dst, src http.Header) {
 	for k, vals := range src {
-		if isHopByHopHeader(k) || strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Accept-Encoding") {
+		if isHopByHopHeader(k) ||
+			strings.EqualFold(k, "Authorization") ||
+			strings.EqualFold(k, "Accept-Encoding") ||
+			strings.EqualFold(k, "X-Claw-Consumer-Session-Epoch") {
 			continue
 		}
 		for _, v := range vals {
