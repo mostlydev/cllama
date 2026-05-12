@@ -163,7 +163,9 @@ func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *a
 	results := make([]feeds.FeedResult, 0, len(entries))
 	for _, entry := range entries {
 		var channelContextDecision channelContextPrepareDecision
-		if isChannelContextFeed(entry) {
+		channelFeed := isChannelContextFeed(entry)
+		channelAwarenessFeed := isChannelAwarenessFeed(entry)
+		if channelFeed {
 			var err error
 			entry, channelContextDecision, err = h.prepareChannelContextFeed(agentID, entry, incomingEpoch)
 			if err != nil {
@@ -175,7 +177,7 @@ func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *a
 		if err != nil {
 			continue
 		}
-		if isChannelContextFeed(entry) {
+		if channelFeed {
 			if channelContextDecision.Bootstrapped && !result.Unavailable {
 				if out.PendingCommit == nil {
 					out.PendingCommit = &pendingChannelCursorCommit{}
@@ -192,6 +194,22 @@ func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *a
 				}
 				out.PendingCommit.Merge(metadata.Cursor)
 			}
+		}
+		if channelFeed || channelAwarenessFeed {
+			metadata := parseChannelContextMetadata(result.Content)
+			status := metadata.Status
+			if result.Unavailable {
+				status = "error"
+			}
+			h.logger.LogChannelContextOp(agentID, "", logging.ChannelContextOpInfo{
+				Kind:     metadata.Kind,
+				Channels: metadata.Channels,
+				Retained: metadata.Retained,
+				Returned: metadata.Returned,
+				Omitted:  metadata.Omitted,
+				Source:   result.Source,
+				Status:   status,
+			})
 		}
 		results = append(results, result)
 	}

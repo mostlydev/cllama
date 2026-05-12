@@ -6,19 +6,21 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // AgentContext holds the per-agent mounted contract and metadata files.
 type AgentContext struct {
-	AgentID     string
-	ContextDir  string
-	AgentsMD    []byte
-	ClawdapusMD []byte
-	Metadata    map[string]any
-	ServiceAuth []ServiceAuthEntry
-	Tools       *ToolManifest
-	Memory      *MemoryManifest
-	ModelPolicy *ModelPolicy
+	AgentID          string
+	ContextDir       string
+	AgentsMD         []byte
+	ClawdapusMD      []byte
+	Metadata         map[string]any
+	ServiceAuth      []ServiceAuthEntry
+	Tools            *ToolManifest
+	Memory           *MemoryManifest
+	ModelPolicy      *ModelPolicy
+	ChannelAllowlist map[string]struct{}
 }
 
 type ServiceAuthEntry struct {
@@ -62,6 +64,11 @@ type ToolPolicy struct {
 	MaxRounds        int `json:"max_rounds"`
 	TimeoutPerToolMS int `json:"timeout_per_tool_ms"`
 	TotalTimeoutMS   int `json:"total_timeout_ms"`
+}
+
+type ChannelAllowlistManifest struct {
+	Version  int      `json:"version"`
+	Channels []string `json:"channels"`
 }
 
 type MemoryManifest struct {
@@ -120,17 +127,22 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load agent context %q: memory.json: %w", agentID, err)
 	}
+	channelAllowlist, err := loadChannelAllowlist(dir)
+	if err != nil {
+		return nil, fmt.Errorf("load agent context %q: channels-allowlist.json: %w", agentID, err)
+	}
 
 	return &AgentContext{
-		AgentID:     agentID,
-		ContextDir:  dir,
-		AgentsMD:    agentsMD,
-		ClawdapusMD: clawdapusMD,
-		Metadata:    meta,
-		ServiceAuth: serviceAuth,
-		Tools:       tools,
-		Memory:      memory,
-		ModelPolicy: typed.ModelPolicy,
+		AgentID:          agentID,
+		ContextDir:       dir,
+		AgentsMD:         agentsMD,
+		ClawdapusMD:      clawdapusMD,
+		Metadata:         meta,
+		ServiceAuth:      serviceAuth,
+		Tools:            tools,
+		Memory:           memory,
+		ModelPolicy:      typed.ModelPolicy,
+		ChannelAllowlist: channelAllowlist,
 	}, nil
 }
 
@@ -175,6 +187,18 @@ func (a *AgentContext) FailoverRefs() []string {
 		return nil
 	}
 	return a.ModelPolicy.FailoverRefs()
+}
+
+func (a *AgentContext) ChannelAllowed(channelID string) bool {
+	if a == nil || len(a.ChannelAllowlist) == 0 {
+		return false
+	}
+	channelID = strings.TrimSpace(channelID)
+	if channelID == "" {
+		return false
+	}
+	_, ok := a.ChannelAllowlist[channelID]
+	return ok
 }
 
 // FeedsPath returns the path to the agent's feeds.json manifest.
@@ -245,6 +269,32 @@ func loadToolsManifest(dir string) (*ToolManifest, error) {
 		return nil, err
 	}
 	return &manifest, nil
+}
+
+func loadChannelAllowlist(dir string) (map[string]struct{}, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, "channels-allowlist.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var manifest ChannelAllowlistManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return nil, err
+	}
+	if len(manifest.Channels) == 0 {
+		return nil, nil
+	}
+	allowlist := make(map[string]struct{}, len(manifest.Channels))
+	for _, channelID := range manifest.Channels {
+		channelID = strings.TrimSpace(channelID)
+		if channelID == "" {
+			continue
+		}
+		allowlist[channelID] = struct{}{}
+	}
+	return allowlist, nil
 }
 
 // AgentSummary is a lightweight view of an agent for listing purposes.

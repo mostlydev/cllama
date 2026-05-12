@@ -32,6 +32,7 @@ type ToolCallTrace struct {
 	Result           json.RawMessage `json:"result,omitempty"`
 	LatencyMS        int64           `json:"latency_ms,omitempty"`
 	Service          string          `json:"service,omitempty"`
+	Status           string          `json:"status,omitempty"`
 	StatusCode       int             `json:"status_code,omitempty"`
 	Duplicate        bool            `json:"duplicate,omitempty"`
 	DuplicateOfRound int             `json:"duplicate_of_round,omitempty"`

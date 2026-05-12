@@ -45,6 +45,15 @@ type entry struct {
 	MemoryBlocks  *int    `json:"memory_blocks,omitempty"`
 	MemoryBytes   *int    `json:"memory_bytes,omitempty"`
 	MemoryRemoved *int    `json:"memory_removed,omitempty"`
+	// channel_context_op event fields
+	ChannelKind *string  `json:"kind,omitempty"`
+	Channels    []string `json:"channels,omitempty"`
+	Retained    *int     `json:"retained,omitempty"`
+	Returned    *int     `json:"returned,omitempty"`
+	Omitted     *int     `json:"omitted,omitempty"`
+	Source      *string  `json:"source,omitempty"`
+	Status      *string  `json:"status,omitempty"`
+	ToolName    *string  `json:"tool_name,omitempty"`
 	// provider_pool event fields
 	Provider      string `json:"provider,omitempty"`
 	KeyID         string `json:"key_id,omitempty"`
@@ -81,6 +90,22 @@ type MemoryOpInfo struct {
 	InjectedBytes *int
 	PolicyRemoved *int
 	Error         error
+}
+
+// ChannelContextOpInfo holds structured telemetry for channel awareness,
+// channel-context, and channel retrieval tool operations.
+type ChannelContextOpInfo struct {
+	Kind       string
+	Channels   []string
+	Retained   int
+	Returned   int
+	Omitted    int
+	Source     string
+	Status     string
+	ToolName   string
+	StatusCode int
+	LatencyMS  int64
+	Error      error
 }
 
 func New(w io.Writer) *Logger {
@@ -226,6 +251,34 @@ func (l *Logger) LogMemoryOp(clawID, model string, info MemoryOpInfo) {
 		MemoryBlocks:  info.Blocks,
 		MemoryBytes:   info.InjectedBytes,
 		MemoryRemoved: info.PolicyRemoved,
+	}
+	if info.LatencyMS > 0 {
+		e.LatencyMS = ptrI64(info.LatencyMS)
+	}
+	if info.StatusCode > 0 {
+		e.StatusCode = ptrInt(info.StatusCode)
+	}
+	if info.Error != nil {
+		e.Error = info.Error.Error()
+	}
+	l.log(e)
+}
+
+func (l *Logger) LogChannelContextOp(clawID, model string, info ChannelContextOpInfo) {
+	e := entry{
+		TS:           time.Now().UTC().Format(time.RFC3339),
+		ClawID:       clawID,
+		Type:         "channel_context_op",
+		Model:        model,
+		Intervention: nil,
+		ChannelKind:  ptrString(info.Kind),
+		Channels:     append([]string(nil), info.Channels...),
+		Retained:     ptrInt(info.Retained),
+		Returned:     ptrInt(info.Returned),
+		Omitted:      ptrInt(info.Omitted),
+		Source:       ptrString(info.Source),
+		Status:       ptrString(info.Status),
+		ToolName:     ptrString(info.ToolName),
 	}
 	if info.LatencyMS > 0 {
 		e.LatencyMS = ptrI64(info.LatencyMS)

@@ -852,6 +852,7 @@ func duplicateManagedToolOutcome(duplicate *managedToolDuplicate) managedToolOut
 		Arguments:        append(json.RawMessage(nil), duplicate.Arguments...),
 		Result:           append(json.RawMessage(nil), raw...),
 		Service:          duplicate.Service,
+		Status:           managedToolResponseStatus(raw, http.StatusConflict),
 		StatusCode:       http.StatusConflict,
 		Duplicate:        true,
 		DuplicateOfRound: duplicate.FirstRound,
@@ -894,24 +895,30 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 		raw = toolErrorPayload("timeout", fmt.Sprintf("Service did not respond within %s", formatDuration(policy.PerToolTimeout)), http.StatusGatewayTimeout, nil)
 		statusCode = http.StatusGatewayTimeout
 		trace.StatusCode = statusCode
+		trace.Status = managedToolResponseStatus(raw, statusCode)
 		trace.Result = raw
-		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+		modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, trace.Name, call.Arguments, raw, trace.Status, statusCode, trace.LatencyMS)
+		return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 	}
 	if errors.Is(err, context.Canceled) {
 		if ctx.Err() != nil {
 			return managedToolOutcome{}, errManagedToolBudget
 		}
 		raw = toolErrorPayload("canceled", "Tool execution was canceled", 0, nil)
+		trace.Status = managedToolResponseStatus(raw, 0)
 		trace.Result = raw
-		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+		modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, trace.Name, call.Arguments, raw, trace.Status, 0, trace.LatencyMS)
+		return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 	}
 	trace.StatusCode = statusCode
+	trace.Status = managedToolResponseStatus(raw, statusCode)
+	modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, trace.Name, call.Arguments, raw, trace.Status, statusCode, trace.LatencyMS)
 	if err != nil {
 		trace.Result = raw
-		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+		return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 	}
 	trace.Result = raw
-	return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+	return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 }
 
 func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID string, agentCtx *agentctx.AgentContext, call anthropicToolUse, policy managedToolPolicy) (managedToolOutcome, error) {
@@ -948,29 +955,48 @@ func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID strin
 		raw = toolErrorPayload("timeout", fmt.Sprintf("Service did not respond within %s", formatDuration(policy.PerToolTimeout)), http.StatusGatewayTimeout, nil)
 		statusCode = http.StatusGatewayTimeout
 		trace.StatusCode = statusCode
+		trace.Status = managedToolResponseStatus(raw, statusCode)
 		trace.Result = raw
-		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+		modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, trace.Name, call.Arguments, raw, trace.Status, statusCode, trace.LatencyMS)
+		return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 	}
 	if errors.Is(err, context.Canceled) {
 		if ctx.Err() != nil {
 			return managedToolOutcome{}, errManagedToolBudget
 		}
 		raw = toolErrorPayload("canceled", "Tool execution was canceled", 0, nil)
+		trace.Status = managedToolResponseStatus(raw, 0)
 		trace.Result = raw
-		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+		modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, trace.Name, call.Arguments, raw, trace.Status, 0, trace.LatencyMS)
+		return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 	}
 	trace.StatusCode = statusCode
+	trace.Status = managedToolResponseStatus(raw, statusCode)
+	modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, trace.Name, call.Arguments, raw, trace.Status, statusCode, trace.LatencyMS)
 	if err != nil {
 		trace.Result = raw
-		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+		return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 	}
 	trace.Result = raw
-	return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+	return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 }
 
 func (h *Handler) callManagedHTTPTool(ctx context.Context, agentID string, tool agentctx.ToolManifestEntry, args map[string]any) ([]byte, int, error) {
 	if !strings.EqualFold(tool.Execution.Transport, "http") {
 		return toolErrorPayload("unsupported_transport", fmt.Sprintf("Managed tool transport %q is unsupported", tool.Execution.Transport), 0, nil), 0, nil
+	}
+	if strings.EqualFold(tool.Execution.Service, "claw-wall") {
+		disallowed, err := firstDisallowedChannel(agentID, args, h.loadContext)
+		if err != nil {
+			return toolErrorPayload("channel_allowlist_unavailable", err.Error(), http.StatusForbidden, nil), http.StatusForbidden, nil
+		}
+		if disallowed != "" {
+			details := map[string]any{
+				"agent":   agentID,
+				"channel": disallowed,
+			}
+			return toolErrorPayload("channel_not_allowed", fmt.Sprintf("This agent has no surface to channel %s; ask the operator to add it.", disallowed), http.StatusForbidden, details), http.StatusForbidden, nil
+		}
 	}
 
 	renderedPath, remaining, err := renderManagedToolPath(tool.Execution.Path, agentID, args)
@@ -991,6 +1017,9 @@ func (h *Handler) callManagedHTTPTool(ctx context.Context, agentID string, tool 
 	if err := applyManagedToolAuth(req, tool.Execution.Auth); err != nil {
 		return toolErrorPayload("unsupported_auth", err.Error(), 0, nil), 0, nil
 	}
+	if strings.EqualFold(tool.Execution.Service, "claw-wall") {
+		req.Header.Set("X-Claw-ID", agentID)
+	}
 
 	resp, err := h.client.Do(req)
 	if err != nil {
@@ -1010,6 +1039,174 @@ func (h *Handler) callManagedHTTPTool(ctx context.Context, agentID string, tool 
 		return toolErrorPayload(fmt.Sprintf("http_%d", resp.StatusCode), fmt.Sprintf("Service returned HTTP %d", resp.StatusCode), resp.StatusCode, details), resp.StatusCode, nil
 	}
 	return toolSuccessPayload(resp.StatusCode, details), resp.StatusCode, nil
+}
+
+func firstDisallowedChannel(agentID string, args map[string]any, load ContextLoader) (string, error) {
+	channels := managedToolRequestedChannels(args)
+	if len(channels) == 0 {
+		return "", fmt.Errorf("channel-aware tool request must include channels")
+	}
+	if load == nil {
+		return "", fmt.Errorf("channel allowlist is unavailable")
+	}
+	ctx, err := load(agentID)
+	if err != nil {
+		return "", fmt.Errorf("load channel allowlist: %w", err)
+	}
+	if ctx == nil || len(ctx.ChannelAllowlist) == 0 {
+		return "", fmt.Errorf("channel allowlist is empty for agent %s", agentID)
+	}
+	for _, channelID := range channels {
+		if !ctx.ChannelAllowed(channelID) {
+			return channelID, nil
+		}
+	}
+	return "", nil
+}
+
+func managedToolRequestedChannels(args map[string]any) []string {
+	raw, ok := args["channels"]
+	if !ok {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	switch typed := raw.(type) {
+	case string:
+		for _, part := range strings.Split(typed, ",") {
+			add(part)
+		}
+	case []string:
+		for _, item := range typed {
+			add(item)
+		}
+	case []any:
+		for _, item := range typed {
+			if s, ok := item.(string); ok {
+				add(s)
+			}
+		}
+	}
+	return out
+}
+
+func (h *Handler) decorateManagedToolResult(agentID string, tool agentctx.ToolManifestEntry, toolName string, args map[string]any, raw []byte, status string, statusCode int, latencyMS int64) []byte {
+	if !strings.EqualFold(tool.Execution.Service, "claw-wall") {
+		return raw
+	}
+	channels := managedToolRequestedChannels(args)
+	h.logger.LogChannelContextOp(agentID, "", logging.ChannelContextOpInfo{
+		Kind:       "tool_call",
+		Channels:   channels,
+		Retained:   channelToolRetained(raw),
+		Returned:   channelToolReturned(raw),
+		Omitted:    0,
+		Source:     "claw-wall",
+		Status:     status,
+		ToolName:   strings.TrimPrefix(toolName, "claw-wall."),
+		StatusCode: statusCode,
+		LatencyMS:  latencyMS,
+	})
+	return prependChannelToolHeader(toolName, channels, status, raw)
+}
+
+func managedToolResponseStatus(raw []byte, statusCode int) string {
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		if statusCode >= 400 {
+			return "error"
+		}
+		return "ok"
+	}
+	if ok, present := payload["ok"].(bool); present && !ok {
+		return "error"
+	}
+	if data, ok := payload["data"].(map[string]any); ok {
+		if status, _ := data["status"].(string); strings.TrimSpace(status) != "" {
+			return strings.TrimSpace(status)
+		}
+	}
+	if status, _ := payload["status"].(string); strings.TrimSpace(status) != "" {
+		return strings.TrimSpace(status)
+	}
+	if statusCode >= 400 {
+		return "error"
+	}
+	return "ok"
+}
+
+func channelToolRetained(raw []byte) int {
+	data := channelToolData(raw)
+	if data == nil {
+		return 0
+	}
+	if coverage, ok := data["retained_coverage"].(map[string]any); ok {
+		if size, ok := numericInt(coverage["buffer_size"]); ok {
+			return size
+		}
+	}
+	if messages, ok := data["messages"].([]any); ok {
+		return len(messages)
+	}
+	return 0
+}
+
+func channelToolReturned(raw []byte) int {
+	data := channelToolData(raw)
+	if data == nil {
+		return 0
+	}
+	if messages, ok := data["messages"].([]any); ok {
+		return len(messages)
+	}
+	return 0
+}
+
+func channelToolData(raw []byte) map[string]any {
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil
+	}
+	data, _ := payload["data"].(map[string]any)
+	return data
+}
+
+func numericInt(value any) (int, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed), true
+	case int:
+		return typed, true
+	default:
+		return 0, false
+	}
+}
+
+func prependChannelToolHeader(toolName string, channels []string, status string, raw []byte) []byte {
+	toolName = strings.TrimSpace(strings.TrimPrefix(toolName, "claw-wall."))
+	if toolName == "" {
+		toolName = "unknown"
+	}
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = "ok"
+	}
+	header := fmt.Sprintf("[channel-tool] kind=tool_call name=%s status=%s source=claw-wall", toolName, status)
+	if len(channels) > 0 {
+		header += " channels=" + strings.Join(channels, ",")
+	}
+	return []byte(header + "\n" + string(raw))
 }
 
 func (h *Handler) dispatchManagedTool(ctx context.Context, agentID string, tool agentctx.ToolManifestEntry, args map[string]any) ([]byte, int, error) {
@@ -1441,6 +1638,7 @@ func buildRejectedToolTrace(agentCtx *agentctx.AgentContext, name string, args j
 		Arguments:  append(json.RawMessage(nil), args...),
 		Result:     append(json.RawMessage(nil), raw...),
 		Service:    service,
+		Status:     managedToolResponseStatus(raw, http.StatusConflict),
 		StatusCode: http.StatusConflict,
 	}
 }
@@ -2312,12 +2510,25 @@ func toolErrorPayload(code, message string, statusCode int, details any) []byte 
 }
 
 func managedToolPayloadIsError(raw []byte) bool {
+	raw = stripChannelToolHeader(raw)
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return false
 	}
 	ok, present := payload["ok"].(bool)
 	return present && !ok
+}
+
+func stripChannelToolHeader(raw []byte) []byte {
+	trimmed := bytes.TrimSpace(raw)
+	if !bytes.HasPrefix(trimmed, []byte("[channel-tool]")) {
+		return raw
+	}
+	_, rest, found := bytes.Cut(trimmed, []byte("\n"))
+	if !found {
+		return raw
+	}
+	return bytes.TrimSpace(rest)
 }
 
 func ensureJSONPayload(body []byte) []byte {

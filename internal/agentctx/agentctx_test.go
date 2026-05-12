@@ -44,6 +44,9 @@ func TestLoadReadsAllFiles(t *testing.T) {
 	if ctx.HasPolicy() {
 		t.Fatal("expected no model policy")
 	}
+	if ctx.ChannelAllowed("chan-1") {
+		t.Fatal("expected missing channel allowlist to deny channel")
+	}
 }
 
 func TestLoadMissingDirErrors(t *testing.T) {
@@ -161,6 +164,37 @@ func TestLoadReadsServiceAuthEntries(t *testing.T) {
 	}
 	if ctx.ServiceAuth[0].Service != "team-memory" || ctx.ServiceAuth[0].Token != "memory-token" {
 		t.Fatalf("unexpected service auth entry: %+v", ctx.ServiceAuth[0])
+	}
+}
+
+func TestLoadReadsChannelAllowlist(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"tiverton:secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "channels-allowlist.json"), []byte(`{"version":1,"channels":["chan-1","chan-2"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "tiverton")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ctx.ChannelAllowed("chan-1") || !ctx.ChannelAllowed("chan-2") {
+		t.Fatalf("expected channels to be allowed: %+v", ctx.ChannelAllowlist)
+	}
+	if ctx.ChannelAllowed("chan-3") {
+		t.Fatal("expected unlisted channel to be denied")
 	}
 }
 

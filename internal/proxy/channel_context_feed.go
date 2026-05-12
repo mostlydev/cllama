@@ -11,7 +11,12 @@ import (
 
 type channelContextMetadata struct {
 	Available int
+	Returned  int
+	Retained  int
 	Omitted   int
+	Kind      string
+	Channels  []string
+	Status    string
 	Cursor    map[string]channelCursor
 	RangeEnd  string
 }
@@ -32,6 +37,17 @@ func isChannelContextFeed(entry feeds.FeedEntry) bool {
 		return strings.HasPrefix(entry.Path, "/channel-context")
 	}
 	return strings.HasSuffix(u.Path, "/channel-context") || u.Path == "/channel-context"
+}
+
+func isChannelAwarenessFeed(entry feeds.FeedEntry) bool {
+	if entry.Name == "channel-awareness" {
+		return true
+	}
+	u, err := url.Parse(entry.URL)
+	if err != nil {
+		return strings.HasPrefix(entry.Path, "/channel-awareness")
+	}
+	return strings.HasSuffix(u.Path, "/channel-awareness") || u.Path == "/channel-awareness"
 }
 
 func (h *Handler) prepareChannelContextFeed(agentID string, entry feeds.FeedEntry, incomingEpoch string) (feeds.FeedEntry, channelContextPrepareDecision, error) {
@@ -57,13 +73,20 @@ func (h *Handler) prepareChannelContextFeed(agentID string, entry feeds.FeedEntr
 	if incomingEpoch != "" && incomingEpoch != snapshot.Epoch {
 		decision.Bootstrapped = true
 		decision.IncomingEpoch = incomingEpoch
+		q.Set("context_kind", "bootstrap_tail")
+		u.RawQuery = q.Encode()
+		entry.URL = u.String()
 		return entry, decision, nil
 	}
 	after := encodeAfterCursors(channels, snapshot.Cursors)
 	if after == "" {
+		q.Set("context_kind", "tail")
+		u.RawQuery = q.Encode()
+		entry.URL = u.String()
 		return entry, decision, nil
 	}
 	q.Set("after", after)
+	q.Set("context_kind", "delta_tail")
 	u.RawQuery = q.Encode()
 	entry.URL = u.String()
 	decision.AppliedAfter = true
@@ -74,7 +97,7 @@ func parseChannelContextMetadata(content string) channelContextMetadata {
 	var meta channelContextMetadata
 	firstLine, _, _ := strings.Cut(content, "\n")
 	firstLine = strings.TrimSpace(firstLine)
-	if !strings.HasPrefix(firstLine, "[channel-context]") {
+	if !strings.HasPrefix(firstLine, "[channel-context") && !strings.HasPrefix(firstLine, "[channel-awareness") {
 		return meta
 	}
 	for _, field := range strings.Fields(firstLine) {
@@ -83,8 +106,17 @@ func parseChannelContextMetadata(content string) channelContextMetadata {
 			continue
 		}
 		switch key {
+		case "kind":
+			meta.Kind = strings.TrimSpace(value)
+		case "channels":
+			meta.Channels = splitCSV(value)
+		case "messages":
+			meta.Returned, _ = strconv.Atoi(value)
 		case "available":
 			meta.Available, _ = strconv.Atoi(value)
+		case "retained":
+			retained, _, _ := strings.Cut(value, "/")
+			meta.Retained, _ = strconv.Atoi(retained)
 		case "omitted":
 			meta.Omitted, _ = strconv.Atoi(value)
 		case "cursor":
@@ -95,6 +127,17 @@ func parseChannelContextMetadata(content string) channelContextMetadata {
 				meta.RangeEnd = end
 			}
 		}
+	}
+	if meta.Retained == 0 {
+		meta.Retained = meta.Available
+	}
+	if meta.Kind == "" {
+		meta.Kind = "tail"
+	}
+	if meta.Returned == 0 && meta.Retained == 0 {
+		meta.Status = "empty"
+	} else {
+		meta.Status = "ok"
 	}
 	return meta
 }

@@ -227,3 +227,38 @@ func TestLogMemoryOpIncludesStructuredFields(t *testing.T) {
 		t.Fatalf("expected latency_ms=37, got %v", entry["latency_ms"])
 	}
 }
+
+func TestLogChannelContextOpIncludesStructuredFields(t *testing.T) {
+	var buf bytes.Buffer
+	l := New(&buf)
+	l.LogChannelContextOp("weston", "openai/gpt-4o", ChannelContextOpInfo{
+		Kind:       "raw_window",
+		Channels:   []string{"chan-1", "chan-2"},
+		Retained:   60,
+		Returned:   40,
+		Omitted:    20,
+		Source:     "claw-wall",
+		Status:     "ok",
+		ToolName:   "search_channel_context",
+		StatusCode: 200,
+		LatencyMS:  17,
+	})
+
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if entry["type"] != "channel_context_op" {
+		t.Fatalf("expected type=channel_context_op, got %v", entry["type"])
+	}
+	if entry["kind"] != "raw_window" || entry["source"] != "claw-wall" || entry["status"] != "ok" {
+		t.Fatalf("unexpected channel context fields: %+v", entry)
+	}
+	if entry["retained"].(float64) != 60 || entry["returned"].(float64) != 40 || entry["omitted"].(float64) != 20 {
+		t.Fatalf("unexpected counts: %+v", entry)
+	}
+	channels := entry["channels"].([]any)
+	if len(channels) != 2 || channels[0] != "chan-1" || channels[1] != "chan-2" {
+		t.Fatalf("unexpected channels: %+v", channels)
+	}
+}

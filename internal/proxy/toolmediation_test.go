@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -8,8 +9,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mostlydev/cllama/internal/agentctx"
+	"github.com/mostlydev/cllama/internal/logging"
 )
 
 func TestBuildManagedToolRequestPreservesFlatJSONBodyByDefault(t *testing.T) {
@@ -107,6 +110,143 @@ func TestDispatchManagedToolExecutesMCPTransport(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"ok":true`) || !strings.Contains(string(raw), "echoed") {
 		t.Fatalf("unexpected managed MCP payload: %s", raw)
+	}
+}
+
+func TestCallManagedHTTPToolForClawWallRequiresAllowedChannel(t *testing.T) {
+	var hit bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		if got := r.Header.Get("X-Claw-ID"); got != "weston" {
+			t.Fatalf("expected X-Claw-ID header, got %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer wall-token" {
+			t.Fatalf("expected bearer auth, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	h := NewHandler(nil, func(agentID string) (*agentctx.AgentContext, error) {
+		if agentID != "weston" {
+			t.Fatalf("unexpected agent id %q", agentID)
+		}
+		return &agentctx.AgentContext{
+			ChannelAllowlist: map[string]struct{}{"chan-1": {}},
+		}, nil
+	}, nil)
+
+	raw, status, err := h.callManagedHTTPTool(context.Background(), "weston", agentctx.ToolManifestEntry{
+		Name: "claw-wall.search_channel_context",
+		Execution: agentctx.ToolExecution{
+			Transport: "http",
+			Service:   "claw-wall",
+			BaseURL:   server.URL,
+			Method:    http.MethodPost,
+			Path:      "/search_channel_context",
+			Auth:      &agentctx.AuthEntry{Type: "bearer", Token: "wall-token"},
+		},
+	}, map[string]any{"channels": []any{"chan-1"}, "query": "alpha"})
+	if err != nil {
+		t.Fatalf("callManagedHTTPTool: %v", err)
+	}
+	if status != http.StatusOK || !strings.Contains(string(raw), `"ok":true`) {
+		t.Fatalf("unexpected result status=%d raw=%s", status, raw)
+	}
+	if !hit {
+		t.Fatal("expected claw-wall request to be forwarded")
+	}
+}
+
+func TestCallManagedHTTPToolForClawWallRejectsDisallowedChannel(t *testing.T) {
+	var hit bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	h := NewHandler(nil, func(agentID string) (*agentctx.AgentContext, error) {
+		return &agentctx.AgentContext{
+			ChannelAllowlist: map[string]struct{}{"chan-1": {}},
+		}, nil
+	}, nil)
+
+	raw, status, err := h.callManagedHTTPTool(context.Background(), "weston", agentctx.ToolManifestEntry{
+		Name: "claw-wall.get_channel_messages",
+		Execution: agentctx.ToolExecution{
+			Transport: "http",
+			Service:   "claw-wall",
+			BaseURL:   server.URL,
+			Method:    http.MethodPost,
+			Path:      "/get_channel_messages",
+		},
+	}, map[string]any{"channels": []any{"chan-2"}, "message_ids": []any{"200"}})
+	if err != nil {
+		t.Fatalf("callManagedHTTPTool: %v", err)
+	}
+	if status != http.StatusForbidden || !strings.Contains(string(raw), "channel_not_allowed") {
+		t.Fatalf("expected channel_not_allowed 403, got status=%d raw=%s", status, raw)
+	}
+	if hit {
+		t.Fatal("disallowed claw-wall request should not be forwarded")
+	}
+}
+
+func TestExecuteManagedToolForClawWallPrependsHeaderAndRecordsStatus(t *testing.T) {
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"messages":[],"retained_coverage":{"buffer_size":500},"status":"not_in_buffer","hint":"evicted"}`))
+	}))
+	defer toolSrv.Close()
+
+	var logs bytes.Buffer
+	h := NewHandler(nil, func(agentID string) (*agentctx.AgentContext, error) {
+		return &agentctx.AgentContext{
+			ChannelAllowlist: map[string]struct{}{"chan-1": {}},
+		}, nil
+	}, logging.New(&logs))
+	agentCtx := &agentctx.AgentContext{
+		Tools: &agentctx.ToolManifest{
+			Tools: []agentctx.ToolManifestEntry{{
+				Name: "claw-wall.search_channel_context",
+				Execution: agentctx.ToolExecution{
+					Transport: "http",
+					Service:   "claw-wall",
+					BaseURL:   toolSrv.URL,
+					Method:    http.MethodPost,
+					Path:      "/search_channel_context",
+				},
+			}},
+		},
+	}
+	args := map[string]any{"channels": []any{"chan-1"}, "query": "cmcsa"}
+	argsRaw := json.RawMessage(`{"channels":["chan-1"],"query":"cmcsa"}`)
+
+	outcome, err := h.executeManagedOpenAITool(context.Background(), "weston", agentCtx, openAIToolCall{
+		Name:         "claw-wall.search_channel_context",
+		Arguments:    args,
+		ArgumentsRaw: argsRaw,
+	}, managedToolPolicy{PerToolTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("executeManagedOpenAITool: %v", err)
+	}
+	if !strings.HasPrefix(string(outcome.RawJSON), "[channel-tool] kind=tool_call name=search_channel_context status=not_in_buffer") {
+		t.Fatalf("expected channel-tool header, got %s", outcome.RawJSON)
+	}
+	if outcome.Trace.Status != "not_in_buffer" {
+		t.Fatalf("expected trace status not_in_buffer, got %+v", outcome.Trace)
+	}
+	if !json.Valid(outcome.Trace.Result) {
+		t.Fatalf("trace result must remain valid JSON, got %s", outcome.Trace.Result)
+	}
+	var logEntry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &logEntry); err != nil {
+		t.Fatalf("parse log entry: %v\n%s", err, logs.String())
+	}
+	if logEntry["type"] != "channel_context_op" || logEntry["status"] != "not_in_buffer" || logEntry["tool_name"] != "search_channel_context" {
+		t.Fatalf("unexpected channel_context_op log: %+v", logEntry)
 	}
 }
 
