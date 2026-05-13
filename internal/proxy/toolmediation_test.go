@@ -224,15 +224,15 @@ func TestExecuteManagedToolForClawWallPrependsHeaderAndRecordsStatus(t *testing.
 	args := map[string]any{"channels": []any{"chan-1"}, "query": "cmcsa"}
 	argsRaw := json.RawMessage(`{"channels":["chan-1"],"query":"cmcsa"}`)
 
-	outcome, err := h.executeManagedOpenAITool(context.Background(), "weston", agentCtx, openAIToolCall{
-		Name:         "claw-wall.search_channel_context",
+	outcome, err := h.executeManagedOpenAITool(context.Background(), "weston", "vercel/deepseek/deepseek-v4-pro", agentCtx, openAIToolCall{
+		Name:         "claw-wall_search_channel_context",
 		Arguments:    args,
 		ArgumentsRaw: argsRaw,
 	}, managedToolPolicy{PerToolTimeout: 5 * time.Second})
 	if err != nil {
 		t.Fatalf("executeManagedOpenAITool: %v", err)
 	}
-	if !strings.HasPrefix(string(outcome.RawJSON), "[channel-tool] kind=tool_call name=search_channel_context status=not_in_buffer") {
+	if !strings.HasPrefix(string(outcome.RawJSON), "[channel-tool] kind=tool_call name=claw-wall_search_channel_context_2919442f status=not_in_buffer") {
 		t.Fatalf("expected channel-tool header, got %s", outcome.RawJSON)
 	}
 	if outcome.Trace.Status != "not_in_buffer" {
@@ -241,12 +241,74 @@ func TestExecuteManagedToolForClawWallPrependsHeaderAndRecordsStatus(t *testing.
 	if !json.Valid(outcome.Trace.Result) {
 		t.Fatalf("trace result must remain valid JSON, got %s", outcome.Trace.Result)
 	}
-	var logEntry map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &logEntry); err != nil {
-		t.Fatalf("parse log entry: %v\n%s", err, logs.String())
+	entries := parseLogEntries(t, logs.Bytes())
+	var sawIntervention bool
+	var channelEntry map[string]any
+	for _, entry := range entries {
+		if entry["type"] == "intervention" && entry["intervention"] == managedToolHashlessAliasIntervention+":claw-wall.search_channel_context" {
+			sawIntervention = true
+		}
+		if entry["type"] == "channel_context_op" {
+			channelEntry = entry
+		}
 	}
-	if logEntry["type"] != "channel_context_op" || logEntry["status"] != "not_in_buffer" || logEntry["tool_name"] != "search_channel_context" {
-		t.Fatalf("unexpected channel_context_op log: %+v", logEntry)
+	if !sawIntervention {
+		t.Fatalf("expected hashless alias intervention log, got %+v", entries)
+	}
+	if channelEntry == nil || channelEntry["status"] != "not_in_buffer" || channelEntry["tool_name"] != "search_channel_context" {
+		t.Fatalf("unexpected channel_context_op log: %+v", entries)
+	}
+}
+
+func TestExecuteManagedAnthropicToolAcceptsHashlessAlias(t *testing.T) {
+	var hit bool
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"messages":[],"retained_coverage":{"buffer_size":500},"status":"ok"}`))
+	}))
+	defer toolSrv.Close()
+
+	var logs bytes.Buffer
+	h := NewHandler(nil, func(agentID string) (*agentctx.AgentContext, error) {
+		return &agentctx.AgentContext{
+			ChannelAllowlist: map[string]struct{}{"chan-1": {}},
+		}, nil
+	}, logging.New(&logs))
+	agentCtx := &agentctx.AgentContext{
+		Tools: &agentctx.ToolManifest{
+			Tools: []agentctx.ToolManifestEntry{{
+				Name: "claw-wall.get_channel_messages",
+				Execution: agentctx.ToolExecution{
+					Transport: "http",
+					Service:   "claw-wall",
+					BaseURL:   toolSrv.URL,
+					Method:    http.MethodPost,
+					Path:      "/get_channel_messages",
+				},
+			}},
+		},
+	}
+	args := map[string]any{"channels": []any{"chan-1"}, "author": "Wojtek"}
+	argsRaw := json.RawMessage(`{"channels":["chan-1"],"author":"Wojtek"}`)
+
+	outcome, err := h.executeManagedAnthropicTool(context.Background(), "weston", "anthropic/claude-sonnet-4", agentCtx, anthropicToolUse{
+		Name:         "claw-wall_get_channel_messages",
+		Arguments:    args,
+		ArgumentsRaw: argsRaw,
+	}, managedToolPolicy{PerToolTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("executeManagedAnthropicTool: %v", err)
+	}
+	if !hit {
+		t.Fatal("expected hashless anthropic alias to execute managed HTTP tool")
+	}
+	if outcome.Trace.Name != "claw-wall.get_channel_messages" || outcome.Trace.Status != "ok" {
+		t.Fatalf("unexpected outcome trace: %+v", outcome.Trace)
+	}
+	assertInterventionLogged(t, logs.Bytes(), managedToolHashlessAliasIntervention+":claw-wall.get_channel_messages")
+	if !strings.HasPrefix(string(outcome.RawJSON), "[channel-tool] kind=tool_call name=claw-wall_get_channel_messages_c83b6078 status=ok") {
+		t.Fatalf("expected channel-tool header, got %s", outcome.RawJSON)
 	}
 }
 
