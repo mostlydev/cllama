@@ -44,6 +44,7 @@ const mixedToolOrderMessage = "mixed managed and runner-native tool calls are no
 const managedMixedPrefixSerializedIntervention = "managed_prefix_native_suffix_serialized"
 const mixedToolOrderInternalRetryIntervention = "mixed_tool_order_internal_retry"
 const duplicateManagedToolCallIntervention = "duplicate_managed_tool_call"
+const managedToolHashlessAliasIntervention = "managed_tool_hashless_alias"
 
 type capturedResponse struct {
 	StatusCode    int
@@ -350,7 +351,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				continue
 			}
 			execResult := waitWithManagedKeepalive(streamKeepalive, managedToolWaitComment(len(toolTrace)+1, managedToolDisplayName(agentCtx, call.Name)), func() managedOpenAIToolExecResult {
-				outcome, execErr := h.executeManagedOpenAITool(loopCtx, agentID, agentCtx, call, policy)
+				outcome, execErr := h.executeManagedOpenAITool(loopCtx, agentID, requestedModel, agentCtx, call, policy)
 				return managedOpenAIToolExecResult{Outcome: outcome, Err: execErr}
 			})
 			outcome, execErr := execResult.Outcome, execResult.Err
@@ -562,7 +563,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				continue
 			}
 			execResult := waitWithManagedKeepalive(streamKeepalive, managedToolWaitComment(len(toolTrace)+1, managedToolDisplayName(agentCtx, call.Name)), func() managedAnthropicToolExecResult {
-				outcome, execErr := h.executeManagedAnthropicTool(loopCtx, agentID, agentCtx, call, policy)
+				outcome, execErr := h.executeManagedAnthropicTool(loopCtx, agentID, requestedModel, agentCtx, call, policy)
 				return managedAnthropicToolExecResult{Outcome: outcome, Err: execErr}
 			})
 			outcome, execErr := execResult.Outcome, execResult.Err
@@ -861,7 +862,7 @@ func duplicateManagedToolOutcome(duplicate *managedToolDuplicate) managedToolOut
 	return managedToolOutcome{RawJSON: raw, Trace: trace}
 }
 
-func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, agentCtx *agentctx.AgentContext, call openAIToolCall, policy managedToolPolicy) (managedToolOutcome, error) {
+func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, requestedModel string, agentCtx *agentctx.AgentContext, call openAIToolCall, policy managedToolPolicy) (managedToolOutcome, error) {
 	trace := sessionhistory.ToolCallTrace{
 		Name:      managedToolDisplayName(agentCtx, call.Name),
 		Arguments: call.ArgumentsRaw,
@@ -874,6 +875,9 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 	}
 	trace.Name = resolved.CanonicalName
 	trace.Service = resolved.Manifest.Execution.Service
+	if resolved.HashlessAlias {
+		h.logger.LogIntervention(agentID, requestedModel, managedToolHashlessAliasIntervention+":"+resolved.CanonicalName)
+	}
 	if call.ParseErr != nil {
 		raw := toolErrorPayload("invalid_arguments", fmt.Sprintf("Tool arguments for %s are invalid JSON: %v", trace.Name, call.ParseErr), 0, nil)
 		trace.Result = raw
@@ -921,7 +925,7 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 	return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 }
 
-func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID string, agentCtx *agentctx.AgentContext, call anthropicToolUse, policy managedToolPolicy) (managedToolOutcome, error) {
+func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID string, requestedModel string, agentCtx *agentctx.AgentContext, call anthropicToolUse, policy managedToolPolicy) (managedToolOutcome, error) {
 	trace := sessionhistory.ToolCallTrace{
 		Name:      managedToolDisplayName(agentCtx, call.Name),
 		Arguments: call.ArgumentsRaw,
@@ -934,6 +938,9 @@ func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID strin
 	}
 	trace.Name = resolved.CanonicalName
 	trace.Service = resolved.Manifest.Execution.Service
+	if resolved.HashlessAlias {
+		h.logger.LogIntervention(agentID, requestedModel, managedToolHashlessAliasIntervention+":"+resolved.CanonicalName)
+	}
 	if call.ParseErr != nil {
 		raw := toolErrorPayload("invalid_arguments", fmt.Sprintf("Tool arguments for %s are invalid JSON: %v", trace.Name, call.ParseErr), 0, nil)
 		trace.Result = raw
@@ -1118,7 +1125,7 @@ func (h *Handler) decorateManagedToolResult(agentID string, tool agentctx.ToolMa
 		StatusCode: statusCode,
 		LatencyMS:  latencyMS,
 	})
-	return prependChannelToolHeader(toolName, channels, status, raw)
+	return prependChannelToolHeader(managedToolPresentedName(tool), channels, status, raw)
 }
 
 func managedToolResponseStatus(raw []byte, statusCode int) string {

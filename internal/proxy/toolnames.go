@@ -17,6 +17,7 @@ type resolvedManagedTool struct {
 	Manifest      agentctx.ToolManifestEntry
 	CanonicalName string
 	PresentedName string
+	HashlessAlias bool
 }
 
 func managedToolPresentedName(tool agentctx.ToolManifestEntry) string {
@@ -49,6 +50,31 @@ func managedToolPresentedNameForCanonical(name string) string {
 	return safe + suffix
 }
 
+func managedToolHashlessAliasForCanonical(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "managed_tool"
+	}
+	if isProviderSafeToolName(name) {
+		return name
+	}
+
+	safe := sanitizeManagedToolName(name)
+	if safe == "" {
+		safe = "managed_tool"
+	}
+
+	suffixLen := 1 + managedToolAliasHashBytes*2
+	maxBaseLen := maxManagedToolPresentedNameLen - suffixLen
+	if maxBaseLen < 1 {
+		maxBaseLen = 1
+	}
+	if len(safe) > maxBaseLen {
+		safe = safe[:maxBaseLen]
+	}
+	return safe
+}
+
 func managedToolDisplayName(agentCtx *agentctx.AgentContext, name string) string {
 	resolved, ok := resolveManagedTool(agentCtx, name)
 	if ok && strings.TrimSpace(resolved.CanonicalName) != "" {
@@ -79,6 +105,29 @@ func resolveManagedTool(agentCtx *agentctx.AgentContext, name string) (resolvedM
 				PresentedName: presented,
 			}, true
 		}
+	}
+	var aliasMatch resolvedManagedTool
+	var matched bool
+	for _, tool := range agentCtx.Tools.Tools {
+		canonical := strings.TrimSpace(tool.Name)
+		presented := managedToolPresentedName(tool)
+		hashless := managedToolHashlessAliasForCanonical(canonical)
+		if hashless == "" || hashless == presented || name != hashless {
+			continue
+		}
+		if matched {
+			return resolvedManagedTool{}, false
+		}
+		aliasMatch = resolvedManagedTool{
+			Manifest:      tool,
+			CanonicalName: canonical,
+			PresentedName: presented,
+			HashlessAlias: true,
+		}
+		matched = true
+	}
+	if matched {
+		return aliasMatch, true
 	}
 	return resolvedManagedTool{}, false
 }
