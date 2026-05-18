@@ -14,20 +14,25 @@ import (
 
 // FeedResult is the outcome of a single feed fetch.
 type FeedResult struct {
-	Name        string
-	Source      string
-	Content     string
-	FetchedAt   time.Time
-	Stale       bool
-	Truncated   bool
-	Unavailable bool
+	Name             string
+	Source           string
+	Content          string
+	FetchedAt        time.Time
+	Stale            bool
+	Truncated        bool
+	Unavailable      bool
+	SourceBytes      int
+	SourceBytesExact bool
+	MaxResponseBytes int
 }
 
 type cacheEntry struct {
-	content   string
-	fetchedAt time.Time
-	expiresAt time.Time
-	truncated bool
+	content          string
+	fetchedAt        time.Time
+	expiresAt        time.Time
+	truncated        bool
+	sourceBytes      int
+	sourceBytesExact bool
 }
 
 // Fetcher fetches feed content with TTL caching.
@@ -35,6 +40,7 @@ type Fetcher struct {
 	podName string
 	client  *http.Client
 	logger  *logging.Logger
+	budget  Budget
 	mu      sync.RWMutex
 	cache   map[string]*cacheEntry
 	nowFunc func() time.Time
@@ -42,6 +48,10 @@ type Fetcher struct {
 
 // NewFetcher creates a feed fetcher. Pass nil for the default http.Client.
 func NewFetcher(podName string, client *http.Client, logger *logging.Logger) *Fetcher {
+	return NewFetcherWithBudget(podName, client, logger, DefaultBudget())
+}
+
+func NewFetcherWithBudget(podName string, client *http.Client, logger *logging.Logger, budget Budget) *Fetcher {
 	if client == nil {
 		client = &http.Client{Timeout: FetchTimeout}
 	}
@@ -49,9 +59,17 @@ func NewFetcher(podName string, client *http.Client, logger *logging.Logger) *Fe
 		podName: podName,
 		client:  client,
 		logger:  logger,
+		budget:  budget.Normalize(),
 		cache:   make(map[string]*cacheEntry),
 		nowFunc: time.Now,
 	}
+}
+
+func (f *Fetcher) Budget() Budget {
+	if f == nil {
+		return DefaultBudget()
+	}
+	return f.budget.Normalize()
 }
 
 func (f *Fetcher) cacheKey(agentID, feedURL string) string {
@@ -78,30 +96,37 @@ func (f *Fetcher) Fetch(ctx context.Context, agentID string, entry FeedEntry) (F
 			f.logger.LogFeedFetchWithInfo(agentID, entry.Name, entry.URL, http.StatusOK, 0, &cachedFlag, cached.fetchedAt.UTC().Format(time.RFC3339), nil)
 		}
 		return FeedResult{
-			Name:      entry.Name,
-			Source:    entry.Source,
-			Content:   cached.content,
-			FetchedAt: cached.fetchedAt,
-			Truncated: cached.truncated,
+			Name:             entry.Name,
+			Source:           entry.Source,
+			Content:          cached.content,
+			FetchedAt:        cached.fetchedAt,
+			Truncated:        cached.truncated,
+			SourceBytes:      cached.sourceBytes,
+			SourceBytesExact: cached.sourceBytesExact,
+			MaxResponseBytes: f.Budget().MaxFeedResponseBytes,
 		}, nil
 	}
 
-	content, truncated, err := f.doFetch(ctx, agentID, entry)
+	content, truncated, sourceBytes, sourceBytesExact, err := f.doFetch(ctx, agentID, entry)
 	if err != nil {
 		if hasCached {
 			return FeedResult{
-				Name:      entry.Name,
-				Source:    entry.Source,
-				Content:   cached.content,
-				FetchedAt: cached.fetchedAt,
-				Stale:     true,
-				Truncated: cached.truncated,
+				Name:             entry.Name,
+				Source:           entry.Source,
+				Content:          cached.content,
+				FetchedAt:        cached.fetchedAt,
+				Stale:            true,
+				Truncated:        cached.truncated,
+				SourceBytes:      cached.sourceBytes,
+				SourceBytesExact: cached.sourceBytesExact,
+				MaxResponseBytes: f.Budget().MaxFeedResponseBytes,
 			}, nil
 		}
 		return FeedResult{
-			Name:        entry.Name,
-			Source:      entry.Source,
-			Unavailable: true,
+			Name:             entry.Name,
+			Source:           entry.Source,
+			Unavailable:      true,
+			MaxResponseBytes: f.Budget().MaxFeedResponseBytes,
 		}, nil
 	}
 
@@ -112,10 +137,12 @@ func (f *Fetcher) Fetch(ctx context.Context, agentID string, entry FeedEntry) (F
 		}
 
 		newEntry := &cacheEntry{
-			content:   content,
-			fetchedAt: now,
-			expiresAt: now.Add(time.Duration(ttl) * time.Second),
-			truncated: truncated,
+			content:          content,
+			fetchedAt:        now,
+			expiresAt:        now.Add(time.Duration(ttl) * time.Second),
+			truncated:        truncated,
+			sourceBytes:      sourceBytes,
+			sourceBytesExact: sourceBytesExact,
 		}
 		f.mu.Lock()
 		f.cache[key] = newEntry
@@ -123,15 +150,18 @@ func (f *Fetcher) Fetch(ctx context.Context, agentID string, entry FeedEntry) (F
 	}
 
 	return FeedResult{
-		Name:      entry.Name,
-		Source:    entry.Source,
-		Content:   content,
-		FetchedAt: now,
-		Truncated: truncated,
+		Name:             entry.Name,
+		Source:           entry.Source,
+		Content:          content,
+		FetchedAt:        now,
+		Truncated:        truncated,
+		SourceBytes:      sourceBytes,
+		SourceBytesExact: sourceBytesExact,
+		MaxResponseBytes: f.Budget().MaxFeedResponseBytes,
 	}, nil
 }
 
-func (f *Fetcher) doFetch(ctx context.Context, agentID string, entry FeedEntry) (content string, truncated bool, err error) {
+func (f *Fetcher) doFetch(ctx context.Context, agentID string, entry FeedEntry) (content string, truncated bool, sourceBytes int, sourceBytesExact bool, err error) {
 	start := time.Now()
 	statusCode := 0
 	defer func() {
@@ -143,7 +173,7 @@ func (f *Fetcher) doFetch(ctx context.Context, agentID string, entry FeedEntry) 
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, entry.URL, nil)
 	if err != nil {
-		return "", false, fmt.Errorf("build feed request: %w", err)
+		return "", false, 0, false, fmt.Errorf("build feed request: %w", err)
 	}
 	req.Header.Set("X-Claw-ID", agentID)
 	req.Header.Set("X-Claw-Pod", f.podName)
@@ -155,27 +185,34 @@ func (f *Fetcher) doFetch(ctx context.Context, agentID string, entry FeedEntry) 
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return "", false, fmt.Errorf("fetch feed %q: %w", entry.Name, err)
+		return "", false, 0, false, fmt.Errorf("fetch feed %q: %w", entry.Name, err)
 	}
 	defer resp.Body.Close()
 	statusCode = resp.StatusCode
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", false, fmt.Errorf("feed %q returned status %d", entry.Name, resp.StatusCode)
+		return "", false, 0, false, fmt.Errorf("feed %q returned status %d", entry.Name, resp.StatusCode)
 	}
 
-	limited := io.LimitReader(resp.Body, int64(MaxFeedResponseBytes+1))
+	maxBytes := f.Budget().MaxFeedResponseBytes
+	limited := io.LimitReader(resp.Body, int64(maxBytes+1))
 	body, err := io.ReadAll(limited)
 	if err != nil {
-		return "", false, fmt.Errorf("read feed %q body: %w", entry.Name, err)
+		return "", false, 0, false, fmt.Errorf("read feed %q body: %w", entry.Name, err)
 	}
 
-	if len(body) > MaxFeedResponseBytes {
-		body = body[:MaxFeedResponseBytes]
+	sourceBytes = len(body)
+	if resp.ContentLength >= 0 {
+		sourceBytes = int(resp.ContentLength)
+		sourceBytesExact = true
+	}
+
+	if len(body) > maxBytes {
+		body = body[:maxBytes]
 		truncated = true
 	}
 
-	return formatFeedContent(body, resp.Header.Get("Content-Type")), truncated, nil
+	return formatFeedContent(body, resp.Header.Get("Content-Type")), truncated, sourceBytes, sourceBytesExact, nil
 }
 
 func formatFeedContent(body []byte, contentType string) string {

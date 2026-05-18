@@ -36,6 +36,7 @@ type Handler struct {
 	accumulator           *cost.Accumulator
 	pricing               *cost.Pricing
 	feedFetcher           *feeds.Fetcher
+	feedBudget            feeds.Budget
 	mcpClient             *mcp.Client
 	managedTurns          *managedOpenAIContinuityStore
 	managedAnthropicTurns *managedAnthropicContinuityStore
@@ -59,7 +60,16 @@ func WithCostTracking(acc *cost.Accumulator, pricing *cost.Pricing) HandlerOptio
 // WithFeeds enables feed injection using the given pod name for identity headers.
 func WithFeeds(podName string) HandlerOption {
 	return func(h *Handler) {
-		h.feedFetcher = feeds.NewFetcher(podName, nil, h.logger)
+		budget := feeds.BudgetFromEnv()
+		h.feedBudget = budget
+		h.feedFetcher = feeds.NewFetcherWithBudget(podName, nil, h.logger, budget)
+	}
+}
+
+func WithFeedBudget(podName string, budget feeds.Budget) HandlerOption {
+	return func(h *Handler) {
+		h.feedBudget = budget.Normalize()
+		h.feedFetcher = feeds.NewFetcherWithBudget(podName, nil, h.logger, h.feedBudget)
 	}
 }
 
@@ -137,6 +147,7 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 		managedAnthropicTurns: newManagedAnthropicContinuityStore(defaultManagedToolContinuityTurns),
 		channelCursors:        newChannelCursorStore(""),
 		snapshots:             NewContextSnapshotStore(),
+		feedBudget:            feeds.DefaultBudget(),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -145,7 +156,7 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 	return h
 }
 
-func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, incomingEpoch string) fetchedFeedContext {
+func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, incomingEpoch string, requestedModel string) fetchedFeedContext {
 	var out fetchedFeedContext
 	if h.feedFetcher == nil || agentCtx == nil || agentCtx.ContextDir == "" {
 		return out
@@ -213,12 +224,25 @@ func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *a
 		}
 		results = append(results, result)
 	}
-	for _, result := range results {
-		if block := feeds.FormatFeedBlock(result); block != "" {
-			out.Blocks = append(out.Blocks, block)
-		}
+	formatted := feeds.FormatFeeds(results, h.feedBudget)
+	out.Blocks = formatted.Blocks
+	out.Combined = formatted.Combined
+	for _, feed := range formatted.Feeds {
+		h.logger.LogFeedInjection(agentID, requestedModel, logging.FeedInjectionInfo{
+			Name:                 feed.Name,
+			Source:               feed.Source,
+			Status:               feed.Status,
+			Truncated:            feed.Truncated,
+			SourceBytes:          feed.SourceBytes,
+			SourceBytesExact:     feed.SourceBytesExact,
+			ContentBytes:         feed.ContentBytes,
+			BlockBytes:           feed.BlockBytes,
+			TotalBytesBefore:     feed.TotalBytesBefore,
+			TotalBytesAfter:      feed.TotalBytesAfter,
+			MaxFeedResponseBytes: feed.MaxFeedResponseBytes,
+			MaxTotalFeedBytes:    feed.MaxTotalFeedBytes,
+		})
 	}
-	out.Combined = feeds.FormatAllFeeds(results)
 	return out
 }
 
@@ -287,7 +311,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	}
 	memoryRecall := h.recallOpenAIMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
 	incomingEpoch := strings.TrimSpace(r.Header.Get("X-Claw-Consumer-Session-Epoch"))
-	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx, incomingEpoch)
+	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx, incomingEpoch, requestedModel)
 	timeContext := currentTimeLine(agentCtx, time.Now())
 	dynamicContext := joinRuntimeContext(memoryRecall, feedCtx.Combined, timeContext)
 	feeds.AppendLateContext(payload, dynamicContext)
@@ -374,7 +398,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	}
 	memoryRecall := h.recallAnthropicMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
 	incomingEpoch := strings.TrimSpace(r.Header.Get("X-Claw-Consumer-Session-Epoch"))
-	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx, incomingEpoch)
+	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx, incomingEpoch, requestedModel)
 	timeContext := currentTimeLine(agentCtx, time.Now())
 	dynamicContext := joinRuntimeContext(memoryRecall, feedCtx.Combined, timeContext)
 	feeds.AppendAnthropicLateContext(payload, dynamicContext)

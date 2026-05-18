@@ -103,6 +103,8 @@ docker run -p 8080:8080 -p 8081:8081 \
 | `CLAW_AUTH_DIR` | `/claw/auth` | Provider credentials |
 | `CLAW_POD` | | Pod name (dashboard display) |
 | `CLAW_SESSION_HISTORY_DIR` | `/claw/session-history` | Per-agent JSONL session history base dir. When set, cllama appends one entry per successful 2xx upstream completion to `<dir>/<agent-id>/history.jsonl`. |
+| `CLLAMA_FEED_MAX_RESPONSE_BYTES` | `32768` | Maximum bytes read from any single feed response before truncation. |
+| `CLLAMA_FEED_MAX_TOTAL_BYTES` | `65536` | Maximum aggregate bytes of formatted feed blocks injected into one request. |
 | `OPENAI_API_KEY` | | Provider key override |
 | `ANTHROPIC_API_KEY` | | Provider key override |
 | `OPENROUTER_API_KEY` | | Provider key override |
@@ -113,6 +115,11 @@ docker run -p 8080:8080 -p 8081:8081 \
 | `AI_GATEWAY_BASE_URL` | `https://ai-gateway.vercel.sh/v1` | Override for Vercel AI Gateway's OpenAI-compatible base URL |
 
 Environment variables override keys saved via the web UI.
+
+When cllama runs under Clawdapus, set feed budget variables through
+`x-claw.cllama-defaults.env` or service-level `x-claw.cllama-env`. The defaults
+stay intentionally bounded for small pods; larger Discord or market-context
+windows should raise both the per-feed and aggregate caps together.
 
 For Vercel AI Gateway routing, declare models as `vercel/<provider>/<model>`,
 for example `vercel/anthropic/claude-sonnet-4.6`. cllama forwards the model
@@ -232,6 +239,12 @@ Every request/response pair emits a structured JSON log line to stdout:
 `intervention` is always `null` in passthrough mode. Policy proxies will populate it with the rule that triggered an amendment, drop, or reroute — the raw material for drift scoring.
 
 These logs feed `docker compose logs`, fleet telemetry pipelines, and `claw audit`.
+
+Feed injection emits a separate `feed_injection` event for each manifest entry.
+It records whether the feed was `included`, `empty`, or `skipped_total_cap`, plus
+source/content/block byte counts, effective caps, and whether the feed body was
+truncated before formatting. Context snapshots store the actual provider-visible
+feed blocks and skip notices, not just the fetched feed list.
 
 ---
 

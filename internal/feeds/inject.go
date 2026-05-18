@@ -5,6 +5,34 @@ import (
 	"strings"
 )
 
+const (
+	FeedInjectionIncluded        = "included"
+	FeedInjectionEmpty           = "empty"
+	FeedInjectionSkippedTotalCap = "skipped_total_cap"
+)
+
+type FormattedFeed struct {
+	Name                 string
+	Source               string
+	Status               string
+	Block                string
+	Truncated            bool
+	SourceBytes          int
+	SourceBytesExact     bool
+	ContentBytes         int
+	BlockBytes           int
+	TotalBytesBefore     int
+	TotalBytesAfter      int
+	MaxFeedResponseBytes int
+	MaxTotalFeedBytes    int
+}
+
+type FormattedFeeds struct {
+	Combined string
+	Blocks   []string
+	Feeds    []FormattedFeed
+}
+
 // FormatFeedBlock formats a single feed result as a delimited context block.
 func FormatFeedBlock(r FeedResult) string {
 	if !r.Unavailable && r.Content == "" {
@@ -42,30 +70,75 @@ func FormatFeedBlock(r FeedResult) string {
 // FormatAllFeeds concatenates formatted feed blocks in manifest order while
 // enforcing a total size cap.
 func FormatAllFeeds(results []FeedResult) string {
+	return FormatFeeds(results, DefaultBudget()).Combined
+}
+
+// FormatFeeds concatenates formatted feed blocks in manifest order, records
+// which blocks are actually provider-visible, and emits visible skip markers
+// when the aggregate cap prevents a fetched feed from being injected.
+func FormatFeeds(results []FeedResult, budget Budget) FormattedFeeds {
 	if len(results) == 0 {
-		return ""
+		return FormattedFeeds{}
 	}
 
+	budget = budget.Normalize()
+	out := FormattedFeeds{Feeds: make([]FormattedFeed, 0, len(results))}
 	var b strings.Builder
 	totalBytes := 0
 
-	for i, r := range results {
+	for _, r := range results {
 		block := FormatFeedBlock(r)
+		status := FormattedFeed{
+			Name:                 r.Name,
+			Source:               r.Source,
+			Status:               FeedInjectionEmpty,
+			Truncated:            r.Truncated,
+			SourceBytes:          r.SourceBytes,
+			SourceBytesExact:     r.SourceBytesExact,
+			ContentBytes:         len(r.Content),
+			BlockBytes:           len(block),
+			TotalBytesBefore:     totalBytes,
+			TotalBytesAfter:      totalBytes,
+			MaxFeedResponseBytes: nonZero(r.MaxResponseBytes, budget.MaxFeedResponseBytes),
+			MaxTotalFeedBytes:    budget.MaxTotalFeedBytes,
+		}
 		if block == "" {
+			out.Feeds = append(out.Feeds, status)
 			continue
 		}
-		if totalBytes+len(block) > MaxTotalFeedBytes {
-			fmt.Fprintf(&b, "--- FEED: %s skipped (total feed size cap reached) ---\n", r.Name)
+		if totalBytes+len(block) > budget.MaxTotalFeedBytes {
+			status.Status = FeedInjectionSkippedTotalCap
+			notice := fmt.Sprintf("--- FEED: %s skipped (total feed size cap reached; block_bytes=%d total_before=%d max_total_bytes=%d) ---", r.Name, len(block), totalBytes, budget.MaxTotalFeedBytes)
+			status.Block = notice
+			if b.Len() > 0 {
+				b.WriteByte('\n')
+			}
+			b.WriteString(notice)
+			out.Blocks = append(out.Blocks, notice)
+			out.Feeds = append(out.Feeds, status)
 			continue
 		}
-		if b.Len() > 0 && i > 0 {
+		if b.Len() > 0 {
 			b.WriteByte('\n')
 		}
 		b.WriteString(block)
 		totalBytes += len(block)
+		status.Status = FeedInjectionIncluded
+		status.Block = block
+		status.TotalBytesAfter = totalBytes
+		out.Blocks = append(out.Blocks, block)
+		out.Feeds = append(out.Feeds, status)
 	}
 
-	return b.String()
+	out.Combined = b.String()
+	return out
+}
+
+func nonZero(value, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	return fallback
 }
 
 // InjectOpenAI appends feed context to the system message in an OpenAI-compatible

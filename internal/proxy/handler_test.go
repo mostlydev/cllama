@@ -18,6 +18,7 @@ import (
 
 	"github.com/mostlydev/cllama/internal/agentctx"
 	"github.com/mostlydev/cllama/internal/cost"
+	"github.com/mostlydev/cllama/internal/feeds"
 	"github.com/mostlydev/cllama/internal/logging"
 	"github.com/mostlydev/cllama/internal/provider"
 )
@@ -3437,6 +3438,117 @@ func TestHandlerInjectsFeedsIntoOpenAI(t *testing.T) {
 	timeIdx := strings.Index(content, "Current time:")
 	if feedIdx > timeIdx {
 		t.Errorf("expected feeds before time (append order), feed@%d time@%d", feedIdx, timeIdx)
+	}
+}
+
+func TestHandlerReportsSkippedFeedInjectionInSnapshotAndLogs(t *testing.T) {
+	feedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/awareness":
+			_, _ = w.Write([]byte(strings.Repeat("a", 96)))
+		case "/context":
+			_, _ = w.Write([]byte(strings.Repeat("b", 96)))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer feedSrv.Close()
+
+	ctxDir := t.TempDir()
+	agentDir := filepath.Join(ctxDir, "weston")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	feedsJSON := fmt.Sprintf(`[
+		{"name":"channel-awareness","source":"claw-wall","path":"/awareness","ttl":30,"url":"%s/awareness"},
+		{"name":"channel-context","source":"claw-wall","path":"/context","ttl":30,"url":"%s/context"}
+	]`, feedSrv.URL, feedSrv.URL)
+	for name, content := range map[string]string{
+		"AGENTS.md":     "# C",
+		"CLAWDAPUS.md":  "# I",
+		"metadata.json": `{"token":"weston:secret","pod":"test-pod","timezone":"UTC"}`,
+		"feeds.json":    feedsJSON,
+	} {
+		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var gotBody []byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	var logs bytes.Buffer
+	store := NewContextSnapshotStore()
+	h := NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
+		return agentctx.Load(ctxDir, agentID)
+	}, logging.New(&logs),
+		WithFeedBudget("test-pod", feeds.Budget{MaxFeedResponseBytes: 512, MaxTotalFeedBytes: len(feeds.FormatFeedBlock(feeds.FeedResult{Name: "channel-awareness", Source: "claw-wall", Content: strings.Repeat("a", 96)})) + 1}),
+		WithSnapshotStore(store),
+	)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"openrouter/anthropic/claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer weston:secret")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	messages := payload["messages"].([]any)
+	contextText := messages[0].(map[string]any)["content"].(string)
+	if !strings.Contains(contextText, "BEGIN FEED: channel-awareness") {
+		t.Fatalf("expected channel-awareness included, got %q", contextText)
+	}
+	if strings.Contains(contextText, "BEGIN FEED: channel-context") {
+		t.Fatalf("channel-context block should not be provider-visible, got %q", contextText)
+	}
+	if !strings.Contains(contextText, "channel-context skipped") {
+		t.Fatalf("expected provider-visible skip notice, got %q", contextText)
+	}
+
+	snapshot, ok := store.Get("weston")
+	if !ok {
+		t.Fatal("expected context snapshot")
+	}
+	if len(snapshot.FeedBlocks) != 2 || !strings.Contains(snapshot.FeedBlocks[1], "channel-context skipped") {
+		t.Fatalf("snapshot should contain included feed and skip notice only, got %+v", snapshot.FeedBlocks)
+	}
+
+	entries := parseLogEntries(t, logs.Bytes())
+	var sawIncluded, sawSkipped bool
+	for _, entry := range entries {
+		if entry["type"] != "feed_injection" {
+			continue
+		}
+		switch entry["feed_name"] {
+		case "channel-awareness":
+			sawIncluded = entry["feed_status"] == feeds.FeedInjectionIncluded
+		case "channel-context":
+			sawSkipped = entry["feed_status"] == feeds.FeedInjectionSkippedTotalCap &&
+				entry["feed_max_total_bytes"].(float64) > 0 &&
+				entry["feed_block_bytes"].(float64) > 0
+		}
+	}
+	if !sawIncluded || !sawSkipped {
+		t.Fatalf("expected included and skipped feed_injection logs, got %+v", entries)
 	}
 }
 

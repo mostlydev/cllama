@@ -29,6 +29,16 @@ type entry struct {
 	FeedURL            string   `json:"feed_url,omitempty"`
 	FeedFetchedAt      string   `json:"feed_fetched_at,omitempty"`
 	FeedCached         *bool    `json:"feed_cached,omitempty"`
+	FeedStatus         string   `json:"feed_status,omitempty"`
+	FeedTruncated      *bool    `json:"feed_truncated,omitempty"`
+	FeedSourceBytes    *int     `json:"feed_source_bytes,omitempty"`
+	FeedSourceExact    *bool    `json:"feed_source_exact,omitempty"`
+	FeedContentBytes   *int     `json:"feed_content_bytes,omitempty"`
+	FeedBlockBytes     *int     `json:"feed_block_bytes,omitempty"`
+	FeedTotalBefore    *int     `json:"feed_total_before,omitempty"`
+	FeedTotalAfter     *int     `json:"feed_total_after,omitempty"`
+	FeedMaxResponse    *int     `json:"feed_max_response_bytes,omitempty"`
+	FeedMaxTotal       *int     `json:"feed_max_total_bytes,omitempty"`
 	LatencyMS          *int64   `json:"latency_ms,omitempty"`
 	StatusCode         *int     `json:"status_code,omitempty"`
 	TokensIn           *int     `json:"tokens_in,omitempty"`
@@ -77,6 +87,23 @@ type RequestInfo struct {
 	FirstNonSystemHash string
 	DynamicContextHash string
 	ToolsHash          string
+}
+
+// FeedInjectionInfo records whether a fetched feed block actually reached the
+// provider-visible runtime context after per-feed and aggregate byte caps.
+type FeedInjectionInfo struct {
+	Name                 string
+	Source               string
+	Status               string
+	Truncated            bool
+	SourceBytes          int
+	SourceBytesExact     bool
+	ContentBytes         int
+	BlockBytes           int
+	TotalBytesBefore     int
+	TotalBytesAfter      int
+	MaxFeedResponseBytes int
+	MaxTotalFeedBytes    int
 }
 
 // MemoryOpInfo holds structured telemetry for memory recall/retain hooks.
@@ -222,6 +249,29 @@ func (l *Logger) LogFeedFetchWithInfo(clawID, feedName, feedURL string, statusCo
 	}
 	if err != nil {
 		e.Error = err.Error()
+	}
+	l.log(e)
+}
+
+func (l *Logger) LogFeedInjection(clawID, model string, info FeedInjectionInfo) {
+	e := entry{
+		TS:               time.Now().UTC().Format(time.RFC3339),
+		ClawID:           clawID,
+		Type:             "feed_injection",
+		Model:            model,
+		FeedName:         info.Name,
+		Source:           ptrString(info.Source),
+		FeedStatus:       info.Status,
+		FeedTruncated:    ptrBool(info.Truncated),
+		FeedSourceBytes:  ptrInt(info.SourceBytes),
+		FeedSourceExact:  ptrBool(info.SourceBytesExact),
+		FeedContentBytes: ptrInt(info.ContentBytes),
+		FeedBlockBytes:   ptrInt(info.BlockBytes),
+		FeedTotalBefore:  ptrInt(info.TotalBytesBefore),
+		FeedTotalAfter:   ptrInt(info.TotalBytesAfter),
+		FeedMaxResponse:  ptrInt(info.MaxFeedResponseBytes),
+		FeedMaxTotal:     ptrInt(info.MaxTotalFeedBytes),
+		Intervention:     nil,
 	}
 	l.log(e)
 }
