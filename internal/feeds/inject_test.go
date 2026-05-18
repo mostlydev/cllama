@@ -128,6 +128,38 @@ func TestFormatAllFeedsTotalSizeCap(t *testing.T) {
 	}
 }
 
+func TestFormatFeedsReportsProviderVisibleBlocks(t *testing.T) {
+	results := []FeedResult{
+		{Name: "channel-awareness", Source: "claw-wall", Content: strings.Repeat("a", 64), FetchedAt: time.Now(), SourceBytes: 64, SourceBytesExact: true, MaxResponseBytes: 128},
+		{Name: "channel-context", Source: "claw-wall", Content: strings.Repeat("b", 64), FetchedAt: time.Now(), SourceBytes: 64, SourceBytesExact: true, MaxResponseBytes: 128},
+	}
+	firstBlock := FormatFeedBlock(results[0])
+	budget := Budget{MaxFeedResponseBytes: 128, MaxTotalFeedBytes: len(firstBlock) + 1}
+
+	formatted := FormatFeeds(results, budget)
+	if !strings.Contains(formatted.Combined, "BEGIN FEED: channel-awareness") {
+		t.Fatalf("expected first feed to be visible, got %q", formatted.Combined)
+	}
+	if strings.Contains(formatted.Combined, "BEGIN FEED: channel-context") {
+		t.Fatalf("second feed block should be skipped, got %q", formatted.Combined)
+	}
+	if !strings.Contains(formatted.Combined, "channel-context skipped") {
+		t.Fatalf("skip notice should be provider-visible, got %q", formatted.Combined)
+	}
+	if len(formatted.Blocks) != 2 {
+		t.Fatalf("expected visible included block plus skip notice, got %d blocks", len(formatted.Blocks))
+	}
+	if formatted.Feeds[0].Status != FeedInjectionIncluded {
+		t.Fatalf("first feed status = %q", formatted.Feeds[0].Status)
+	}
+	if formatted.Feeds[1].Status != FeedInjectionSkippedTotalCap {
+		t.Fatalf("second feed status = %q", formatted.Feeds[1].Status)
+	}
+	if formatted.Feeds[1].BlockBytes == 0 || formatted.Feeds[1].MaxTotalFeedBytes != budget.MaxTotalFeedBytes {
+		t.Fatalf("missing byte metadata for skipped feed: %+v", formatted.Feeds[1])
+	}
+}
+
 func TestInjectOpenAINoExistingSystem(t *testing.T) {
 	payload := map[string]any{
 		"model": "openai/gpt-4o",

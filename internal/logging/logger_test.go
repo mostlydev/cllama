@@ -166,6 +166,42 @@ func TestLogFeedFetchIncludesFeedFields(t *testing.T) {
 	}
 }
 
+func TestLogFeedInjectionIncludesBudgetFields(t *testing.T) {
+	var buf bytes.Buffer
+	l := New(&buf)
+	l.LogFeedInjection("weston", "openrouter/model", FeedInjectionInfo{
+		Name:                 "channel-awareness",
+		Source:               "claw-wall",
+		Status:               "skipped_total_cap",
+		Truncated:            true,
+		SourceBytes:          107000,
+		SourceBytesExact:     true,
+		ContentBytes:         32768,
+		BlockBytes:           33000,
+		TotalBytesBefore:     64000,
+		TotalBytesAfter:      64000,
+		MaxFeedResponseBytes: 32768,
+		MaxTotalFeedBytes:    65536,
+	})
+
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if entry["type"] != "feed_injection" {
+		t.Fatalf("expected type=feed_injection, got %v", entry["type"])
+	}
+	if entry["feed_name"] != "channel-awareness" || entry["source"] != "claw-wall" {
+		t.Fatalf("unexpected feed identity fields: %+v", entry)
+	}
+	if entry["feed_status"] != "skipped_total_cap" || entry["feed_truncated"] != true {
+		t.Fatalf("unexpected feed status fields: %+v", entry)
+	}
+	if entry["feed_source_bytes"].(float64) != 107000 || entry["feed_max_total_bytes"].(float64) != 65536 {
+		t.Fatalf("unexpected feed byte fields: %+v", entry)
+	}
+}
+
 func TestLogToolManifestIncludesStructuredFields(t *testing.T) {
 	var buf bytes.Buffer
 	l := New(&buf)

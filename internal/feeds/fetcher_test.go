@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -184,5 +185,32 @@ func TestFetcherTruncatesOversizeResponse(t *testing.T) {
 	}
 	if !result.Truncated {
 		t.Error("expected truncated=true")
+	}
+}
+
+func TestFetcherUsesConfiguredResponseBudget(t *testing.T) {
+	big := strings.Repeat("x", 2048)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(big)))
+		_, _ = w.Write([]byte(big))
+	}))
+	defer srv.Close()
+
+	f := NewFetcherWithBudget("pod", nil, nil, Budget{MaxFeedResponseBytes: 1024, MaxTotalFeedBytes: MaxTotalFeedBytes})
+	result, err := f.Fetch(context.Background(), "agent", FeedEntry{Name: "big", URL: srv.URL, TTL: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Content) != 1024 {
+		t.Fatalf("expected content truncated to 1024 bytes, got %d", len(result.Content))
+	}
+	if !result.Truncated {
+		t.Fatal("expected truncated=true")
+	}
+	if result.MaxResponseBytes != 1024 {
+		t.Fatalf("MaxResponseBytes = %d; want 1024", result.MaxResponseBytes)
+	}
+	if result.SourceBytes != len(big) || !result.SourceBytesExact {
+		t.Fatalf("expected exact source bytes %d, got %d exact=%v", len(big), result.SourceBytes, result.SourceBytesExact)
 	}
 }
