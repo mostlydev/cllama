@@ -182,6 +182,8 @@ func TestLogFeedInjectionIncludesBudgetFields(t *testing.T) {
 		TotalBytesAfter:      64000,
 		MaxFeedResponseBytes: 32768,
 		MaxTotalFeedBytes:    65536,
+		RawBytes:             12000,
+		DigestBytes:          800,
 	})
 
 	var entry map[string]any
@@ -199,6 +201,9 @@ func TestLogFeedInjectionIncludesBudgetFields(t *testing.T) {
 	}
 	if entry["feed_source_bytes"].(float64) != 107000 || entry["feed_max_total_bytes"].(float64) != 65536 {
 		t.Fatalf("unexpected feed byte fields: %+v", entry)
+	}
+	if entry["feed_raw_bytes"].(float64) != 12000 || entry["feed_digest_bytes"].(float64) != 800 {
+		t.Fatalf("unexpected channel feed byte fields: %+v", entry)
 	}
 }
 
@@ -267,17 +272,23 @@ func TestLogMemoryOpIncludesStructuredFields(t *testing.T) {
 func TestLogChannelContextOpIncludesStructuredFields(t *testing.T) {
 	var buf bytes.Buffer
 	l := New(&buf)
+	deterministic := true
 	l.LogChannelContextOp("weston", "openai/gpt-4o", ChannelContextOpInfo{
-		Kind:       "raw_window",
-		Channels:   []string{"chan-1", "chan-2"},
-		Retained:   60,
-		Returned:   40,
-		Omitted:    20,
-		Source:     "claw-wall",
-		Status:     "ok",
-		ToolName:   "search_channel_context",
-		StatusCode: 200,
-		LatencyMS:  17,
+		Kind:              "raw_window+digest",
+		Channels:          []string{"chan-1", "chan-2"},
+		Retained:          60,
+		Returned:          40,
+		Omitted:           20,
+		RawBytes:          2048,
+		DigestBytes:       512,
+		DigestBlocks:      3,
+		CoverageGaps:      1,
+		DeterministicOnly: &deterministic,
+		Source:            "claw-wall",
+		Status:            "coverage_gap",
+		ToolName:          "search_channel_context",
+		StatusCode:        200,
+		LatencyMS:         17,
 	})
 
 	var entry map[string]any
@@ -287,7 +298,7 @@ func TestLogChannelContextOpIncludesStructuredFields(t *testing.T) {
 	if entry["type"] != "channel_context_op" {
 		t.Fatalf("expected type=channel_context_op, got %v", entry["type"])
 	}
-	if entry["kind"] != "raw_window" || entry["source"] != "claw-wall" || entry["status"] != "ok" {
+	if entry["kind"] != "raw_window+digest" || entry["source"] != "claw-wall" || entry["status"] != "coverage_gap" {
 		t.Fatalf("unexpected channel context fields: %+v", entry)
 	}
 	if entry["retained"].(float64) != 60 || entry["returned"].(float64) != 40 || entry["omitted"].(float64) != 20 {
@@ -296,5 +307,11 @@ func TestLogChannelContextOpIncludesStructuredFields(t *testing.T) {
 	channels := entry["channels"].([]any)
 	if len(channels) != 2 || channels[0] != "chan-1" || channels[1] != "chan-2" {
 		t.Fatalf("unexpected channels: %+v", channels)
+	}
+	if entry["raw_bytes"].(float64) != 2048 || entry["digest_bytes"].(float64) != 512 || entry["digest_blocks"].(float64) != 3 || entry["coverage_gaps"].(float64) != 1 {
+		t.Fatalf("unexpected digest telemetry fields: %+v", entry)
+	}
+	if entry["deterministic_only"] != true {
+		t.Fatalf("expected deterministic_only=true, got %+v", entry)
 	}
 }

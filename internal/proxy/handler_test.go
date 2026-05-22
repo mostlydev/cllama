@@ -3442,10 +3442,11 @@ func TestHandlerInjectsFeedsIntoOpenAI(t *testing.T) {
 }
 
 func TestHandlerReportsSkippedFeedInjectionInSnapshotAndLogs(t *testing.T) {
+	awarenessContent := "[channel-awareness] kind=raw_window+digest since=24h channels=chan-1 messages=10 available=60 omitted=50 retained=60/since-24h digest=coverage_gap raw_bytes=12000 digest_bytes=800 digest_blocks=3 coverage_gaps=1 deterministic_only=true\n" + strings.Repeat("a", 96)
 	feedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/awareness":
-			_, _ = w.Write([]byte(strings.Repeat("a", 96)))
+			_, _ = w.Write([]byte(awarenessContent))
 		case "/context":
 			_, _ = w.Write([]byte(strings.Repeat("b", 96)))
 		default:
@@ -3496,7 +3497,7 @@ func TestHandlerReportsSkippedFeedInjectionInSnapshotAndLogs(t *testing.T) {
 	h := NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
 		return agentctx.Load(ctxDir, agentID)
 	}, logging.New(&logs),
-		WithFeedBudget("test-pod", feeds.Budget{MaxFeedResponseBytes: 512, MaxTotalFeedBytes: len(feeds.FormatFeedBlock(feeds.FeedResult{Name: "channel-awareness", Source: "claw-wall", Content: strings.Repeat("a", 96)})) + 1}),
+		WithFeedBudget("test-pod", feeds.Budget{MaxFeedResponseBytes: 512, MaxTotalFeedBytes: len(feeds.FormatFeedBlock(feeds.FeedResult{Name: "channel-awareness", Source: "claw-wall", Content: awarenessContent})) + 1}),
 		WithSnapshotStore(store),
 	)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"openrouter/anthropic/claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`))
@@ -3533,22 +3534,31 @@ func TestHandlerReportsSkippedFeedInjectionInSnapshotAndLogs(t *testing.T) {
 	}
 
 	entries := parseLogEntries(t, logs.Bytes())
-	var sawIncluded, sawSkipped bool
+	var sawIncluded, sawSkipped, sawChannelOp bool
 	for _, entry := range entries {
-		if entry["type"] != "feed_injection" {
-			continue
+		if entry["type"] == "channel_context_op" && entry["kind"] == "raw_window+digest" {
+			sawChannelOp = entry["status"] == "coverage_gap" &&
+				entry["raw_bytes"].(float64) == 12000 &&
+				entry["digest_bytes"].(float64) == 800 &&
+				entry["digest_blocks"].(float64) == 3 &&
+				entry["coverage_gaps"].(float64) == 1 &&
+				entry["deterministic_only"] == true
 		}
-		switch entry["feed_name"] {
-		case "channel-awareness":
-			sawIncluded = entry["feed_status"] == feeds.FeedInjectionIncluded
-		case "channel-context":
-			sawSkipped = entry["feed_status"] == feeds.FeedInjectionSkippedTotalCap &&
-				entry["feed_max_total_bytes"].(float64) > 0 &&
-				entry["feed_block_bytes"].(float64) > 0
+		if entry["type"] == "feed_injection" {
+			switch entry["feed_name"] {
+			case "channel-awareness":
+				sawIncluded = entry["feed_status"] == feeds.FeedInjectionIncluded &&
+					entry["feed_raw_bytes"].(float64) == 12000 &&
+					entry["feed_digest_bytes"].(float64) == 800
+			case "channel-context":
+				sawSkipped = entry["feed_status"] == feeds.FeedInjectionSkippedTotalCap &&
+					entry["feed_max_total_bytes"].(float64) > 0 &&
+					entry["feed_block_bytes"].(float64) > 0
+			}
 		}
 	}
-	if !sawIncluded || !sawSkipped {
-		t.Fatalf("expected included and skipped feed_injection logs, got %+v", entries)
+	if !sawIncluded || !sawSkipped || !sawChannelOp {
+		t.Fatalf("expected included/skipped feed_injection and digest channel_context_op logs, got %+v", entries)
 	}
 }
 

@@ -140,11 +140,14 @@ func TestParseChannelContextMetadata(t *testing.T) {
 }
 
 func TestParseChannelAwarenessMetadata(t *testing.T) {
-	meta := parseChannelContextMetadata("[channel-awareness] kind=raw_window since=24h channels=chan-a,chan-b messages=40 available=60 omitted=20 retained=60/since-24h digest=unavailable\nbody")
-	if meta.Kind != "raw_window" || meta.Returned != 40 || meta.Retained != 60 || meta.Omitted != 20 || meta.Status != "ok" {
+	meta := parseChannelContextMetadata("[channel-awareness] kind=raw_window+digest since=24h channels=chan-a,chan-b messages=40 available=60 omitted=20 retained=60/since-24h digest=coverage_gap raw_bytes=12000 digest_bytes=800 digest_blocks=3 coverage_gaps=1 deterministic_only=true\nbody")
+	if meta.Kind != "raw_window+digest" || meta.Returned != 40 || meta.Retained != 60 || meta.Omitted != 20 || meta.Status != "coverage_gap" {
 		t.Fatalf("unexpected awareness metadata: %+v", meta)
 	}
 	if len(meta.Channels) != 2 || meta.Channels[0] != "chan-a" || meta.Channels[1] != "chan-b" {
 		t.Fatalf("unexpected channels: %+v", meta.Channels)
+	}
+	if meta.RawBytes != 12000 || meta.DigestBytes != 800 || meta.DigestBlocks != 3 || meta.CoverageGaps != 1 || !meta.DeterministicOnly {
+		t.Fatalf("unexpected digest metadata: %+v", meta)
 	}
 }

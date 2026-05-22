@@ -10,15 +10,21 @@ import (
 )
 
 type channelContextMetadata struct {
-	Available int
-	Returned  int
-	Retained  int
-	Omitted   int
-	Kind      string
-	Channels  []string
-	Status    string
-	Cursor    map[string]channelCursor
-	RangeEnd  string
+	Available         int
+	Returned          int
+	Retained          int
+	Omitted           int
+	Kind              string
+	Channels          []string
+	Status            string
+	Cursor            map[string]channelCursor
+	RangeEnd          string
+	DigestStatus      string
+	RawBytes          int
+	DigestBytes       int
+	DigestBlocks      int
+	CoverageGaps      int
+	DeterministicOnly bool
 }
 
 type channelContextPrepareDecision struct {
@@ -119,6 +125,18 @@ func parseChannelContextMetadata(content string) channelContextMetadata {
 			meta.Retained, _ = strconv.Atoi(retained)
 		case "omitted":
 			meta.Omitted, _ = strconv.Atoi(value)
+		case "digest":
+			meta.DigestStatus = strings.TrimSpace(value)
+		case "raw_bytes":
+			meta.RawBytes, _ = strconv.Atoi(value)
+		case "digest_bytes":
+			meta.DigestBytes, _ = strconv.Atoi(value)
+		case "digest_blocks":
+			meta.DigestBlocks, _ = strconv.Atoi(value)
+		case "coverage_gaps":
+			meta.CoverageGaps, _ = strconv.Atoi(value)
+		case "deterministic_only":
+			meta.DeterministicOnly = strings.EqualFold(strings.TrimSpace(value), "true")
 		case "cursor":
 			meta.Cursor = parseCursorPairs(value)
 		case "range":
@@ -133,6 +151,10 @@ func parseChannelContextMetadata(content string) channelContextMetadata {
 	}
 	if meta.Kind == "" {
 		meta.Kind = "tail"
+	}
+	if meta.DigestStatus != "" && meta.Kind == "raw_window+digest" {
+		meta.Status = meta.DigestStatus
+		return meta
 	}
 	if meta.Returned == 0 && meta.Retained == 0 {
 		meta.Status = "empty"

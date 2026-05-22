@@ -172,6 +172,7 @@ func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *a
 	}
 
 	results := make([]feeds.FeedResult, 0, len(entries))
+	channelMetadataByFeed := make(map[string]channelContextMetadata)
 	for _, entry := range entries {
 		var channelContextDecision channelContextPrepareDecision
 		channelFeed := isChannelContextFeed(entry)
@@ -212,14 +213,20 @@ func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *a
 			if result.Unavailable {
 				status = "error"
 			}
+			channelMetadataByFeed[channelMetadataKey(result.Name, result.Source)] = metadata
 			h.logger.LogChannelContextOp(agentID, "", logging.ChannelContextOpInfo{
-				Kind:     metadata.Kind,
-				Channels: metadata.Channels,
-				Retained: metadata.Retained,
-				Returned: metadata.Returned,
-				Omitted:  metadata.Omitted,
-				Source:   result.Source,
-				Status:   status,
+				Kind:              metadata.Kind,
+				Channels:          metadata.Channels,
+				Retained:          metadata.Retained,
+				Returned:          metadata.Returned,
+				Omitted:           metadata.Omitted,
+				RawBytes:          metadata.RawBytes,
+				DigestBytes:       metadata.DigestBytes,
+				DigestBlocks:      metadata.DigestBlocks,
+				CoverageGaps:      metadata.CoverageGaps,
+				DeterministicOnly: boolPtr(metadata.DeterministicOnly, metadata.Kind == "raw_window+digest"),
+				Source:            result.Source,
+				Status:            status,
 			})
 		}
 		results = append(results, result)
@@ -228,6 +235,7 @@ func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *a
 	out.Blocks = formatted.Blocks
 	out.Combined = formatted.Combined
 	for _, feed := range formatted.Feeds {
+		metadata := channelMetadataByFeed[channelMetadataKey(feed.Name, feed.Source)]
 		h.logger.LogFeedInjection(agentID, requestedModel, logging.FeedInjectionInfo{
 			Name:                 feed.Name,
 			Source:               feed.Source,
@@ -241,9 +249,22 @@ func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *a
 			TotalBytesAfter:      feed.TotalBytesAfter,
 			MaxFeedResponseBytes: feed.MaxFeedResponseBytes,
 			MaxTotalFeedBytes:    feed.MaxTotalFeedBytes,
+			RawBytes:             metadata.RawBytes,
+			DigestBytes:          metadata.DigestBytes,
 		})
 	}
 	return out
+}
+
+func channelMetadataKey(name, source string) string {
+	return strings.TrimSpace(name) + "\x00" + strings.TrimSpace(source)
+}
+
+func boolPtr(value bool, include bool) *bool {
+	if !include {
+		return nil
+	}
+	return &value
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {

@@ -39,6 +39,8 @@ type entry struct {
 	FeedTotalAfter     *int     `json:"feed_total_after,omitempty"`
 	FeedMaxResponse    *int     `json:"feed_max_response_bytes,omitempty"`
 	FeedMaxTotal       *int     `json:"feed_max_total_bytes,omitempty"`
+	FeedRawBytes       *int     `json:"feed_raw_bytes,omitempty"`
+	FeedDigestBytes    *int     `json:"feed_digest_bytes,omitempty"`
 	LatencyMS          *int64   `json:"latency_ms,omitempty"`
 	StatusCode         *int     `json:"status_code,omitempty"`
 	TokensIn           *int     `json:"tokens_in,omitempty"`
@@ -56,14 +58,19 @@ type entry struct {
 	MemoryBytes   *int    `json:"memory_bytes,omitempty"`
 	MemoryRemoved *int    `json:"memory_removed,omitempty"`
 	// channel_context_op event fields
-	ChannelKind *string  `json:"kind,omitempty"`
-	Channels    []string `json:"channels,omitempty"`
-	Retained    *int     `json:"retained,omitempty"`
-	Returned    *int     `json:"returned,omitempty"`
-	Omitted     *int     `json:"omitted,omitempty"`
-	Source      *string  `json:"source,omitempty"`
-	Status      *string  `json:"status,omitempty"`
-	ToolName    *string  `json:"tool_name,omitempty"`
+	ChannelKind       *string  `json:"kind,omitempty"`
+	Channels          []string `json:"channels,omitempty"`
+	Retained          *int     `json:"retained,omitempty"`
+	Returned          *int     `json:"returned,omitempty"`
+	Omitted           *int     `json:"omitted,omitempty"`
+	RawBytes          *int     `json:"raw_bytes,omitempty"`
+	DigestBytes       *int     `json:"digest_bytes,omitempty"`
+	DigestBlocks      *int     `json:"digest_blocks,omitempty"`
+	CoverageGaps      *int     `json:"coverage_gaps,omitempty"`
+	DeterministicOnly *bool    `json:"deterministic_only,omitempty"`
+	Source            *string  `json:"source,omitempty"`
+	Status            *string  `json:"status,omitempty"`
+	ToolName          *string  `json:"tool_name,omitempty"`
 	// provider_pool event fields
 	Provider      string `json:"provider,omitempty"`
 	KeyID         string `json:"key_id,omitempty"`
@@ -104,6 +111,8 @@ type FeedInjectionInfo struct {
 	TotalBytesAfter      int
 	MaxFeedResponseBytes int
 	MaxTotalFeedBytes    int
+	RawBytes             int
+	DigestBytes          int
 }
 
 // MemoryOpInfo holds structured telemetry for memory recall/retain hooks.
@@ -122,17 +131,22 @@ type MemoryOpInfo struct {
 // ChannelContextOpInfo holds structured telemetry for channel awareness,
 // channel-context, and channel retrieval tool operations.
 type ChannelContextOpInfo struct {
-	Kind       string
-	Channels   []string
-	Retained   int
-	Returned   int
-	Omitted    int
-	Source     string
-	Status     string
-	ToolName   string
-	StatusCode int
-	LatencyMS  int64
-	Error      error
+	Kind              string
+	Channels          []string
+	Retained          int
+	Returned          int
+	Omitted           int
+	RawBytes          int
+	DigestBytes       int
+	DigestBlocks      int
+	CoverageGaps      int
+	DeterministicOnly *bool
+	Source            string
+	Status            string
+	ToolName          string
+	StatusCode        int
+	LatencyMS         int64
+	Error             error
 }
 
 func New(w io.Writer) *Logger {
@@ -271,6 +285,8 @@ func (l *Logger) LogFeedInjection(clawID, model string, info FeedInjectionInfo) 
 		FeedTotalAfter:   ptrInt(info.TotalBytesAfter),
 		FeedMaxResponse:  ptrInt(info.MaxFeedResponseBytes),
 		FeedMaxTotal:     ptrInt(info.MaxTotalFeedBytes),
+		FeedRawBytes:     ptrInt(info.RawBytes),
+		FeedDigestBytes:  ptrInt(info.DigestBytes),
 		Intervention:     nil,
 	}
 	l.log(e)
@@ -316,19 +332,24 @@ func (l *Logger) LogMemoryOp(clawID, model string, info MemoryOpInfo) {
 
 func (l *Logger) LogChannelContextOp(clawID, model string, info ChannelContextOpInfo) {
 	e := entry{
-		TS:           time.Now().UTC().Format(time.RFC3339),
-		ClawID:       clawID,
-		Type:         "channel_context_op",
-		Model:        model,
-		Intervention: nil,
-		ChannelKind:  ptrString(info.Kind),
-		Channels:     append([]string(nil), info.Channels...),
-		Retained:     ptrInt(info.Retained),
-		Returned:     ptrInt(info.Returned),
-		Omitted:      ptrInt(info.Omitted),
-		Source:       ptrString(info.Source),
-		Status:       ptrString(info.Status),
-		ToolName:     ptrString(info.ToolName),
+		TS:                time.Now().UTC().Format(time.RFC3339),
+		ClawID:            clawID,
+		Type:              "channel_context_op",
+		Model:             model,
+		Intervention:      nil,
+		ChannelKind:       ptrString(info.Kind),
+		Channels:          append([]string(nil), info.Channels...),
+		Retained:          ptrInt(info.Retained),
+		Returned:          ptrInt(info.Returned),
+		Omitted:           ptrInt(info.Omitted),
+		RawBytes:          ptrInt(info.RawBytes),
+		DigestBytes:       ptrInt(info.DigestBytes),
+		DigestBlocks:      ptrInt(info.DigestBlocks),
+		CoverageGaps:      ptrInt(info.CoverageGaps),
+		DeterministicOnly: info.DeterministicOnly,
+		Source:            ptrString(info.Source),
+		Status:            ptrString(info.Status),
+		ToolName:          ptrString(info.ToolName),
 	}
 	if info.LatencyMS > 0 {
 		e.LatencyMS = ptrI64(info.LatencyMS)
