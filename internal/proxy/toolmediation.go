@@ -45,6 +45,9 @@ const managedMixedPrefixSerializedIntervention = "managed_prefix_native_suffix_s
 const mixedToolOrderInternalRetryIntervention = "mixed_tool_order_internal_retry"
 const duplicateManagedToolCallIntervention = "duplicate_managed_tool_call"
 const managedToolHashlessAliasIntervention = "managed_tool_hashless_alias"
+const managedToolBudgetFinalizationIntervention = "managed_tool_budget_finalization"
+
+const managedToolBudgetFinalizationMessage = "Managed tool budget exhausted. Do not call tools again. Produce the best final answer now using the tool results already in this conversation. If the evidence is insufficient, say exactly what was checked and give the explicit no-go or defer decision."
 
 type capturedResponse struct {
 	StatusCode    int
@@ -188,6 +191,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 	var lastProvider string
 	var lastUpstreamModel string
 	duplicates := newManagedToolDuplicateTracker()
+	finalizingAfterBudget := false
 
 	for {
 		dispatchResult := waitWithManagedKeepalive(streamKeepalive, managedModelWaitComment(len(toolTrace)+1), func() managedDispatchResult {
@@ -271,6 +275,12 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
 			return
 		}
+		if finalizingAfterBudget {
+			msg := "managed tool finalization requested tools after budget exhaustion"
+			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
+			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
+			return
+		}
 
 		managedCalls, _, ownership := classifyOpenAIToolCalls(agentCtx, toolCalls)
 		if ownership == openAIToolsAllNative {
@@ -310,10 +320,16 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 		}
 
 		if len(toolTrace) >= policy.MaxRounds {
-			msg := fmt.Sprintf("managed tool max rounds exceeded (%d)", policy.MaxRounds)
-			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
-			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
-			return
+			h.logger.LogIntervention(agentID, requestedModel, managedToolBudgetFinalizationIntervention)
+			toolMessages, roundTrace := buildOpenAIBudgetFinalizationRound(agentCtx, toolCalls, usage, len(toolTrace)+1, policy.MaxRounds)
+			roundTrace.Round = len(toolTrace) + 1
+			toolTrace = append(toolTrace, roundTrace)
+			appendOpenAIAssistantAndToolMessages(payload, assistantMessage, toolMessages)
+			appendOpenAIFinalizationInstruction(payload)
+			disableOpenAITools(payload)
+			hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, assistantMessage, toolMessages)
+			finalizingAfterBudget = true
+			continue
 		}
 
 		if ownership == openAIToolsUnsafeMixed {
@@ -404,6 +420,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 	var lastProvider string
 	var lastUpstreamModel string
 	duplicates := newManagedToolDuplicateTracker()
+	finalizingAfterBudget := false
 
 	for {
 		dispatchResult := waitWithManagedKeepalive(streamKeepalive, managedModelWaitComment(len(toolTrace)+1), func() managedDispatchResult {
@@ -487,6 +504,12 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
 			return
 		}
+		if finalizingAfterBudget {
+			msg := "managed tool finalization requested tools after budget exhaustion"
+			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
+			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
+			return
+		}
 
 		managedToolUses, _, ownership := classifyAnthropicToolUses(agentCtx, toolUses)
 		if ownership == anthropicToolsAllNative {
@@ -526,10 +549,16 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 		}
 
 		if len(toolTrace) >= policy.MaxRounds {
-			msg := fmt.Sprintf("managed tool max rounds exceeded (%d)", policy.MaxRounds)
-			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
-			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
-			return
+			h.logger.LogIntervention(agentID, requestedModel, managedToolBudgetFinalizationIntervention)
+			toolResults, roundTrace := buildAnthropicBudgetFinalizationRound(agentCtx, toolUses, usage, len(toolTrace)+1, policy.MaxRounds)
+			roundTrace.Round = len(toolTrace) + 1
+			toolTrace = append(toolTrace, roundTrace)
+			toolResultMessage := appendAnthropicAssistantAndToolResultMessages(payload, assistantMessage, toolResults)
+			appendAnthropicFinalizationInstruction(toolResultMessage)
+			disableAnthropicTools(payload)
+			hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, assistantMessage, toolResultMessage)
+			finalizingAfterBudget = true
+			continue
 		}
 
 		if ownership == anthropicToolsUnsafeMixed {
@@ -1633,7 +1662,51 @@ func buildAnthropicUnsafeMixedRetryRound(agentCtx *agentctx.AgentContext, calls 
 	return toolResults, roundTrace
 }
 
+func buildOpenAIBudgetFinalizationRound(agentCtx *agentctx.AgentContext, calls []openAIToolCall, usage cost.Usage, round int, maxRounds int) ([]any, sessionhistory.ToolRoundTrace) {
+	raw := managedToolBudgetFinalizationPayload(maxRounds)
+	toolMessages := make([]any, 0, len(calls))
+	roundTrace := sessionhistory.ToolRoundTrace{
+		Round: round,
+		RoundUsage: sessionhistory.Usage{
+			PromptTokens:     usage.PromptTokens,
+			CompletionTokens: usage.CompletionTokens,
+			ReportedCostUSD:  usage.ReportedCostUSD,
+		},
+	}
+	for _, call := range calls {
+		toolMessages = append(toolMessages, map[string]any{
+			"role":         "tool",
+			"tool_call_id": call.ID,
+			"content":      string(raw),
+		})
+		roundTrace.ToolCalls = append(roundTrace.ToolCalls, buildSyntheticToolTrace(agentCtx, call.Name, call.ArgumentsRaw, raw, http.StatusTooManyRequests))
+	}
+	return toolMessages, roundTrace
+}
+
+func buildAnthropicBudgetFinalizationRound(agentCtx *agentctx.AgentContext, calls []anthropicToolUse, usage cost.Usage, round int, maxRounds int) ([]map[string]any, sessionhistory.ToolRoundTrace) {
+	raw := managedToolBudgetFinalizationPayload(maxRounds)
+	toolResults := make([]map[string]any, 0, len(calls))
+	roundTrace := sessionhistory.ToolRoundTrace{
+		Round: round,
+		RoundUsage: sessionhistory.Usage{
+			PromptTokens:     usage.PromptTokens,
+			CompletionTokens: usage.CompletionTokens,
+			ReportedCostUSD:  usage.ReportedCostUSD,
+		},
+	}
+	for _, call := range calls {
+		toolResults = append(toolResults, anthropicToolResultBlock(call.ID, raw))
+		roundTrace.ToolCalls = append(roundTrace.ToolCalls, buildSyntheticToolTrace(agentCtx, call.Name, call.ArgumentsRaw, raw, http.StatusTooManyRequests))
+	}
+	return toolResults, roundTrace
+}
+
 func buildRejectedToolTrace(agentCtx *agentctx.AgentContext, name string, args json.RawMessage, raw []byte) sessionhistory.ToolCallTrace {
+	return buildSyntheticToolTrace(agentCtx, name, args, raw, http.StatusConflict)
+}
+
+func buildSyntheticToolTrace(agentCtx *agentctx.AgentContext, name string, args json.RawMessage, raw []byte, statusCode int) sessionhistory.ToolCallTrace {
 	traceName := strings.TrimSpace(name)
 	service := ""
 	if resolved, ok := resolveManagedTool(agentCtx, name); ok {
@@ -1645,13 +1718,21 @@ func buildRejectedToolTrace(agentCtx *agentctx.AgentContext, name string, args j
 		Arguments:  append(json.RawMessage(nil), args...),
 		Result:     append(json.RawMessage(nil), raw...),
 		Service:    service,
-		Status:     managedToolResponseStatus(raw, http.StatusConflict),
-		StatusCode: http.StatusConflict,
+		Status:     managedToolResponseStatus(raw, statusCode),
+		StatusCode: statusCode,
 	}
 }
 
 func mixedToolOrderRetryPayload() []byte {
 	return toolErrorPayload("mixed_tool_order", mixedToolOrderMessage, http.StatusConflict, nil)
+}
+
+func managedToolBudgetFinalizationPayload(maxRounds int) []byte {
+	return toolErrorPayload("tool_budget_exhausted", managedToolBudgetFinalizationMessage, http.StatusTooManyRequests, map[string]any{
+		"max_rounds":     maxRounds,
+		"finalize_now":   true,
+		"tools_disabled": true,
+	})
 }
 
 func serializeOpenAIToolCalls(calls []openAIToolCall) []any {
@@ -1739,6 +1820,21 @@ func appendOpenAIAssistantAndToolMessages(payload map[string]any, assistantMessa
 	payload["messages"] = messages
 }
 
+func appendOpenAIFinalizationInstruction(payload map[string]any) {
+	messages, _ := payload["messages"].([]any)
+	messages = append(messages, map[string]any{
+		"role":    "user",
+		"content": managedToolBudgetFinalizationMessage,
+	})
+	payload["messages"] = messages
+}
+
+func disableOpenAITools(payload map[string]any) {
+	delete(payload, "tools")
+	delete(payload, "tool_choice")
+	delete(payload, "parallel_tool_calls")
+}
+
 func appendAnthropicAssistantAndToolResultMessages(payload map[string]any, assistantMessage map[string]any, toolResults []map[string]any) map[string]any {
 	messages, _ := payload["messages"].([]any)
 	messages = append(messages, assistantMessage)
@@ -1749,6 +1845,20 @@ func appendAnthropicAssistantAndToolResultMessages(payload map[string]any, assis
 	messages = append(messages, toolResultMessage)
 	payload["messages"] = messages
 	return toolResultMessage
+}
+
+func appendAnthropicFinalizationInstruction(toolResultMessage map[string]any) {
+	content, _ := toolResultMessage["content"].([]map[string]any)
+	content = append(content, map[string]any{
+		"type": "text",
+		"text": managedToolBudgetFinalizationMessage,
+	})
+	toolResultMessage["content"] = content
+}
+
+func disableAnthropicTools(payload map[string]any) {
+	delete(payload, "tools")
+	delete(payload, "tool_choice")
 }
 
 func synthesizeOpenAIStream(finalBody []byte, upstreamModel string, usage managedUsageAggregate, includeUsage bool) ([]byte, error) {

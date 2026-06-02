@@ -1235,7 +1235,107 @@ func TestHandlerManagedToolHTTPErrorFeedsBackToModel(t *testing.T) {
 	}
 }
 
-func TestHandlerManagedToolMaxRoundsFailsClosed(t *testing.T) {
+func TestHandlerManagedToolMaxRoundsFinalizesWithExistingResults(t *testing.T) {
+	var logs bytes.Buffer
+	var xaiBodies [][]byte
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read xai body: %v", err)
+		}
+		xaiBodies = append(xaiBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(xaiBodies) {
+		case 1, 2:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-loop",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+					}
+				}]
+			}`))
+		case 3:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal finalization request: %v", err)
+			}
+			if _, ok := payload["tools"]; ok {
+				t.Fatalf("expected tools disabled during finalization, got %+v", payload["tools"])
+			}
+			messages := payload["messages"].([]any)
+			if len(messages) < 5 {
+				t.Fatalf("expected tool history plus finalization instruction, got %+v", messages)
+			}
+			last := messages[len(messages)-1].(map[string]any)
+			if last["role"] != "user" || !strings.Contains(last["content"].(string), "Managed tool budget exhausted") {
+				t.Fatalf("expected finalization user instruction, got %+v", last)
+			}
+			prior := messages[len(messages)-2].(map[string]any)
+			if prior["role"] != "tool" {
+				t.Fatalf("expected synthetic budget tool result before finalization instruction, got %+v", prior)
+			}
+			var toolResult map[string]any
+			if err := json.Unmarshal([]byte(prior["content"].(string)), &toolResult); err != nil {
+				t.Fatalf("unmarshal synthetic tool result: %v", err)
+			}
+			if ok, _ := toolResult["ok"].(bool); ok {
+				t.Fatalf("expected budget tool result to be an error, got %+v", toolResult)
+			}
+			errPayload := toolResult["error"].(map[string]any)
+			if errPayload["code"] != "tool_budget_exhausted" {
+				t.Fatalf("expected budget exhaustion tool error, got %+v", toolResult)
+			}
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-final","choices":[{"message":{"role":"assistant","content":"resolved with no more tools"}}]}`))
+		default:
+			t.Fatalf("unexpected xai round %d", len(xaiBodies))
+		}
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	tools := managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")
+	tools.Policy.MaxRounds = 1
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", tools), logging.New(&logs))
+
+	body := `{"model":"xai/grok-4.1-fast","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"trading-api.get_market_context","parameters":{"type":"object"}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "resolved with no more tools") {
+		t.Fatalf("expected final text after budget finalization, got %s", w.Body.String())
+	}
+	if len(xaiBodies) != 3 {
+		t.Fatalf("expected 3 xai calls including finalization turn, got %d", len(xaiBodies))
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected 1 real tool execution before budget finalization, got %d", toolCalls)
+	}
+	assertInterventionLogged(t, logs.Bytes(), managedToolBudgetFinalizationIntervention)
+}
+
+func TestHandlerManagedToolFinalizationFailsIfModelRequestsToolsAgain(t *testing.T) {
 	xaiCalls := 0
 	toolCalls := 0
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1281,14 +1381,194 @@ func TestHandlerManagedToolMaxRoundsFailsClosed(t *testing.T) {
 	if w.Code != http.StatusBadGateway {
 		t.Fatalf("expected 502, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "managed tool max rounds exceeded") {
-		t.Fatalf("expected max_rounds error, got %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), "managed tool finalization requested tools after budget exhaustion") {
+		t.Fatalf("expected finalization tool-request error, got %s", w.Body.String())
 	}
-	if xaiCalls != 2 {
-		t.Fatalf("expected 2 xai calls before max_rounds failure, got %d", xaiCalls)
+	if xaiCalls != 3 {
+		t.Fatalf("expected 3 xai calls through finalization retry, got %d", xaiCalls)
 	}
 	if toolCalls != 1 {
-		t.Fatalf("expected 1 tool execution before max_rounds failure, got %d", toolCalls)
+		t.Fatalf("expected 1 real tool execution before finalization, got %d", toolCalls)
+	}
+}
+
+func TestHandlerManagedAnthropicToolMaxRoundsFinalizesWithExistingResults(t *testing.T) {
+	var logs bytes.Buffer
+	var anthropicBodies [][]byte
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read anthropic body: %v", err)
+		}
+		anthropicBodies = append(anthropicBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(anthropicBodies) {
+		case 1, 2:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_loop",
+				"type":"message",
+				"content":[{"type":"tool_use","id":"toolu_1","name":"trading-api.get_market_context","input":{}}],
+				"stop_reason":"tool_use",
+				"usage":{"input_tokens":10,"output_tokens":3}
+			}`))
+		case 3:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal anthropic finalization request: %v", err)
+			}
+			if _, ok := payload["tools"]; ok {
+				t.Fatalf("expected anthropic tools disabled during finalization, got %+v", payload["tools"])
+			}
+			messages := payload["messages"].([]any)
+			if len(messages) < 5 {
+				t.Fatalf("expected tool history plus finalization message, got %+v", messages)
+			}
+			last := messages[len(messages)-1].(map[string]any)
+			if last["role"] != "user" {
+				t.Fatalf("expected final user tool_result message, got %+v", last)
+			}
+			blocks := last["content"].([]any)
+			var sawBudgetResult bool
+			var sawFinalInstruction bool
+			for _, raw := range blocks {
+				block, _ := raw.(map[string]any)
+				if block == nil {
+					continue
+				}
+				switch block["type"] {
+				case "tool_result":
+					var toolResult map[string]any
+					if err := json.Unmarshal([]byte(block["content"].(string)), &toolResult); err != nil {
+						t.Fatalf("unmarshal anthropic synthetic tool result: %v", err)
+					}
+					errPayload := toolResult["error"].(map[string]any)
+					if errPayload["code"] == "tool_budget_exhausted" {
+						sawBudgetResult = true
+					}
+					if block["is_error"] != true {
+						t.Fatalf("expected budget tool_result to be marked is_error, got %+v", block)
+					}
+				case "text":
+					text, _ := block["text"].(string)
+					if strings.Contains(text, "Managed tool budget exhausted") {
+						sawFinalInstruction = true
+					}
+				}
+			}
+			if !sawBudgetResult || !sawFinalInstruction {
+				t.Fatalf("expected budget tool result and final instruction, got %+v", blocks)
+			}
+			_, _ = w.Write([]byte(`{
+				"id":"msg_final",
+				"type":"message",
+				"content":[{"type":"text","text":"resolved with no more tools"}],
+				"stop_reason":"end_turn",
+				"usage":{"input_tokens":8,"output_tokens":4}
+			}`))
+		default:
+			t.Fatalf("unexpected anthropic round %d", len(anthropicBodies))
+		}
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	tools := managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")
+	tools.Policy.MaxRounds = 1
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", tools), logging.New(&logs))
+	body := `{
+		"model":"claude-sonnet-4-20250514",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"name":"trading-api.get_market_context","description":"Retrieve market context","input_schema":{"type":"object"}}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "resolved with no more tools") {
+		t.Fatalf("expected final anthropic text after budget finalization, got %s", w.Body.String())
+	}
+	if len(anthropicBodies) != 3 {
+		t.Fatalf("expected 3 anthropic calls including finalization turn, got %d", len(anthropicBodies))
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected 1 real tool execution before budget finalization, got %d", toolCalls)
+	}
+	assertInterventionLogged(t, logs.Bytes(), managedToolBudgetFinalizationIntervention)
+}
+
+func TestHandlerManagedAnthropicToolFinalizationFailsIfModelRequestsToolsAgain(t *testing.T) {
+	anthropicCalls := 0
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		anthropicCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"msg_loop",
+			"type":"message",
+			"content":[{"type":"tool_use","id":"toolu_1","name":"trading-api.get_market_context","input":{}}],
+			"stop_reason":"tool_use",
+			"usage":{"input_tokens":10,"output_tokens":3}
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	tools := managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")
+	tools.Policy.MaxRounds = 1
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", tools), logging.New(io.Discard))
+	body := `{
+		"model":"claude-sonnet-4-20250514",
+		"messages":[{"role":"user","content":"hi"}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "managed tool finalization requested tools after budget exhaustion") {
+		t.Fatalf("expected finalization tool-request error, got %s", w.Body.String())
+	}
+	if anthropicCalls != 3 {
+		t.Fatalf("expected 3 anthropic calls through finalization retry, got %d", anthropicCalls)
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected 1 real tool execution before finalization, got %d", toolCalls)
 	}
 }
 
