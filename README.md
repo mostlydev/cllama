@@ -105,6 +105,8 @@ docker run -p 8080:8080 -p 8081:8081 \
 | `CLAW_SESSION_HISTORY_DIR` | `/claw/session-history` | Per-agent JSONL session history base dir. When set, cllama appends one entry per successful 2xx upstream completion to `<dir>/<agent-id>/history.jsonl`. |
 | `CLLAMA_FEED_MAX_RESPONSE_BYTES` | `32768` | Maximum bytes read from any single feed response before truncation. |
 | `CLLAMA_FEED_MAX_TOTAL_BYTES` | `65536` | Maximum aggregate bytes of formatted feed blocks injected into one request. |
+| `CLLAMA_FEED_FETCH_TIMEOUT_MS` | `3000` | Per-fetch HTTP timeout for feed providers (sanity range 100–120000; invalid values fall back to default). Raise it when a feed provider computes synchronously under load. |
+| `CLLAMA_TOOL_SCHEMA_VALIDATION` | `on` | Set to `off` to disable pre-dispatch validation of managed tool arguments against the manifest `inputSchema`. Emergency rollback knob; validation fails open on schema constructs it does not understand. |
 | `OPENAI_API_KEY` | | Provider key override |
 | `ANTHROPIC_API_KEY` | | Provider key override |
 | `OPENROUTER_API_KEY` | | Provider key override |
