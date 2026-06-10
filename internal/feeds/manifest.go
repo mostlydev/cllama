@@ -16,21 +16,27 @@ const (
 	MaxTotalFeedBytes       = 64 * 1024
 	DefaultTTLSeconds       = 60
 	FetchTimeout            = 3 * time.Second
+	MinFetchTimeout         = 100 * time.Millisecond
+	MaxFetchTimeout         = 120 * time.Second
 	EnvMaxFeedResponseBytes = "CLLAMA_FEED_MAX_RESPONSE_BYTES"
 	EnvMaxTotalFeedBytes    = "CLLAMA_FEED_MAX_TOTAL_BYTES"
+	EnvFeedFetchTimeoutMS   = "CLLAMA_FEED_FETCH_TIMEOUT_MS"
 )
 
-// Budget controls the fetch-time per-feed byte cap and the aggregate injected
-// feed block cap. Zero values are normalized to the bounded defaults.
+// Budget controls the fetch-time per-feed byte cap, the aggregate injected
+// feed block cap, and the per-fetch HTTP timeout. Zero values are normalized
+// to the bounded defaults.
 type Budget struct {
 	MaxFeedResponseBytes int
 	MaxTotalFeedBytes    int
+	FetchTimeout         time.Duration
 }
 
 func DefaultBudget() Budget {
 	return Budget{
 		MaxFeedResponseBytes: MaxFeedResponseBytes,
 		MaxTotalFeedBytes:    MaxTotalFeedBytes,
+		FetchTimeout:         FetchTimeout,
 	}
 }
 
@@ -42,11 +48,15 @@ func (b Budget) Normalize() Budget {
 	if b.MaxTotalFeedBytes <= 0 {
 		b.MaxTotalFeedBytes = defaults.MaxTotalFeedBytes
 	}
+	if b.FetchTimeout <= 0 {
+		b.FetchTimeout = defaults.FetchTimeout
+	}
 	return b
 }
 
-// BudgetFromEnv reads optional byte caps from process env. Invalid values fall
-// back to defaults so a bad knob cannot accidentally unbound feed injection.
+// BudgetFromEnv reads optional byte caps and the fetch timeout from process
+// env. Invalid or out-of-range values fall back to defaults so a bad knob
+// cannot accidentally unbound feed injection or hang feed fetches.
 func BudgetFromEnv() Budget {
 	budget := DefaultBudget()
 	if v, ok := positiveIntEnv(EnvMaxFeedResponseBytes); ok {
@@ -54,6 +64,12 @@ func BudgetFromEnv() Budget {
 	}
 	if v, ok := positiveIntEnv(EnvMaxTotalFeedBytes); ok {
 		budget.MaxTotalFeedBytes = v
+	}
+	if v, ok := positiveIntEnv(EnvFeedFetchTimeoutMS); ok {
+		timeout := time.Duration(v) * time.Millisecond
+		if timeout >= MinFetchTimeout && timeout <= MaxFetchTimeout {
+			budget.FetchTimeout = timeout
+		}
 	}
 	return budget
 }

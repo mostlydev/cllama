@@ -52,14 +52,15 @@ func NewFetcher(podName string, client *http.Client, logger *logging.Logger) *Fe
 }
 
 func NewFetcherWithBudget(podName string, client *http.Client, logger *logging.Logger, budget Budget) *Fetcher {
+	budget = budget.Normalize()
 	if client == nil {
-		client = &http.Client{Timeout: FetchTimeout}
+		client = &http.Client{Timeout: budget.FetchTimeout}
 	}
 	return &Fetcher{
 		podName: podName,
 		client:  client,
 		logger:  logger,
-		budget:  budget.Normalize(),
+		budget:  budget,
 		cache:   make(map[string]*cacheEntry),
 		nowFunc: time.Now,
 	}
