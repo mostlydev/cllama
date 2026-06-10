@@ -44,6 +44,7 @@ type Handler struct {
 	channelCursors        *channelCursorStore
 	adminToken            string
 	snapshots             *ContextSnapshotStore
+	toolSchemaValidation  bool
 }
 
 // HandlerOption configures optional Handler behaviour.
@@ -148,6 +149,7 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 		channelCursors:        newChannelCursorStore(""),
 		snapshots:             NewContextSnapshotStore(),
 		feedBudget:            feeds.DefaultBudget(),
+		toolSchemaValidation:  toolSchemaValidationFromEnv(),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -1118,12 +1120,13 @@ func rewriteManagedAnthropicToolChoice(toolChoice any, agentCtx *agentctx.AgentC
 }
 
 func buildOpenAIToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]any {
+	presented := managedToolPresentedNames(tools)
 	schemas := make([]map[string]any, 0, len(tools))
 	for _, tool := range tools {
 		schemas = append(schemas, map[string]any{
 			"type": "function",
 			"function": map[string]any{
-				"name":        managedToolPresentedName(tool),
+				"name":        presented[strings.TrimSpace(tool.Name)],
 				"description": tool.Description,
 				"parameters":  tool.InputSchema,
 			},
@@ -1133,10 +1136,11 @@ func buildOpenAIToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]any
 }
 
 func buildAnthropicToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]any {
+	presented := managedToolPresentedNames(tools)
 	schemas := make([]map[string]any, 0, len(tools))
 	for _, tool := range tools {
 		schemas = append(schemas, map[string]any{
-			"name":         managedToolPresentedName(tool),
+			"name":         presented[strings.TrimSpace(tool.Name)],
 			"description":  tool.Description,
 			"input_schema": tool.InputSchema,
 		})

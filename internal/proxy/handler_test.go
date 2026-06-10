@@ -77,7 +77,7 @@ func TestHandlerForwardsAndSwapsAuth(t *testing.T) {
 }
 
 func TestHandlerInjectsManagedToolsIntoOpenAIRequests(t *testing.T) {
-	expectedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
+	expectedName := managedToolHashlessAliasForCanonical("trading-api.get_market_context")
 	var gotBody []byte
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var err error
@@ -332,7 +332,7 @@ func TestHandlerPassesThroughNativeOpenAIToolCallsWhenManagedToolsArePresent(t *
 }
 
 func TestHandlerRetriesUnsafeMixedOpenAIToolCallsInternally(t *testing.T) {
-	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
+	presentedName := managedToolHashlessAliasForCanonical("trading-api.get_market_context")
 	xaiCalls := 0
 	toolCalls := 0
 	var logs bytes.Buffer
@@ -451,7 +451,7 @@ func TestHandlerRetriesUnsafeMixedOpenAIToolCallsInternally(t *testing.T) {
 }
 
 func TestHandlerSerializesManagedPrefixBeforeNativeOpenAIToolCalls(t *testing.T) {
-	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
+	presentedName := managedToolHashlessAliasForCanonical("trading-api.get_market_context")
 	xaiCalls := 0
 	toolCalls := 0
 	var logs bytes.Buffer
@@ -798,7 +798,7 @@ func TestHandlerHandsOffNativeOpenAIToolCallsAfterManagedRounds(t *testing.T) {
 }
 
 func TestHandlerStreamsManagedOpenAIKeepaliveComments(t *testing.T) {
-	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
+	presentedName := managedToolHashlessAliasForCanonical("trading-api.get_market_context")
 	toolRelease := make(chan struct{})
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-toolRelease
@@ -890,7 +890,7 @@ func TestHandlerStreamsManagedOpenAIKeepaliveComments(t *testing.T) {
 }
 
 func TestHandlerExecutesManagedToolsViaXAI(t *testing.T) {
-	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
+	presentedName := managedToolHashlessAliasForCanonical("trading-api.get_market_context")
 	var xaiBodies [][]byte
 	var toolAuth string
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2541,7 +2541,7 @@ func TestHandlerForwardsAnthropicMessages(t *testing.T) {
 }
 
 func TestHandlerExecutesManagedAnthropicTools(t *testing.T) {
-	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
+	presentedName := managedToolHashlessAliasForCanonical("trading-api.get_market_context")
 	var anthropicBodies [][]byte
 	var toolAuth string
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2898,7 +2898,7 @@ func TestHandlerPassesThroughNativeAnthropicToolUseWhenManagedToolsArePresent(t 
 }
 
 func TestHandlerRetriesUnsafeMixedAnthropicToolUsesInternally(t *testing.T) {
-	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
+	presentedName := managedToolHashlessAliasForCanonical("trading-api.get_market_context")
 	anthropicCalls := 0
 	toolCalls := 0
 	var logs bytes.Buffer
@@ -3015,7 +3015,7 @@ func TestHandlerRetriesUnsafeMixedAnthropicToolUsesInternally(t *testing.T) {
 }
 
 func TestHandlerSerializesManagedPrefixBeforeNativeAnthropicToolUse(t *testing.T) {
-	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
+	presentedName := managedToolHashlessAliasForCanonical("trading-api.get_market_context")
 	anthropicCalls := 0
 	toolCalls := 0
 	var logs bytes.Buffer

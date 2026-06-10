@@ -44,8 +44,8 @@ const mixedToolOrderMessage = "mixed managed and runner-native tool calls are no
 const managedMixedPrefixSerializedIntervention = "managed_prefix_native_suffix_serialized"
 const mixedToolOrderInternalRetryIntervention = "mixed_tool_order_internal_retry"
 const duplicateManagedToolCallIntervention = "duplicate_managed_tool_call"
-const managedToolHashlessAliasIntervention = "managed_tool_hashless_alias"
 const managedToolBudgetFinalizationIntervention = "managed_tool_budget_finalization"
+const managedToolSchemaRejectedIntervention = "managed_tool_schema_rejected"
 
 const managedToolBudgetFinalizationMessage = "Managed tool budget exhausted. Do not call tools again. Produce the best final answer now using the tool results already in this conversation. If the evidence is insufficient, say exactly what was checked and give the explicit no-go or defer decision."
 
@@ -904,13 +904,13 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 	}
 	trace.Name = resolved.CanonicalName
 	trace.Service = resolved.Manifest.Execution.Service
-	if resolved.HashlessAlias {
-		h.logger.LogIntervention(agentID, requestedModel, managedToolHashlessAliasIntervention+":"+resolved.CanonicalName)
-	}
 	if call.ParseErr != nil {
 		raw := toolErrorPayload("invalid_arguments", fmt.Sprintf("Tool arguments for %s are invalid JSON: %v", trace.Name, call.ParseErr), 0, nil)
 		trace.Result = raw
 		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+	}
+	if rejected := h.rejectSchemaViolations(agentID, requestedModel, resolved, call.Arguments, &trace); rejected != nil {
+		return *rejected, nil
 	}
 
 	start := time.Now()
@@ -930,7 +930,7 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 		trace.StatusCode = statusCode
 		trace.Status = managedToolResponseStatus(raw, statusCode)
 		trace.Result = raw
-		modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, trace.Name, call.Arguments, raw, trace.Status, statusCode, trace.LatencyMS)
+		modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, resolved.PresentedName, trace.Name, call.Arguments, raw, trace.Status, statusCode, trace.LatencyMS)
 		return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 	}
 	if errors.Is(err, context.Canceled) {
@@ -940,18 +940,44 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 		raw = toolErrorPayload("canceled", "Tool execution was canceled", 0, nil)
 		trace.Status = managedToolResponseStatus(raw, 0)
 		trace.Result = raw
-		modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, trace.Name, call.Arguments, raw, trace.Status, 0, trace.LatencyMS)
+		modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, resolved.PresentedName, trace.Name, call.Arguments, raw, trace.Status, 0, trace.LatencyMS)
 		return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 	}
 	trace.StatusCode = statusCode
 	trace.Status = managedToolResponseStatus(raw, statusCode)
-	modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, trace.Name, call.Arguments, raw, trace.Status, statusCode, trace.LatencyMS)
+	modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, resolved.PresentedName, trace.Name, call.Arguments, raw, trace.Status, statusCode, trace.LatencyMS)
 	if err != nil {
 		trace.Result = raw
 		return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 	}
 	trace.Result = raw
 	return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
+}
+
+// rejectSchemaViolations validates model-emitted arguments against the
+// manifest inputSchema before the providing-service dispatch. Nil means the
+// call may proceed. The rejection consumes a mediation round (the model must
+// correct and re-emit) but no service round-trip and no provider error event.
+func (h *Handler) rejectSchemaViolations(agentID, requestedModel string, resolved resolvedManagedTool, args map[string]any, trace *sessionhistory.ToolCallTrace) *managedToolOutcome {
+	if !h.toolSchemaValidation {
+		return nil
+	}
+	violations := validateManagedToolArgs(resolved.Manifest.InputSchema, args)
+	if len(violations) == 0 {
+		return nil
+	}
+	h.logger.LogIntervention(agentID, requestedModel, managedToolSchemaRejectedIntervention+":"+resolved.CanonicalName)
+	messages := make([]string, 0, len(violations))
+	for _, violation := range violations {
+		messages = append(messages, violation.Message)
+	}
+	raw := toolErrorPayload("schema_validation",
+		fmt.Sprintf("Arguments for %s were rejected before dispatch: %s. The service was not called; correct the arguments and retry.", trace.Name, strings.Join(messages, "; ")),
+		0,
+		map[string]any{"violations": violations})
+	trace.Result = raw
+	trace.Status = managedToolResponseStatus(raw, 0)
+	return &managedToolOutcome{RawJSON: raw, Trace: *trace}
 }
 
 func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID string, requestedModel string, agentCtx *agentctx.AgentContext, call anthropicToolUse, policy managedToolPolicy) (managedToolOutcome, error) {
@@ -967,13 +993,13 @@ func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID strin
 	}
 	trace.Name = resolved.CanonicalName
 	trace.Service = resolved.Manifest.Execution.Service
-	if resolved.HashlessAlias {
-		h.logger.LogIntervention(agentID, requestedModel, managedToolHashlessAliasIntervention+":"+resolved.CanonicalName)
-	}
 	if call.ParseErr != nil {
 		raw := toolErrorPayload("invalid_arguments", fmt.Sprintf("Tool arguments for %s are invalid JSON: %v", trace.Name, call.ParseErr), 0, nil)
 		trace.Result = raw
 		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
+	}
+	if rejected := h.rejectSchemaViolations(agentID, requestedModel, resolved, call.Arguments, &trace); rejected != nil {
+		return *rejected, nil
 	}
 
 	start := time.Now()
@@ -993,7 +1019,7 @@ func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID strin
 		trace.StatusCode = statusCode
 		trace.Status = managedToolResponseStatus(raw, statusCode)
 		trace.Result = raw
-		modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, trace.Name, call.Arguments, raw, trace.Status, statusCode, trace.LatencyMS)
+		modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, resolved.PresentedName, trace.Name, call.Arguments, raw, trace.Status, statusCode, trace.LatencyMS)
 		return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 	}
 	if errors.Is(err, context.Canceled) {
@@ -1003,12 +1029,12 @@ func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID strin
 		raw = toolErrorPayload("canceled", "Tool execution was canceled", 0, nil)
 		trace.Status = managedToolResponseStatus(raw, 0)
 		trace.Result = raw
-		modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, trace.Name, call.Arguments, raw, trace.Status, 0, trace.LatencyMS)
+		modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, resolved.PresentedName, trace.Name, call.Arguments, raw, trace.Status, 0, trace.LatencyMS)
 		return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 	}
 	trace.StatusCode = statusCode
 	trace.Status = managedToolResponseStatus(raw, statusCode)
-	modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, trace.Name, call.Arguments, raw, trace.Status, statusCode, trace.LatencyMS)
+	modelRaw := h.decorateManagedToolResult(agentID, resolved.Manifest, resolved.PresentedName, trace.Name, call.Arguments, raw, trace.Status, statusCode, trace.LatencyMS)
 	if err != nil {
 		trace.Result = raw
 		return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
@@ -1137,7 +1163,7 @@ func managedToolRequestedChannels(args map[string]any) []string {
 	return out
 }
 
-func (h *Handler) decorateManagedToolResult(agentID string, tool agentctx.ToolManifestEntry, toolName string, args map[string]any, raw []byte, status string, statusCode int, latencyMS int64) []byte {
+func (h *Handler) decorateManagedToolResult(agentID string, tool agentctx.ToolManifestEntry, presentedName string, toolName string, args map[string]any, raw []byte, status string, statusCode int, latencyMS int64) []byte {
 	if !strings.EqualFold(tool.Execution.Service, "claw-wall") {
 		return raw
 	}
@@ -1154,7 +1180,7 @@ func (h *Handler) decorateManagedToolResult(agentID string, tool agentctx.ToolMa
 		StatusCode: statusCode,
 		LatencyMS:  latencyMS,
 	})
-	return prependChannelToolHeader(managedToolPresentedName(tool), channels, status, raw)
+	return prependChannelToolHeader(presentedName, channels, status, raw)
 }
 
 func managedToolResponseStatus(raw []byte, statusCode int) string {

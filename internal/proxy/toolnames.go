@@ -17,14 +17,51 @@ type resolvedManagedTool struct {
 	Manifest      agentctx.ToolManifestEntry
 	CanonicalName string
 	PresentedName string
-	HashlessAlias bool
 }
 
-func managedToolPresentedName(tool agentctx.ToolManifestEntry) string {
-	return managedToolPresentedNameForCanonical(tool.Name)
+// managedToolPresentedNames computes the model-facing name for every tool in
+// a manifest. Provider-safe canonical names pass through. Non-safe names are
+// presented hash-free (sanitized) when that form is unique across the
+// manifest's sanitized forms and collides with no canonical name; otherwise
+// they keep the legacy hash suffix. Hash-free presentation eliminates the
+// suffix-dropping failure class for typical pods: some models consistently
+// drop trailing hex hashes when emitting tool calls.
+func managedToolPresentedNames(tools []agentctx.ToolManifestEntry) map[string]string {
+	canonicals := make(map[string]struct{}, len(tools))
+	hashlessCounts := make(map[string]int, len(tools))
+	for _, tool := range tools {
+		canonical := strings.TrimSpace(tool.Name)
+		canonicals[canonical] = struct{}{}
+		if isProviderSafeToolName(canonical) {
+			continue
+		}
+		hashlessCounts[managedToolHashlessAliasForCanonical(canonical)]++
+	}
+
+	names := make(map[string]string, len(tools))
+	for _, tool := range tools {
+		canonical := strings.TrimSpace(tool.Name)
+		if isProviderSafeToolName(canonical) {
+			names[canonical] = canonical
+			continue
+		}
+		hashless := managedToolHashlessAliasForCanonical(canonical)
+		if hashlessCounts[hashless] == 1 {
+			if _, taken := canonicals[hashless]; !taken {
+				names[canonical] = hashless
+				continue
+			}
+		}
+		names[canonical] = managedToolHashedNameForCanonical(canonical)
+	}
+	return names
 }
 
-func managedToolPresentedNameForCanonical(name string) string {
+// managedToolHashedNameForCanonical is the legacy presented form: sanitized
+// name plus an 8-hex hash suffix. It is no longer the default presentation,
+// but resolution keeps accepting it because session histories and cross-turn
+// continuity replays recorded under older proxies contain these names.
+func managedToolHashedNameForCanonical(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "managed_tool"
@@ -87,6 +124,11 @@ func managedToolDisplayName(agentCtx *agentctx.AgentContext, name string) string
 	return name
 }
 
+// resolveManagedTool maps a model-emitted (or replayed) tool name onto a
+// manifest entry. Accepted forms per tool: the canonical name, the current
+// presented name, and the legacy hashed form. A name matching the hashless
+// form of two or more colliding tools resolves to nothing — ambiguity stays
+// a hard miss.
 func resolveManagedTool(agentCtx *agentctx.AgentContext, name string) (resolvedManagedTool, bool) {
 	if agentCtx == nil || agentCtx.Tools == nil {
 		return resolvedManagedTool{}, false
@@ -95,39 +137,16 @@ func resolveManagedTool(agentCtx *agentctx.AgentContext, name string) (resolvedM
 	if name == "" {
 		return resolvedManagedTool{}, false
 	}
+	presented := managedToolPresentedNames(agentCtx.Tools.Tools)
 	for _, tool := range agentCtx.Tools.Tools {
 		canonical := strings.TrimSpace(tool.Name)
-		presented := managedToolPresentedName(tool)
-		if name == canonical || name == presented {
+		if name == canonical || name == presented[canonical] || name == managedToolHashedNameForCanonical(canonical) {
 			return resolvedManagedTool{
 				Manifest:      tool,
 				CanonicalName: canonical,
-				PresentedName: presented,
+				PresentedName: presented[canonical],
 			}, true
 		}
-	}
-	var aliasMatch resolvedManagedTool
-	var matched bool
-	for _, tool := range agentCtx.Tools.Tools {
-		canonical := strings.TrimSpace(tool.Name)
-		presented := managedToolPresentedName(tool)
-		hashless := managedToolHashlessAliasForCanonical(canonical)
-		if hashless == "" || hashless == presented || name != hashless {
-			continue
-		}
-		if matched {
-			return resolvedManagedTool{}, false
-		}
-		aliasMatch = resolvedManagedTool{
-			Manifest:      tool,
-			CanonicalName: canonical,
-			PresentedName: presented,
-			HashlessAlias: true,
-		}
-		matched = true
-	}
-	if matched {
-		return aliasMatch, true
 	}
 	return resolvedManagedTool{}, false
 }

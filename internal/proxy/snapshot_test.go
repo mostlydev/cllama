@@ -242,7 +242,7 @@ func TestHandlerCapturesAnthropicContextSnapshotWithBlockSystem(t *testing.T) {
 }
 
 func TestHandlerManagedSnapshotTracksCompletedTurnCount(t *testing.T) {
-	presentedName := managedToolPresentedNameForCanonical("trading-api.get_market_context")
+	presentedName := managedToolHashlessAliasForCanonical("trading-api.get_market_context")
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"balance":5000}`))
