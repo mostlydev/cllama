@@ -125,10 +125,11 @@ func managedToolDisplayName(agentCtx *agentctx.AgentContext, name string) string
 }
 
 // resolveManagedTool maps a model-emitted (or replayed) tool name onto a
-// manifest entry. Accepted forms per tool: the canonical name, the current
-// presented name, and the legacy hashed form. A name matching the hashless
-// form of two or more colliding tools resolves to nothing — ambiguity stays
-// a hard miss.
+// manifest entry. Resolution runs in priority passes across the whole
+// manifest — canonical first, then current presented, then legacy hashed —
+// so a legacy alias of one tool can never shadow another tool's canonical
+// name. Two matches within one pass (or a hashless form shared by colliding
+// tools) resolve to nothing: ambiguity stays a hard miss.
 func resolveManagedTool(agentCtx *agentctx.AgentContext, name string) (resolvedManagedTool, bool) {
 	if agentCtx == nil || agentCtx.Tools == nil {
 		return resolvedManagedTool{}, false
@@ -137,15 +138,37 @@ func resolveManagedTool(agentCtx *agentctx.AgentContext, name string) (resolvedM
 	if name == "" {
 		return resolvedManagedTool{}, false
 	}
-	presented := managedToolPresentedNames(agentCtx.Tools.Tools)
-	for _, tool := range agentCtx.Tools.Tools {
-		canonical := strings.TrimSpace(tool.Name)
-		if name == canonical || name == presented[canonical] || name == managedToolHashedNameForCanonical(canonical) {
-			return resolvedManagedTool{
+	tools := agentCtx.Tools.Tools
+	presented := managedToolPresentedNames(tools)
+	passes := []func(canonical string) string{
+		func(canonical string) string { return canonical },
+		func(canonical string) string { return presented[canonical] },
+		managedToolHashedNameForCanonical,
+	}
+	for _, candidateName := range passes {
+		var match resolvedManagedTool
+		var matched, ambiguous bool
+		for _, tool := range tools {
+			canonical := strings.TrimSpace(tool.Name)
+			if name != candidateName(canonical) {
+				continue
+			}
+			if matched {
+				ambiguous = true
+				break
+			}
+			match = resolvedManagedTool{
 				Manifest:      tool,
 				CanonicalName: canonical,
 				PresentedName: presented[canonical],
-			}, true
+			}
+			matched = true
+		}
+		if ambiguous {
+			return resolvedManagedTool{}, false
+		}
+		if matched {
+			return match, true
 		}
 	}
 	return resolvedManagedTool{}, false

@@ -209,17 +209,37 @@ func TestValidateManagedToolArgsFailOpenUnsupportedKeywords(t *testing.T) {
 	}
 }
 
-func TestValidateManagedToolArgsUnsupportedTypeFormStillChecksRequired(t *testing.T) {
-	schema := map[string]any{
+func TestValidateManagedToolArgsUnsupportedTypeFormFailsOpen(t *testing.T) {
+	// A type keyword we cannot interpret as a plain known string signals a
+	// schema dialect we do not understand: skip the whole level, including
+	// required, so validation never blocks a call the provider might accept.
+	union := map[string]any{
 		"type":     []any{"object", "null"},
 		"required": []any{"symbol"},
 		"properties": map[string]any{
 			"symbol": map[string]any{"type": "string"},
 		},
 	}
-	violations := validateManagedToolArgs(schema, map[string]any{})
-	if len(violations) != 1 || violations[0].Code != "missing_required" || violations[0].Path != "symbol" {
-		t.Fatalf("required should still apply under union type form, got %+v", violations)
+	if v := validateManagedToolArgs(union, map[string]any{}); v != nil {
+		t.Fatalf("union type form must fail open entirely, got %+v", v)
+	}
+	unknown := map[string]any{
+		"type":     "file",
+		"required": []any{"symbol"},
+	}
+	if v := validateManagedToolArgs(unknown, map[string]any{}); v != nil {
+		t.Fatalf("unknown type string must fail open entirely, got %+v", v)
+	}
+	nestedUnknown := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"upload": map[string]any{"type": "file", "required": []any{"name"}},
+			"side":   map[string]any{"type": "string", "enum": []any{"buy", "sell"}},
+		},
+	}
+	violations := validateManagedToolArgs(nestedUnknown, map[string]any{"upload": map[string]any{}, "side": "hold"})
+	if len(violations) != 1 || violations[0].Path != "side" {
+		t.Fatalf("unknown nested type must fail open while siblings validate, got %+v", violations)
 	}
 }
 

@@ -77,6 +77,27 @@ func TestManagedToolPresentedNamesCanonicalCollisionKeepsHash(t *testing.T) {
 	}
 }
 
+func TestResolveManagedToolCanonicalBeatsLegacyHashedShadow(t *testing.T) {
+	// A tool canonically named like another tool's legacy hashed form must win
+	// on canonical match; the legacy alias must not shadow it.
+	legacy := managedToolHashedNameForCanonical("svc.foo")
+	agentCtx := &agentctx.AgentContext{
+		Tools: &agentctx.ToolManifest{
+			Tools: []agentctx.ToolManifestEntry{
+				{Name: "svc.foo"},
+				{Name: legacy},
+			},
+		},
+	}
+	resolved, ok := resolveManagedTool(agentCtx, legacy)
+	if !ok {
+		t.Fatalf("expected canonical match for %q", legacy)
+	}
+	if resolved.CanonicalName != legacy {
+		t.Fatalf("canonical match must beat legacy hashed alias: got %q, want %q", resolved.CanonicalName, legacy)
+	}
+}
+
 func TestResolveManagedToolAcceptsLegacyHashedName(t *testing.T) {
 	agentCtx := &agentctx.AgentContext{
 		Tools: &agentctx.ToolManifest{
@@ -92,6 +113,58 @@ func TestResolveManagedToolAcceptsLegacyHashedName(t *testing.T) {
 	}
 	if resolved.CanonicalName != "claw-wall.search_channel_context" {
 		t.Fatalf("canonical = %q", resolved.CanonicalName)
+	}
+}
+
+func TestRewriteManagedToolChoiceUsesPresentedNames(t *testing.T) {
+	agentCtx := &agentctx.AgentContext{
+		Tools: &agentctx.ToolManifest{
+			Tools: []agentctx.ToolManifestEntry{
+				{Name: "trading-api.propose_trade"},
+			},
+		},
+	}
+	legacy := managedToolHashedNameForCanonical("trading-api.propose_trade")
+
+	for name, emitted := range map[string]string{
+		"canonical":     "trading-api.propose_trade",
+		"legacy hashed": legacy,
+		"hash-free":     "trading-api_propose_trade",
+	} {
+		openai := rewriteManagedOpenAIToolChoice(map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": emitted},
+		}, agentCtx)
+		function, _ := openai.(map[string]any)["function"].(map[string]any)
+		if function["name"] != "trading-api_propose_trade" {
+			t.Fatalf("%s: openai tool_choice rewrote to %q, want hash-free presented", name, function["name"])
+		}
+		anthropic := rewriteManagedAnthropicToolChoice(map[string]any{
+			"type": "tool",
+			"name": emitted,
+		}, agentCtx)
+		if anthropic.(map[string]any)["name"] != "trading-api_propose_trade" {
+			t.Fatalf("%s: anthropic tool_choice rewrote to %q, want hash-free presented", name, anthropic.(map[string]any)["name"])
+		}
+	}
+}
+
+func TestRewriteManagedToolChoiceKeepsHashOnCollision(t *testing.T) {
+	agentCtx := &agentctx.AgentContext{
+		Tools: &agentctx.ToolManifest{
+			Tools: []agentctx.ToolManifestEntry{
+				{Name: "svc.one"},
+				{Name: "svc/one"},
+			},
+		},
+	}
+	rewritten := rewriteManagedOpenAIToolChoice(map[string]any{
+		"type":     "function",
+		"function": map[string]any{"name": "svc.one"},
+	}, agentCtx)
+	function, _ := rewritten.(map[string]any)["function"].(map[string]any)
+	if function["name"] != managedToolHashedNameForCanonical("svc.one") {
+		t.Fatalf("collision tool_choice rewrote to %q, want hashed form", function["name"])
 	}
 }
 

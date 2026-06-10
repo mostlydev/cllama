@@ -61,7 +61,14 @@ func validateSchemaValue(schema map[string]any, value any, path string, rootArgs
 
 	var violations []schemaViolation
 
-	if typeName, ok := schema["type"].(string); ok {
+	if rawType, present := schema["type"]; present {
+		typeName, isString := rawType.(string)
+		if !isString || !isKnownSchemaType(typeName) {
+			// A type keyword we cannot interpret as a plain known string
+			// signals a schema dialect we do not understand. Skip the whole
+			// level, required included: fail open.
+			return nil
+		}
 		if violation := checkSchemaType(typeName, value, path); violation != nil {
 			// A type mismatch makes deeper keyword checks meaningless noise.
 			return []schemaViolation{*violation}
@@ -113,6 +120,14 @@ func validateSchemaValue(schema map[string]any, value any, path string, rootArgs
 	return violations
 }
 
+func isKnownSchemaType(typeName string) bool {
+	switch typeName {
+	case "object", "array", "string", "boolean", "number", "integer", "null":
+		return true
+	}
+	return false
+}
+
 func checkSchemaType(typeName string, value any, path string) *schemaViolation {
 	matched := true
 	switch typeName {
@@ -130,9 +145,6 @@ func checkSchemaType(typeName string, value any, path string) *schemaViolation {
 		matched = isJSONInteger(value)
 	case "null":
 		matched = value == nil
-	default:
-		// Unknown type keyword: fail open.
-		return nil
 	}
 	if matched {
 		return nil

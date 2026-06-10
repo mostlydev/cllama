@@ -66,9 +66,12 @@ func BudgetFromEnv() Budget {
 		budget.MaxTotalFeedBytes = v
 	}
 	if v, ok := positiveIntEnv(EnvFeedFetchTimeoutMS); ok {
-		timeout := time.Duration(v) * time.Millisecond
-		if timeout >= MinFetchTimeout && timeout <= MaxFetchTimeout {
-			budget.FetchTimeout = timeout
+		// Bounds-check in integer milliseconds before converting: a huge
+		// value would overflow the Duration multiplication.
+		minMS := int(MinFetchTimeout / time.Millisecond)
+		maxMS := int(MaxFetchTimeout / time.Millisecond)
+		if v >= minMS && v <= maxMS {
+			budget.FetchTimeout = time.Duration(v) * time.Millisecond
 		}
 	}
 	return budget

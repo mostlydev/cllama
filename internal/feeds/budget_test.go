@@ -47,6 +47,7 @@ func TestBudgetFromEnvFetchTimeoutBounds(t *testing.T) {
 		{"above ceiling", "120001", FetchTimeout},
 		{"zero", "0", FetchTimeout},
 		{"negative", "-5000", FetchTimeout},
+		{"duration overflow", "10000000000000", FetchTimeout},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
