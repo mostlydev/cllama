@@ -37,6 +37,8 @@ type ToolCallTrace struct {
 	Duplicate        bool            `json:"duplicate,omitempty"`
 	DuplicateOfRound int             `json:"duplicate_of_round,omitempty"`
 	DuplicateCount   int             `json:"duplicate_count,omitempty"`
+	DuplicateStreak  int             `json:"duplicate_streak,omitempty"`
+	DuplicatePolicy  string          `json:"policy,omitempty"`
 }
 
 type ToolRoundTrace struct {

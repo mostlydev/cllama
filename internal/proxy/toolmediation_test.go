@@ -324,6 +324,8 @@ func TestManagedToolDuplicateTrackerCanonicalizesArguments(t *testing.T) {
 	if duplicate := tracker.ObserveOpenAI(agentCtx, first, 1); duplicate != nil {
 		t.Fatalf("first call should not be duplicate: %+v", duplicate)
 	}
+	firstResult := []byte(`{"ok":true,"data":{"result":"fresh"},"status_code":200}`)
+	tracker.StoreOpenAIResult(agentCtx, first, 1, managedToolOutcome{RawJSON: firstResult})
 
 	second := openAIToolCall{
 		Name:         managedToolHashedNameForCanonical("trading-api.get_market_context"),
@@ -337,6 +339,21 @@ func TestManagedToolDuplicateTrackerCanonicalizesArguments(t *testing.T) {
 	if duplicate.CanonicalName != "trading-api.get_market_context" || duplicate.FirstRound != 1 || duplicate.Count != 2 {
 		t.Fatalf("unexpected duplicate metadata: %+v", duplicate)
 	}
+	if duplicate.Streak != 1 || !bytes.Equal(duplicate.CachedResult, firstResult) {
+		t.Fatalf("expected cached result and first duplicate streak, got %+v", duplicate)
+	}
+
+	third := openAIToolCall{
+		Name:         "trading-api.get_market_context",
+		Arguments:    map[string]any{"ticker": "MSFT", "window": "1d"},
+		ArgumentsRaw: json.RawMessage(`{"ticker":"MSFT","window":"1d"}`),
+	}
+	if duplicate := tracker.ObserveOpenAI(agentCtx, third, 3); duplicate != nil {
+		t.Fatalf("different args should reset without duplicate: %+v", duplicate)
+	}
+	if duplicate := tracker.ObserveOpenAI(agentCtx, first, 4); duplicate == nil || duplicate.Streak != 1 || !bytes.Equal(duplicate.CachedResult, firstResult) {
+		t.Fatalf("expected duplicate streak to restart after different args, got %+v", duplicate)
+	}
 
 	anthropicTracker := newManagedToolDuplicateTracker()
 	use := anthropicToolUse{
@@ -347,7 +364,8 @@ func TestManagedToolDuplicateTrackerCanonicalizesArguments(t *testing.T) {
 	if duplicate := anthropicTracker.ObserveAnthropic(agentCtx, use, 1); duplicate != nil {
 		t.Fatalf("first anthropic call should not be duplicate: %+v", duplicate)
 	}
-	if duplicate := anthropicTracker.ObserveAnthropic(agentCtx, use, 2); duplicate == nil || duplicate.FirstRound != 1 {
+	anthropicTracker.StoreAnthropicResult(agentCtx, use, 1, managedToolOutcome{RawJSON: firstResult})
+	if duplicate := anthropicTracker.ObserveAnthropic(agentCtx, use, 2); duplicate == nil || duplicate.FirstRound != 1 || duplicate.Streak != 1 || !bytes.Equal(duplicate.CachedResult, firstResult) {
 		t.Fatalf("expected anthropic duplicate metadata, got %+v", duplicate)
 	}
 }

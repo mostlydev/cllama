@@ -1572,7 +1572,191 @@ func TestHandlerManagedAnthropicToolFinalizationFailsIfModelRequestsToolsAgain(t
 	}
 }
 
-func TestHandlerSkipsDuplicateManagedOpenAIToolCalls(t *testing.T) {
+func TestHandlerReplaysDuplicateManagedOpenAIToolCallsAndFinalizes(t *testing.T) {
+	t.Setenv(EnvManagedDuplicateStreakCutoff, "1")
+
+	var xaiBodies [][]byte
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":"fresh"}`))
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read xai body: %v", err)
+		}
+		xaiBodies = append(xaiBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(xaiBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-1",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{\"ticker\":\"NVDA\",\"window\":\"1d\"}"}}]
+					}
+				}]
+			}`))
+		case 2:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal second xai request: %v", err)
+			}
+			messages, _ := payload["messages"].([]any)
+			if len(messages) == 0 {
+				t.Fatalf("expected mediated messages in second request, got %+v", payload)
+			}
+			last := messages[len(messages)-1].(map[string]any)
+			if last["role"] != "tool" || last["tool_call_id"] != "call_1" {
+				t.Fatalf("expected first tool result as last message, got %+v", last)
+			}
+			var toolResult map[string]any
+			if err := json.Unmarshal([]byte(last["content"].(string)), &toolResult); err != nil {
+				t.Fatalf("unmarshal first tool result: %v", err)
+			}
+			data, _ := toolResult["data"].(map[string]any)
+			if data["result"] != "fresh" {
+				t.Fatalf("expected first tool result data, got %+v", toolResult)
+			}
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-2",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_2","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{\"window\":\"1d\",\"ticker\":\"NVDA\"}"}}]
+					}
+				}]
+			}`))
+		case 3:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal third xai request: %v", err)
+			}
+			if _, ok := payload["tools"]; ok {
+				t.Fatalf("expected tools disabled after duplicate streak, got %+v", payload["tools"])
+			}
+			if _, ok := payload["tool_choice"]; ok {
+				t.Fatalf("expected tool_choice removed after duplicate streak, got %+v", payload["tool_choice"])
+			}
+			messages, _ := payload["messages"].([]any)
+			if len(messages) == 0 {
+				t.Fatalf("expected mediated messages in third request, got %+v", payload)
+			}
+			last := messages[len(messages)-1].(map[string]any)
+			if last["role"] != "user" || !strings.Contains(last["content"].(string), managedToolDuplicateFinalizationMessage) {
+				t.Fatalf("expected duplicate finalization instruction, got %+v", last)
+			}
+			var firstContent, replayContent string
+			for _, raw := range messages {
+				msg, _ := raw.(map[string]any)
+				if msg == nil || msg["role"] != "tool" {
+					continue
+				}
+				switch msg["tool_call_id"] {
+				case "call_1":
+					firstContent, _ = msg["content"].(string)
+				case "call_2":
+					replayContent, _ = msg["content"].(string)
+				}
+			}
+			if firstContent == "" || replayContent == "" {
+				t.Fatalf("expected original and replayed tool results, got %+v", messages)
+			}
+			if replayContent != firstContent {
+				t.Fatalf("expected exact cached replay, first=%s replay=%s", firstContent, replayContent)
+			}
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-3",
+				"choices":[{"message":{"role":"assistant","content":"using the first result"}}]
+			}`))
+		default:
+			t.Fatalf("unexpected xai round %d", len(xaiBodies))
+		}
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	histDir := t.TempDir()
+	logs := &lockedBuffer{}
+	h := NewHandler(reg, stubContextLoaderWithTools("agent", "agent:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(logs),
+		WithSessionHistory(histDir))
+	body := `{"model":"xai/grok-4.1-fast","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer agent:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "using the first result") {
+		t.Fatalf("expected final text response, got %s", w.Body.String())
+	}
+	if len(xaiBodies) != 3 {
+		t.Fatalf("expected 3 xai rounds, got %d", len(xaiBodies))
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected duplicate tool call to replay without execution, tool executions=%d", toolCalls)
+	}
+
+	histFile := filepath.Join(histDir, "agent", "history.jsonl")
+	rawHist, err := os.ReadFile(histFile)
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(rawHist, "\n"), &entry); err != nil {
+		t.Fatalf("unmarshal history entry: %v", err)
+	}
+	trace, _ := entry["tool_trace"].([]any)
+	if len(trace) != 2 {
+		t.Fatalf("expected two tool trace rounds, got %+v", trace)
+	}
+	duplicateRound := trace[1].(map[string]any)
+	duplicateCalls := duplicateRound["tool_calls"].([]any)
+	duplicate := duplicateCalls[0].(map[string]any)
+	if duplicate["duplicate"] != true || duplicate["duplicate_of_round"].(float64) != 1 || duplicate["status_code"].(float64) != http.StatusOK {
+		t.Fatalf("expected duplicate trace metadata, got %+v", duplicate)
+	}
+	if duplicate["duplicate_streak"].(float64) != 1 || duplicate["policy"] != managedDuplicatePolicyReplay {
+		t.Fatalf("expected replay duplicate trace policy/streak, got %+v", duplicate)
+	}
+
+	entries := parseLogEntries(t, logs.Bytes())
+	foundIntervention := false
+	foundFinalization := false
+	for _, entry := range entries {
+		if entry["type"] == "intervention" && strings.Contains(fmt.Sprint(entry["intervention"]), "duplicate_managed_tool_call:trading-api.get_market_context") {
+			foundIntervention = true
+		}
+		if entry["type"] == "intervention" && strings.Contains(fmt.Sprint(entry["intervention"]), "duplicate_managed_tool_call_finalization:trading-api.get_market_context") {
+			foundFinalization = true
+		}
+	}
+	if !foundIntervention {
+		t.Fatalf("expected duplicate intervention log, got %+v", entries)
+	}
+	if !foundFinalization {
+		t.Fatalf("expected duplicate finalization intervention log, got %+v", entries)
+	}
+}
+
+func TestHandlerRejectsDuplicateManagedOpenAIToolCallsWhenPolicyReject(t *testing.T) {
+	t.Setenv(EnvManagedDuplicatePolicy, managedDuplicatePolicyReject)
+
 	var xaiBodies [][]byte
 	toolCalls := 0
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1622,10 +1806,17 @@ func TestHandlerSkipsDuplicateManagedOpenAIToolCalls(t *testing.T) {
 				t.Fatalf("expected mediated messages in third request, got %+v", payload)
 			}
 			last := messages[len(messages)-1].(map[string]any)
-			if last["role"] != "tool" {
-				t.Fatalf("expected duplicate result as last message, got %+v", last)
+			if last["role"] != "tool" || last["tool_call_id"] != "call_2" {
+				t.Fatalf("expected duplicate rejection as last message, got %+v", last)
 			}
-			assertToolErrorContains(t, last["content"].(string), "already ran in round 1")
+			assertToolErrorContains(t, last["content"], "already ran in round 1")
+			var toolResult map[string]any
+			if err := json.Unmarshal([]byte(last["content"].(string)), &toolResult); err != nil {
+				t.Fatalf("unmarshal duplicate rejection: %v", err)
+			}
+			if toolResult["status_code"].(float64) != http.StatusConflict {
+				t.Fatalf("expected 409 duplicate rejection, got %+v", toolResult)
+			}
 			_, _ = w.Write([]byte(`{
 				"id":"chatcmpl-3",
 				"choices":[{"message":{"role":"assistant","content":"using the first result"}}]
@@ -1641,10 +1832,7 @@ func TestHandlerSkipsDuplicateManagedOpenAIToolCalls(t *testing.T) {
 		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
 	})
 
-	histDir := t.TempDir()
-	logs := &lockedBuffer{}
-	h := NewHandler(reg, stubContextLoaderWithTools("agent", "agent:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(logs),
-		WithSessionHistory(histDir))
+	h := NewHandler(reg, stubContextLoaderWithTools("agent", "agent:dummy123", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(io.Discard))
 	body := `{"model":"xai/grok-4.1-fast","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer agent:dummy123")
@@ -1656,46 +1844,152 @@ func TestHandlerSkipsDuplicateManagedOpenAIToolCalls(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "using the first result") {
-		t.Fatalf("expected final text response, got %s", w.Body.String())
-	}
 	if len(xaiBodies) != 3 {
 		t.Fatalf("expected 3 xai rounds, got %d", len(xaiBodies))
 	}
 	if toolCalls != 1 {
-		t.Fatalf("expected duplicate tool call to be skipped, tool executions=%d", toolCalls)
+		t.Fatalf("expected duplicate rejection without re-execution, tool executions=%d", toolCalls)
 	}
+}
 
-	histFile := filepath.Join(histDir, "agent", "history.jsonl")
-	rawHist, err := os.ReadFile(histFile)
-	if err != nil {
-		t.Fatalf("read history: %v", err)
-	}
-	var entry map[string]any
-	if err := json.Unmarshal(bytes.TrimRight(rawHist, "\n"), &entry); err != nil {
-		t.Fatalf("unmarshal history entry: %v", err)
-	}
-	trace, _ := entry["tool_trace"].([]any)
-	if len(trace) != 2 {
-		t.Fatalf("expected two tool trace rounds, got %+v", trace)
-	}
-	duplicateRound := trace[1].(map[string]any)
-	duplicateCalls := duplicateRound["tool_calls"].([]any)
-	duplicate := duplicateCalls[0].(map[string]any)
-	if duplicate["duplicate"] != true || duplicate["duplicate_of_round"].(float64) != 1 || duplicate["status_code"].(float64) != http.StatusConflict {
-		t.Fatalf("expected duplicate trace metadata, got %+v", duplicate)
-	}
+func TestHandlerReplaysDuplicateManagedAnthropicToolUsesAndFinalizes(t *testing.T) {
+	t.Setenv(EnvManagedDuplicateStreakCutoff, "1")
 
-	entries := parseLogEntries(t, logs.Bytes())
-	foundIntervention := false
-	for _, entry := range entries {
-		if entry["type"] == "intervention" && strings.Contains(fmt.Sprint(entry["intervention"]), "duplicate_managed_tool_call:trading-api.get_market_context") {
-			foundIntervention = true
+	var logs lockedBuffer
+	var anthropicBodies [][]byte
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":"fresh"}`))
+	}))
+	defer toolSrv.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read anthropic body: %v", err)
 		}
+		anthropicBodies = append(anthropicBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(anthropicBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_1",
+				"type":"message",
+				"content":[{"type":"tool_use","id":"toolu_1","name":"trading-api.get_market_context","input":{"ticker":"NVDA","window":"1d"}}],
+				"stop_reason":"tool_use",
+				"usage":{"input_tokens":10,"output_tokens":3}
+			}`))
+		case 2:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal second anthropic request: %v", err)
+			}
+			messages, _ := payload["messages"].([]any)
+			firstContent, ok := anthropicToolResultContent(messages, "toolu_1")
+			if !ok {
+				t.Fatalf("expected first tool_result in second request, got %+v", payload)
+			}
+			var toolResult map[string]any
+			if err := json.Unmarshal([]byte(firstContent), &toolResult); err != nil {
+				t.Fatalf("unmarshal first anthropic tool result: %v", err)
+			}
+			data, _ := toolResult["data"].(map[string]any)
+			if data["result"] != "fresh" {
+				t.Fatalf("expected first tool result data, got %+v", toolResult)
+			}
+			_, _ = w.Write([]byte(`{
+				"id":"msg_2",
+				"type":"message",
+				"content":[{"type":"tool_use","id":"toolu_2","name":"trading-api.get_market_context","input":{"window":"1d","ticker":"NVDA"}}],
+				"stop_reason":"tool_use",
+				"usage":{"input_tokens":10,"output_tokens":3}
+			}`))
+		case 3:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal third anthropic request: %v", err)
+			}
+			if _, ok := payload["tools"]; ok {
+				t.Fatalf("expected anthropic tools disabled after duplicate streak, got %+v", payload["tools"])
+			}
+			if _, ok := payload["tool_choice"]; ok {
+				t.Fatalf("expected anthropic tool_choice removed after duplicate streak, got %+v", payload["tool_choice"])
+			}
+			messages, _ := payload["messages"].([]any)
+			firstContent, ok := anthropicToolResultContent(messages, "toolu_1")
+			if !ok {
+				t.Fatalf("expected original tool_result in final request, got %+v", payload)
+			}
+			replayContent, ok := anthropicToolResultContent(messages, "toolu_2")
+			if !ok {
+				t.Fatalf("expected replayed tool_result in final request, got %+v", payload)
+			}
+			if replayContent != firstContent {
+				t.Fatalf("expected exact anthropic cached replay, first=%s replay=%s", firstContent, replayContent)
+			}
+			last := messages[len(messages)-1].(map[string]any)
+			blocks, _ := last["content"].([]any)
+			var sawInstruction bool
+			for _, raw := range blocks {
+				block, _ := raw.(map[string]any)
+				if block == nil || block["type"] != "text" {
+					continue
+				}
+				text, _ := block["text"].(string)
+				if strings.Contains(text, managedToolDuplicateFinalizationMessage) {
+					sawInstruction = true
+				}
+			}
+			if !sawInstruction {
+				t.Fatalf("expected duplicate finalization text block, got %+v", last)
+			}
+			_, _ = w.Write([]byte(`{
+				"id":"msg_final",
+				"type":"message",
+				"content":[{"type":"text","text":"using the first result"}],
+				"stop_reason":"end_turn",
+				"usage":{"input_tokens":8,"output_tokens":4}
+			}`))
+		default:
+			t.Fatalf("unexpected anthropic round %d", len(anthropicBodies))
+		}
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")), logging.New(&logs))
+	body := `{
+		"model":"claude-sonnet-4-20250514",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"name":"trading-api.get_market_context","description":"Retrieve market context","input_schema":{"type":"object"}}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if !foundIntervention {
-		t.Fatalf("expected duplicate intervention log, got %+v", entries)
+	if !strings.Contains(w.Body.String(), "using the first result") {
+		t.Fatalf("expected final anthropic text response, got %s", w.Body.String())
 	}
+	if len(anthropicBodies) != 3 {
+		t.Fatalf("expected 3 anthropic rounds, got %d", len(anthropicBodies))
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected duplicate anthropic tool use to replay without execution, tool executions=%d", toolCalls)
+	}
+	assertInterventionLogged(t, logs.Bytes(), duplicateManagedToolCallFinalizationIntervention+":trading-api.get_market_context")
 }
 
 func TestHandlerRejectsMissingBearer(t *testing.T) {
@@ -5572,6 +5866,25 @@ func assertInterventionLogged(t *testing.T, raw []byte, reason string) {
 		}
 	}
 	t.Fatalf("expected intervention %q in logs, got %v", reason, entries)
+}
+
+func anthropicToolResultContent(messages []any, toolUseID string) (string, bool) {
+	for _, rawMessage := range messages {
+		msg, _ := rawMessage.(map[string]any)
+		if msg == nil || msg["role"] != "user" {
+			continue
+		}
+		blocks, _ := msg["content"].([]any)
+		for _, rawBlock := range blocks {
+			block, _ := rawBlock.(map[string]any)
+			if block == nil || block["type"] != "tool_result" || block["tool_use_id"] != toolUseID {
+				continue
+			}
+			content, _ := block["content"].(string)
+			return content, content != ""
+		}
+	}
+	return "", false
 }
 
 func assertToolErrorContains(t *testing.T, raw any, want string) {

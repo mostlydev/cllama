@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,12 +25,24 @@ import (
 )
 
 const (
-	defaultManagedToolMaxRounds    = 8
-	defaultManagedToolTimeoutMS    = 30000
-	defaultManagedToolTotalTimeout = 120000
-	managedKeepaliveInterval       = 250 * time.Millisecond
-	maxManagedToolResultBytes      = 16 * 1024
-	maxManagedLLMResponseBytes     = 4 * 1024 * 1024
+	defaultManagedToolMaxRounds         = 8
+	defaultManagedToolTimeoutMS         = 30000
+	defaultManagedToolTotalTimeout      = 120000
+	defaultManagedDuplicatePolicy       = managedDuplicatePolicyReplay
+	defaultManagedDuplicateStreakCutoff = 3
+	managedKeepaliveInterval            = 250 * time.Millisecond
+	maxManagedToolResultBytes           = 16 * 1024
+	maxManagedLLMResponseBytes          = 4 * 1024 * 1024
+)
+
+const (
+	EnvManagedDuplicatePolicy       = "CLLAMA_MANAGED_DUPLICATE_POLICY"
+	EnvManagedDuplicateStreakCutoff = "CLLAMA_MANAGED_DUPLICATE_STREAK_CUTOFF"
+)
+
+const (
+	managedDuplicatePolicyReplay = "replay"
+	managedDuplicatePolicyReject = "reject"
 )
 
 var (
@@ -44,10 +58,12 @@ const mixedToolOrderMessage = "mixed managed and runner-native tool calls are no
 const managedMixedPrefixSerializedIntervention = "managed_prefix_native_suffix_serialized"
 const mixedToolOrderInternalRetryIntervention = "mixed_tool_order_internal_retry"
 const duplicateManagedToolCallIntervention = "duplicate_managed_tool_call"
+const duplicateManagedToolCallFinalizationIntervention = "duplicate_managed_tool_call_finalization"
 const managedToolBudgetFinalizationIntervention = "managed_tool_budget_finalization"
 const managedToolSchemaRejectedIntervention = "managed_tool_schema_rejected"
 
 const managedToolBudgetFinalizationMessage = "Managed tool budget exhausted. Do not call tools again. Produce the best final answer now using the tool results already in this conversation. If the evidence is insufficient, say exactly what was checked and give the explicit no-go or defer decision."
+const managedToolDuplicateFinalizationMessage = "This managed tool call was repeated with identical arguments. Do not call tools again. Produce your final answer now from the earlier tool result; if evidence is insufficient, give an explicit no-go/defer."
 
 type capturedResponse struct {
 	StatusCode    int
@@ -95,20 +111,30 @@ type managedToolPolicy struct {
 }
 
 type managedToolDuplicateTracker struct {
-	seen map[string]managedToolSeen
+	seen            map[string]managedToolSeen
+	lastSignature   string
+	duplicateStreak int
 }
 
 type managedToolSeen struct {
-	Round int
-	Count int
+	Round      int
+	Count      int
+	Result     []byte
+	Status     string
+	StatusCode int
 }
 
 type managedToolDuplicate struct {
-	CanonicalName string
-	Service       string
-	Arguments     json.RawMessage
-	FirstRound    int
-	Count         int
+	CanonicalName   string
+	Service         string
+	Arguments       json.RawMessage
+	FirstRound      int
+	Count           int
+	Streak          int
+	CachedResult    []byte
+	HasCachedResult bool
+	Status          string
+	StatusCode      int
 }
 
 type managedUsageAggregate struct {
@@ -192,6 +218,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 	var lastUpstreamModel string
 	duplicates := newManagedToolDuplicateTracker()
 	finalizingAfterBudget := false
+	finalizingAfterDuplicate := false
 
 	for {
 		dispatchResult := waitWithManagedKeepalive(streamKeepalive, managedModelWaitComment(len(toolTrace)+1), func() managedDispatchResult {
@@ -275,8 +302,11 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
 			return
 		}
-		if finalizingAfterBudget {
+		if finalizingAfterBudget || finalizingAfterDuplicate {
 			msg := "managed tool finalization requested tools after budget exhaustion"
+			if finalizingAfterDuplicate {
+				msg = "managed tool finalization requested tools after duplicate managed tool call streak"
+			}
 			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
 			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
 			return
@@ -354,10 +384,15 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				ReportedCostUSD:  usage.ReportedCostUSD,
 			},
 		}
+		finalizeAfterDuplicate := false
 		for _, call := range managedCalls {
 			if duplicate := duplicates.ObserveOpenAI(agentCtx, call, len(toolTrace)+1); duplicate != nil {
-				outcome := duplicateManagedToolOutcome(duplicate)
+				outcome := duplicateManagedToolOutcome(duplicate, h.managedDuplicatePolicy)
 				h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallIntervention+":"+duplicate.CanonicalName)
+				if !finalizeAfterDuplicate && duplicate.Streak >= h.managedDuplicateStreakCutoff {
+					h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallFinalizationIntervention+":"+duplicate.CanonicalName)
+					finalizeAfterDuplicate = true
+				}
 				roundTrace.ToolCalls = append(roundTrace.ToolCalls, outcome.Trace)
 				toolMessages = append(toolMessages, map[string]any{
 					"role":         "tool",
@@ -382,6 +417,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, execErr)
 				return
 			}
+			duplicates.StoreOpenAIResult(agentCtx, call, len(toolTrace)+1, outcome)
 			roundTrace.ToolCalls = append(roundTrace.ToolCalls, outcome.Trace)
 			toolMessages = append(toolMessages, map[string]any{
 				"role":         "tool",
@@ -395,6 +431,11 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			managedAssistant = buildOpenAIAssistantMessage(assistantMessage, managedCalls, true)
 		}
 		appendOpenAIAssistantAndToolMessages(payload, managedAssistant, toolMessages)
+		if finalizeAfterDuplicate {
+			appendOpenAIDuplicateFinalizationInstruction(payload)
+			disableOpenAITools(payload)
+			finalizingAfterDuplicate = true
+		}
 		// Persist the filtered managed-only assistant so the hidden continuity
 		// transcript matches the serialized round the model actually saw before
 		// the runner-native handoff.
@@ -421,6 +462,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 	var lastUpstreamModel string
 	duplicates := newManagedToolDuplicateTracker()
 	finalizingAfterBudget := false
+	finalizingAfterDuplicate := false
 
 	for {
 		dispatchResult := waitWithManagedKeepalive(streamKeepalive, managedModelWaitComment(len(toolTrace)+1), func() managedDispatchResult {
@@ -504,8 +546,11 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
 			return
 		}
-		if finalizingAfterBudget {
+		if finalizingAfterBudget || finalizingAfterDuplicate {
 			msg := "managed tool finalization requested tools after budget exhaustion"
+			if finalizingAfterDuplicate {
+				msg = "managed tool finalization requested tools after duplicate managed tool call streak"
+			}
 			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
 			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
 			return
@@ -583,10 +628,15 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				ReportedCostUSD:  usage.ReportedCostUSD,
 			},
 		}
+		finalizeAfterDuplicate := false
 		for _, call := range managedToolUses {
 			if duplicate := duplicates.ObserveAnthropic(agentCtx, call, len(toolTrace)+1); duplicate != nil {
-				outcome := duplicateManagedToolOutcome(duplicate)
+				outcome := duplicateManagedToolOutcome(duplicate, h.managedDuplicatePolicy)
 				h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallIntervention+":"+duplicate.CanonicalName)
+				if !finalizeAfterDuplicate && duplicate.Streak >= h.managedDuplicateStreakCutoff {
+					h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallFinalizationIntervention+":"+duplicate.CanonicalName)
+					finalizeAfterDuplicate = true
+				}
 				roundTrace.ToolCalls = append(roundTrace.ToolCalls, outcome.Trace)
 				toolResults = append(toolResults, anthropicToolResultBlock(call.ID, outcome.RawJSON))
 				continue
@@ -607,6 +657,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, execErr)
 				return
 			}
+			duplicates.StoreAnthropicResult(agentCtx, call, len(toolTrace)+1, outcome)
 			roundTrace.ToolCalls = append(roundTrace.ToolCalls, outcome.Trace)
 			toolResults = append(toolResults, anthropicToolResultBlock(call.ID, outcome.RawJSON))
 		}
@@ -616,6 +667,11 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			managedAssistant = buildAnthropicAssistantMessage(assistantMessage, managedToolUses, true)
 		}
 		toolResultMessage := appendAnthropicAssistantAndToolResultMessages(payload, managedAssistant, toolResults)
+		if finalizeAfterDuplicate {
+			appendAnthropicDuplicateFinalizationInstruction(toolResultMessage)
+			disableAnthropicTools(payload)
+			finalizingAfterDuplicate = true
+		}
 		// Persist the filtered managed-only assistant so the hidden continuity
 		// transcript matches the serialized round the model actually saw before
 		// the runner-native handoff.
@@ -796,6 +852,29 @@ func resolveManagedToolPolicy(agentCtx *agentctx.AgentContext) managedToolPolicy
 	}
 }
 
+func managedToolDuplicatePolicyFromEnv() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvManagedDuplicatePolicy))) {
+	case "", managedDuplicatePolicyReplay:
+		return managedDuplicatePolicyReplay
+	case managedDuplicatePolicyReject:
+		return managedDuplicatePolicyReject
+	default:
+		return defaultManagedDuplicatePolicy
+	}
+}
+
+func managedToolDuplicateStreakCutoffFromEnv() int {
+	raw := strings.TrimSpace(os.Getenv(EnvManagedDuplicateStreakCutoff))
+	if raw == "" {
+		return defaultManagedDuplicateStreakCutoff
+	}
+	cutoff, err := strconv.Atoi(raw)
+	if err != nil || cutoff <= 0 {
+		return defaultManagedDuplicateStreakCutoff
+	}
+	return cutoff
+}
+
 func newManagedToolDuplicateTracker() *managedToolDuplicateTracker {
 	return &managedToolDuplicateTracker{seen: make(map[string]managedToolSeen)}
 }
@@ -811,6 +890,17 @@ func (t *managedToolDuplicateTracker) ObserveOpenAI(agentCtx *agentctx.AgentCont
 	return t.observe(resolved.CanonicalName, resolved.Manifest.Execution.Service, call.ArgumentsRaw, call.Arguments, round)
 }
 
+func (t *managedToolDuplicateTracker) StoreOpenAIResult(agentCtx *agentctx.AgentContext, call openAIToolCall, round int, outcome managedToolOutcome) {
+	if t == nil || call.ParseErr != nil {
+		return
+	}
+	resolved, ok := resolveManagedTool(agentCtx, call.Name)
+	if !ok {
+		return
+	}
+	t.store(resolved.CanonicalName, call.ArgumentsRaw, call.Arguments, round, outcome)
+}
+
 func (t *managedToolDuplicateTracker) ObserveAnthropic(agentCtx *agentctx.AgentContext, call anthropicToolUse, round int) *managedToolDuplicate {
 	if t == nil || call.ParseErr != nil {
 		return nil
@@ -822,12 +912,26 @@ func (t *managedToolDuplicateTracker) ObserveAnthropic(agentCtx *agentctx.AgentC
 	return t.observe(resolved.CanonicalName, resolved.Manifest.Execution.Service, call.ArgumentsRaw, call.Arguments, round)
 }
 
+func (t *managedToolDuplicateTracker) StoreAnthropicResult(agentCtx *agentctx.AgentContext, call anthropicToolUse, round int, outcome managedToolOutcome) {
+	if t == nil || call.ParseErr != nil {
+		return
+	}
+	resolved, ok := resolveManagedTool(agentCtx, call.Name)
+	if !ok {
+		return
+	}
+	t.store(resolved.CanonicalName, call.ArgumentsRaw, call.Arguments, round, outcome)
+}
+
 func (t *managedToolDuplicateTracker) observe(canonicalName, service string, rawArgs json.RawMessage, args map[string]any, round int) *managedToolDuplicate {
-	canonicalArgs, ok := canonicalManagedToolArguments(rawArgs, args)
+	signature, canonicalArgs, ok := managedToolDuplicateSignature(canonicalName, rawArgs, args)
 	if !ok {
 		return nil
 	}
-	signature := canonicalName + "\x00" + string(canonicalArgs)
+	if signature != t.lastSignature {
+		t.duplicateStreak = 0
+		t.lastSignature = signature
+	}
 	seen, ok := t.seen[signature]
 	if !ok {
 		t.seen[signature] = managedToolSeen{Round: round, Count: 1}
@@ -835,13 +939,45 @@ func (t *managedToolDuplicateTracker) observe(canonicalName, service string, raw
 	}
 	seen.Count++
 	t.seen[signature] = seen
+	t.duplicateStreak++
 	return &managedToolDuplicate{
-		CanonicalName: canonicalName,
-		Service:       service,
-		Arguments:     canonicalArgs,
-		FirstRound:    seen.Round,
-		Count:         seen.Count,
+		CanonicalName:   canonicalName,
+		Service:         service,
+		Arguments:       canonicalArgs,
+		FirstRound:      seen.Round,
+		Count:           seen.Count,
+		Streak:          t.duplicateStreak,
+		CachedResult:    append([]byte(nil), seen.Result...),
+		HasCachedResult: len(seen.Result) > 0,
+		Status:          seen.Status,
+		StatusCode:      seen.StatusCode,
 	}
+}
+
+func (t *managedToolDuplicateTracker) store(canonicalName string, rawArgs json.RawMessage, args map[string]any, round int, outcome managedToolOutcome) {
+	signature, _, ok := managedToolDuplicateSignature(canonicalName, rawArgs, args)
+	if !ok {
+		return
+	}
+	seen, ok := t.seen[signature]
+	if !ok {
+		seen = managedToolSeen{Round: round, Count: 1}
+	}
+	seen.Result = append([]byte(nil), outcome.RawJSON...)
+	seen.Status = outcome.Trace.Status
+	seen.StatusCode = outcome.Trace.StatusCode
+	if strings.TrimSpace(seen.Status) == "" {
+		seen.Status = managedToolResponseStatus(outcome.RawJSON, seen.StatusCode)
+	}
+	t.seen[signature] = seen
+}
+
+func managedToolDuplicateSignature(canonicalName string, rawArgs json.RawMessage, args map[string]any) (string, json.RawMessage, bool) {
+	canonicalArgs, ok := canonicalManagedToolArguments(rawArgs, args)
+	if !ok {
+		return "", nil, false
+	}
+	return canonicalName + "\x00" + string(canonicalArgs), canonicalArgs, true
 }
 
 func canonicalManagedToolArguments(raw json.RawMessage, args map[string]any) (json.RawMessage, bool) {
@@ -864,29 +1000,45 @@ func canonicalManagedToolArguments(raw json.RawMessage, args map[string]any) (js
 	return json.RawMessage(canonical), true
 }
 
-func duplicateManagedToolOutcome(duplicate *managedToolDuplicate) managedToolOutcome {
+func duplicateManagedToolOutcome(duplicate *managedToolDuplicate, policy string) managedToolOutcome {
+	if strings.TrimSpace(policy) == "" {
+		policy = defaultManagedDuplicatePolicy
+	}
 	if duplicate == nil {
 		raw := toolErrorPayload("duplicate_tool_call", "Duplicate managed tool call skipped.", http.StatusConflict, nil)
 		return managedToolOutcome{RawJSON: raw}
 	}
-	details := map[string]any{
-		"tool":             duplicate.CanonicalName,
-		"first_round":      duplicate.FirstRound,
-		"duplicate_count":  duplicate.Count,
-		"reuse_prior_call": true,
+	raw := append([]byte(nil), duplicate.CachedResult...)
+	status := duplicate.Status
+	statusCode := duplicate.StatusCode
+	if policy == managedDuplicatePolicyReject || !duplicate.HasCachedResult {
+		details := map[string]any{
+			"tool":             duplicate.CanonicalName,
+			"first_round":      duplicate.FirstRound,
+			"duplicate_count":  duplicate.Count,
+			"duplicate_streak": duplicate.Streak,
+			"policy":           policy,
+			"reuse_prior_call": true,
+		}
+		message := fmt.Sprintf("This exact managed tool call already ran in round %d. Reuse the earlier result instead of calling it again.", duplicate.FirstRound)
+		raw = toolErrorPayload("duplicate_tool_call", message, http.StatusConflict, details)
+		status = managedToolResponseStatus(raw, http.StatusConflict)
+		statusCode = http.StatusConflict
+	} else if strings.TrimSpace(status) == "" {
+		status = managedToolResponseStatus(raw, statusCode)
 	}
-	message := fmt.Sprintf("This exact managed tool call already ran in round %d. Reuse the earlier result instead of calling it again.", duplicate.FirstRound)
-	raw := toolErrorPayload("duplicate_tool_call", message, http.StatusConflict, details)
 	trace := sessionhistory.ToolCallTrace{
 		Name:             duplicate.CanonicalName,
 		Arguments:        append(json.RawMessage(nil), duplicate.Arguments...),
 		Result:           append(json.RawMessage(nil), raw...),
 		Service:          duplicate.Service,
-		Status:           managedToolResponseStatus(raw, http.StatusConflict),
-		StatusCode:       http.StatusConflict,
+		Status:           status,
+		StatusCode:       statusCode,
 		Duplicate:        true,
 		DuplicateOfRound: duplicate.FirstRound,
 		DuplicateCount:   duplicate.Count,
+		DuplicateStreak:  duplicate.Streak,
+		DuplicatePolicy:  policy,
 	}
 	return managedToolOutcome{RawJSON: raw, Trace: trace}
 }
@@ -1847,10 +1999,18 @@ func appendOpenAIAssistantAndToolMessages(payload map[string]any, assistantMessa
 }
 
 func appendOpenAIFinalizationInstruction(payload map[string]any) {
+	appendOpenAIFinalizationInstructionMessage(payload, managedToolBudgetFinalizationMessage)
+}
+
+func appendOpenAIDuplicateFinalizationInstruction(payload map[string]any) {
+	appendOpenAIFinalizationInstructionMessage(payload, managedToolDuplicateFinalizationMessage)
+}
+
+func appendOpenAIFinalizationInstructionMessage(payload map[string]any, message string) {
 	messages, _ := payload["messages"].([]any)
 	messages = append(messages, map[string]any{
 		"role":    "user",
-		"content": managedToolBudgetFinalizationMessage,
+		"content": message,
 	})
 	payload["messages"] = messages
 }
@@ -1874,10 +2034,18 @@ func appendAnthropicAssistantAndToolResultMessages(payload map[string]any, assis
 }
 
 func appendAnthropicFinalizationInstruction(toolResultMessage map[string]any) {
+	appendAnthropicFinalizationInstructionMessage(toolResultMessage, managedToolBudgetFinalizationMessage)
+}
+
+func appendAnthropicDuplicateFinalizationInstruction(toolResultMessage map[string]any) {
+	appendAnthropicFinalizationInstructionMessage(toolResultMessage, managedToolDuplicateFinalizationMessage)
+}
+
+func appendAnthropicFinalizationInstructionMessage(toolResultMessage map[string]any, message string) {
 	content, _ := toolResultMessage["content"].([]map[string]any)
 	content = append(content, map[string]any{
 		"type": "text",
-		"text": managedToolBudgetFinalizationMessage,
+		"text": message,
 	})
 	toolResultMessage["content"] = content
 }

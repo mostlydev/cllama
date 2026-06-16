@@ -28,23 +28,25 @@ type ContextLoader func(agentID string) (*agentctx.AgentContext, error)
 
 // Handler proxies OpenAI-compatible chat requests to upstream providers.
 type Handler struct {
-	registry              *provider.Registry
-	loadContext           ContextLoader
-	client                *http.Client
-	logger                *logging.Logger
-	notifier              *alert.Notifier
-	accumulator           *cost.Accumulator
-	pricing               *cost.Pricing
-	feedFetcher           *feeds.Fetcher
-	feedBudget            feeds.Budget
-	mcpClient             *mcp.Client
-	managedTurns          *managedOpenAIContinuityStore
-	managedAnthropicTurns *managedAnthropicContinuityStore
-	sessionRecorder       *sessionhistory.Recorder
-	channelCursors        *channelCursorStore
-	adminToken            string
-	snapshots             *ContextSnapshotStore
-	toolSchemaValidation  bool
+	registry                     *provider.Registry
+	loadContext                  ContextLoader
+	client                       *http.Client
+	logger                       *logging.Logger
+	notifier                     *alert.Notifier
+	accumulator                  *cost.Accumulator
+	pricing                      *cost.Pricing
+	feedFetcher                  *feeds.Fetcher
+	feedBudget                   feeds.Budget
+	mcpClient                    *mcp.Client
+	managedTurns                 *managedOpenAIContinuityStore
+	managedAnthropicTurns        *managedAnthropicContinuityStore
+	sessionRecorder              *sessionhistory.Recorder
+	channelCursors               *channelCursorStore
+	adminToken                   string
+	snapshots                    *ContextSnapshotStore
+	toolSchemaValidation         bool
+	managedDuplicatePolicy       string
+	managedDuplicateStreakCutoff int
 }
 
 // HandlerOption configures optional Handler behaviour.
@@ -140,16 +142,18 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 		logger = logging.New(io.Discard)
 	}
 	h := &Handler{
-		registry:              registry,
-		loadContext:           contextLoader,
-		client:                &http.Client{},
-		logger:                logger,
-		managedTurns:          newManagedOpenAIContinuityStore(defaultManagedToolContinuityTurns),
-		managedAnthropicTurns: newManagedAnthropicContinuityStore(defaultManagedToolContinuityTurns),
-		channelCursors:        newChannelCursorStore(""),
-		snapshots:             NewContextSnapshotStore(),
-		feedBudget:            feeds.DefaultBudget(),
-		toolSchemaValidation:  toolSchemaValidationFromEnv(),
+		registry:                     registry,
+		loadContext:                  contextLoader,
+		client:                       &http.Client{},
+		logger:                       logger,
+		managedTurns:                 newManagedOpenAIContinuityStore(defaultManagedToolContinuityTurns),
+		managedAnthropicTurns:        newManagedAnthropicContinuityStore(defaultManagedToolContinuityTurns),
+		channelCursors:               newChannelCursorStore(""),
+		snapshots:                    NewContextSnapshotStore(),
+		feedBudget:                   feeds.DefaultBudget(),
+		toolSchemaValidation:         toolSchemaValidationFromEnv(),
+		managedDuplicatePolicy:       managedToolDuplicatePolicyFromEnv(),
+		managedDuplicateStreakCutoff: managedToolDuplicateStreakCutoffFromEnv(),
 	}
 	for _, opt := range opts {
 		opt(h)
