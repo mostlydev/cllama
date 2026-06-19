@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -2327,7 +2328,8 @@ func TestHandlerMissingModelClampsToDefaultAndLogsIntervention(t *testing.T) {
 	assertInterventionLogged(t, logs.Bytes(), "missing")
 }
 
-func TestHandlerDoesNotAdvanceCandidatesOnUpstream500(t *testing.T) {
+func TestHandlerFallsBackToDeclaredCandidateOnUpstream500(t *testing.T) {
+	var logs bytes.Buffer
 	var fallbackCalls int
 	primaryBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -2358,7 +2360,7 @@ func TestHandlerDoesNotAdvanceCandidatesOnUpstream500(t *testing.T) {
 			{Slot: "fallback", Ref: "openrouter/anthropic/claude-haiku-4-5"},
 		},
 	}
-	h := NewHandler(reg, stubContextLoaderWithPolicy("weston", "weston:dummy123", policy), nil)
+	h := NewHandler(reg, stubContextLoaderWithPolicy("weston", "weston:dummy123", policy), logging.New(&logs))
 	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer weston:dummy123")
@@ -2367,11 +2369,205 @@ func TestHandlerDoesNotAdvanceCandidatesOnUpstream500(t *testing.T) {
 
 	h.ServeHTTP(w, req)
 
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected fallback 200 after upstream 500, got %d: %s", w.Code, w.Body.String())
+	}
+	if fallbackCalls != 1 {
+		t.Fatalf("expected one fallback call after upstream 500, got %d", fallbackCalls)
+	}
+	assertInterventionLogged(t, logs.Bytes(), "provider_candidate_fallback:http_500")
+	assertInterventionLogged(t, logs.Bytes(), "provider_exhausted_failover")
+}
+
+func TestHandlerForwardsTerminalUpstream500(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"upstream exploded"}}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-openai", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithToken("agent-1", "agent-1:dummy123"), nil)
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer agent-1:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
 	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("expected upstream 500 to pass through, got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("expected terminal upstream 500 to pass through, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "upstream exploded") {
+		t.Fatalf("expected upstream error body to pass through, got %s", w.Body.String())
+	}
+}
+
+func TestHandlerFallsBackToDeclaredCandidateOnTransportError(t *testing.T) {
+	var logs bytes.Buffer
+	primaryBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	primaryURL := primaryBackend.URL
+	primaryBackend.Close()
+
+	var fallbackCalls int
+	fallbackBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-2","choices":[{"message":{"content":"fallback"}}]}`))
+	}))
+	defer fallbackBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: primaryURL + "/v1", APIKey: "sk-openai", Auth: "bearer",
+	})
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: fallbackBackend.URL + "/v1", APIKey: "sk-or", Auth: "bearer",
+	})
+
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "openai/gpt-4o"},
+			{Slot: "fallback", Ref: "openrouter/anthropic/claude-haiku-4-5"},
+		},
+	}
+	h := NewHandler(reg, stubContextLoaderWithPolicy("agent-1", "agent-1:dummy123", policy), logging.New(&logs))
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer agent-1:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected fallback 200 after transport error, got %d: %s", w.Code, w.Body.String())
+	}
+	if fallbackCalls != 1 {
+		t.Fatalf("expected one fallback call after transport error, got %d", fallbackCalls)
+	}
+	assertInterventionLogged(t, logs.Bytes(), "provider_candidate_fallback:transport_error")
+}
+
+func TestHandlerDoesNotFallbackOnUpstream400(t *testing.T) {
+	var fallbackCalls int
+	primaryBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad request"}}`))
+	}))
+	defer primaryBackend.Close()
+
+	fallbackBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-2","choices":[{"message":{"content":"fallback"}}]}`))
+	}))
+	defer fallbackBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: primaryBackend.URL + "/v1", APIKey: "sk-openai", Auth: "bearer",
+	})
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: fallbackBackend.URL + "/v1", APIKey: "sk-or", Auth: "bearer",
+	})
+
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "openai/gpt-4o"},
+			{Slot: "fallback", Ref: "openrouter/anthropic/claude-haiku-4-5"},
+		},
+	}
+	h := NewHandler(reg, stubContextLoaderWithPolicy("agent-1", "agent-1:dummy123", policy), nil)
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer agent-1:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected upstream 400 to pass through, got %d: %s", w.Code, w.Body.String())
 	}
 	if fallbackCalls != 0 {
-		t.Fatalf("expected no fallback calls on upstream 500, got %d", fallbackCalls)
+		t.Fatalf("expected no fallback calls on upstream 400, got %d", fallbackCalls)
+	}
+}
+
+func TestDispatchCandidatesJSONFallsBackOnUpstream500(t *testing.T) {
+	var logs bytes.Buffer
+	primaryBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"upstream exploded"}}`))
+	}))
+	defer primaryBackend.Close()
+
+	var fallbackCalls int
+	fallbackBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-2","choices":[{"message":{"content":"fallback"}}]}`))
+	}))
+	defer fallbackBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: primaryBackend.URL + "/v1", APIKey: "sk-openai", Auth: "bearer",
+	})
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: fallbackBackend.URL + "/v1", APIKey: "sk-or", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, nil, logging.New(&logs))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Content-Type", "application/json")
+	payload := map[string]any{
+		"model":    "openai/gpt-4o",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}
+	candidates := []dispatchCandidate{
+		{ProviderName: "openai", UpstreamModel: "gpt-4o"},
+		{ProviderName: "openrouter", UpstreamModel: "anthropic/claude-haiku-4-5"},
+	}
+
+	resp, status, msg, err := h.dispatchCandidatesJSON(context.Background(), req, "agent-1", "openai/gpt-4o", payload, candidates, nil)
+	if err != nil {
+		t.Fatalf("dispatchCandidatesJSON returned error status=%d msg=%q err=%v", status, msg, err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected fallback 200 response, got %+v", resp)
+	}
+	if resp.ProviderName != "openrouter" || resp.UpstreamModel != "anthropic/claude-haiku-4-5" {
+		t.Fatalf("expected fallback provider metadata, got %+v", resp)
+	}
+	if fallbackCalls != 1 {
+		t.Fatalf("expected one fallback call, got %d", fallbackCalls)
+	}
+	assertInterventionLogged(t, logs.Bytes(), "provider_candidate_fallback:http_500")
+}
+
+func TestDispatchCandidateTimeoutDurationFromEnv(t *testing.T) {
+	t.Setenv(EnvDispatchCandidateTimeoutMS, "1234")
+	if got := dispatchCandidateTimeoutDuration(); got != 1234*time.Millisecond {
+		t.Fatalf("dispatchCandidateTimeoutDuration = %s; want 1234ms", got)
+	}
+}
+
+func TestDispatchCandidateTimeoutDurationFallsBackOnInvalidEnv(t *testing.T) {
+	t.Setenv(EnvDispatchCandidateTimeoutMS, "not-a-number")
+	if got := dispatchCandidateTimeoutDuration(); got != time.Duration(defaultDispatchCandidateTimeoutMS)*time.Millisecond {
+		t.Fatalf("dispatchCandidateTimeoutDuration = %s; want default", got)
 	}
 }
 

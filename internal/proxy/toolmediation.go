@@ -682,12 +682,13 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, agentID string, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestInfo *logging.RequestInfo) (*capturedResponse, int, string, error) {
 	sawCooldown := false
 	for i, candidate := range candidates {
+		canFallback := i+1 < len(candidates)
 		payload["model"] = candidate.UpstreamModel
 		outBody, err := json.Marshal(payload)
 		if err != nil {
 			return nil, http.StatusInternalServerError, "failed to encode upstream body", err
 		}
-		result := h.dispatchJSONWithRetry(ctx, r, agentID, requestedModel, candidate, outBody, requestInfo)
+		result := h.dispatchJSONWithRetry(ctx, r, agentID, requestedModel, candidate, outBody, requestInfo, canFallback)
 		if result.Response != nil {
 			return result.Response, 0, "", nil
 		}
@@ -708,7 +709,7 @@ func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, a
 	return nil, http.StatusBadGateway, "no usable declared provider key after retries", err
 }
 
-func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, agentID string, requestedModel string, candidate dispatchCandidate, outBody []byte, requestInfo *logging.RequestInfo) dispatchJSONAttemptResult {
+func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, agentID string, requestedModel string, candidate dispatchCandidate, outBody []byte, requestInfo *logging.RequestInfo, canFallback bool) dispatchJSONAttemptResult {
 	const maxKeyAttempts = 5
 	sawCooldown := false
 
@@ -735,8 +736,10 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			}
 		}
 
-		outReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(outBody))
+		attemptCtx, cancel := context.WithTimeout(ctx, dispatchCandidateTimeoutDuration())
+		outReq, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, targetURL, bytes.NewReader(outBody))
 		if err != nil {
+			cancel()
 			return dispatchJSONAttemptResult{
 				ClientStatus:  http.StatusBadGateway,
 				ClientMessage: "failed to create upstream request",
@@ -746,6 +749,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 		copyRequestHeaders(outReq.Header, r.Header)
 		outReq.Header.Set("Content-Type", "application/json")
 		if err := applyProviderAuth(outReq, prov); err != nil {
+			cancel()
 			return dispatchJSONAttemptResult{
 				ClientStatus:  http.StatusBadGateway,
 				ClientMessage: "provider auth not configured",
@@ -756,10 +760,18 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 		h.logger.LogRequestWithInfo(agentID, requestedModel, requestInfo)
 		resp, err := h.client.Do(outReq)
 		if err != nil {
+			cancel()
+			if !canFallback {
+				return dispatchJSONAttemptResult{
+					ClientStatus:  http.StatusBadGateway,
+					ClientMessage: "upstream request failed",
+					Err:           err,
+				}
+			}
+			h.logCandidateFallback(agentID, requestedModel, "transport_error")
 			return dispatchJSONAttemptResult{
-				ClientStatus:  http.StatusBadGateway,
-				ClientMessage: "upstream request failed",
-				Err:           err,
+				AdvanceToNextCandidate: true,
+				Err:                    err,
 			}
 		}
 
@@ -767,6 +779,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 		switch classification {
 		case classAuth:
 			resp.Body.Close()
+			cancel()
 			reason := fmt.Sprintf("http_%d", resp.StatusCode)
 			_ = h.registry.MarkDead(lease.ProviderName, lease.KeyID, reason, resp.StatusCode)
 			h.logger.LogProviderPool(lease.ProviderName, lease.KeyID, "dead", reason, "")
@@ -777,6 +790,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			continue
 		case classRateLimit:
 			resp.Body.Close()
+			cancel()
 			cooldownDur := parseCooldownDuration(resp)
 			until := time.Now().UTC().Add(cooldownDur)
 			_ = h.registry.MarkCooldown(lease.ProviderName, lease.KeyID, "rate_limit", until)
@@ -795,9 +809,19 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			_ = h.registry.SaveToFile()
 			continue
 		default:
+			if canFallback && isCandidateFallbackStatus(resp.StatusCode) {
+				reason := fmt.Sprintf("http_%d", resp.StatusCode)
+				resp.Body.Close()
+				cancel()
+				h.logCandidateFallback(agentID, requestedModel, reason)
+				return dispatchJSONAttemptResult{
+					AdvanceToNextCandidate: true,
+				}
+			}
 			limited, readErr := readBodyLimited(resp.Body, maxManagedLLMResponseBytes)
 			resp.Body.Close()
 			if readErr != nil {
+				cancel()
 				return dispatchJSONAttemptResult{
 					ClientStatus:  http.StatusBadGateway,
 					ClientMessage: "failed to read upstream response",
@@ -805,12 +829,14 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 				}
 			}
 			if limited.Truncated {
+				cancel()
 				return dispatchJSONAttemptResult{
 					ClientStatus:  http.StatusBadGateway,
 					ClientMessage: "managed tool mediation upstream response exceeded size limit",
 					Err:           fmt.Errorf("upstream response exceeded %d bytes during managed tool mediation", maxManagedLLMResponseBytes),
 				}
 			}
+			cancel()
 			return dispatchJSONAttemptResult{
 				Response: &capturedResponse{
 					StatusCode:    resp.StatusCode,

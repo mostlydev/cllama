@@ -34,6 +34,40 @@ func TestChannelCursorStoreRoundTripsAndAdvancesMonotonically(t *testing.T) {
 	}
 }
 
+func TestChannelCursorStoreNormalizesLedgerPermissions(t *testing.T) {
+	root := t.TempDir()
+	agentDir := filepath.Join(root, "agent-1")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	store := newChannelCursorStore(root)
+	if err := store.Commit("agent-1", ledgerCommitInput{CursorUpdates: map[string]channelCursor{
+		"chan-1": {LastMessageID: "101"},
+	}}); err != nil {
+		t.Fatalf("commit cursor: %v", err)
+	}
+
+	dirInfo, err := os.Stat(agentDir)
+	if err != nil {
+		t.Fatalf("stat agent dir: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o777 {
+		t.Fatalf("agent dir mode=%o want 777", got)
+	}
+
+	cursorInfo, err := os.Stat(filepath.Join(agentDir, "cursor.json"))
+	if err != nil {
+		t.Fatalf("stat cursor file: %v", err)
+	}
+	if got := cursorInfo.Mode().Perm(); got != 0o666 {
+		t.Fatalf("cursor file mode=%o want 666", got)
+	}
+}
+
 func TestChannelCursorStoreMemoryFallback(t *testing.T) {
 	store := newChannelCursorStore("")
 	if err := store.Commit("agent-1", ledgerCommitInput{CursorUpdates: map[string]channelCursor{
