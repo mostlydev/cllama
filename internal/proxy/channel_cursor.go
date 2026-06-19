@@ -147,7 +147,10 @@ func (s *channelCursorStore) saveLocked(agentID string, ledger channelCursorLedg
 		return nil
 	}
 	agentDir := filepath.Join(s.dir, agentID)
-	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+	if err := os.MkdirAll(agentDir, 0o777); err != nil {
+		return err
+	}
+	if err := os.Chmod(agentDir, 0o777); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(ledger, "", "  ")
@@ -161,6 +164,11 @@ func (s *channelCursorStore) saveLocked(agentID string, ledger channelCursorLedg
 	}
 	tmpPath := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Chmod(0o666); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpPath)
 		return err

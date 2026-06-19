@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -48,6 +50,11 @@ type Handler struct {
 	managedDuplicatePolicy       string
 	managedDuplicateStreakCutoff int
 }
+
+const (
+	EnvDispatchCandidateTimeoutMS     = "CLLAMA_DISPATCH_CANDIDATE_TIMEOUT_MS"
+	defaultDispatchCandidateTimeoutMS = 60000
+)
 
 // HandlerOption configures optional Handler behaviour.
 type HandlerOption func(*Handler)
@@ -459,14 +466,16 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 
 func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit) {
 	sawCooldown := false
+	downstreamStream := payloadRequestsStream(payload)
 	for i, candidate := range candidates {
+		canFallback := i+1 < len(candidates)
 		payload["model"] = candidate.UpstreamModel
 		outBody, err := json.Marshal(payload)
 		if err != nil {
 			h.fail(w, http.StatusInternalServerError, "failed to encode upstream body", agentID, requestedModel, start, err)
 			return
 		}
-		tryNextCandidate, candidateCooldown := h.dispatchWithRetry(w, r, agentID, agentCtx, requestedModel, candidate, outBody, requestOriginal, start, requestInfo, pendingCursor)
+		tryNextCandidate, candidateCooldown := h.dispatchWithRetry(w, r, agentID, agentCtx, requestedModel, candidate, outBody, requestOriginal, start, requestInfo, pendingCursor, downstreamStream, canFallback)
 		if !tryNextCandidate {
 			return
 		}
@@ -483,11 +492,20 @@ func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, age
 	h.fail(w, http.StatusBadGateway, "no usable declared provider key after retries", agentID, requestedModel, start, fmt.Errorf("exhausted declared model candidates"))
 }
 
+func payloadRequestsStream(payload map[string]any) bool {
+	if payload == nil {
+		return false
+	}
+	stream, _ := payload["stream"].(bool)
+	return stream
+}
+
 // dispatchWithRetry selects a key, dispatches the request, and retries on key-level
 // failures (401/403/402/quota-429 → dead, rate-limit-429 → cooldown).
-// 5xx and transport errors do NOT cause key state changes.
+// 5xx and transport errors do NOT cause key state changes, but can advance to
+// the next declared model candidate before any downstream response is written.
 // It returns (advanceToNextCandidate, candidateSawCooldown).
-func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, candidate dispatchCandidate, outBody []byte, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit) (bool, bool) {
+func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, candidate dispatchCandidate, outBody []byte, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit, downstreamStream bool, canFallback bool) (bool, bool) {
 	const maxKeyAttempts = 5
 	sawCooldown := false
 
@@ -506,8 +524,10 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			return false, sawCooldown
 		}
 
-		outReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(outBody))
+		reqCtx, cancel := dispatchAttemptContext(r.Context(), downstreamStream)
+		outReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(outBody))
 		if err != nil {
+			cancel()
 			h.fail(w, http.StatusBadGateway, "failed to create upstream request", agentID, requestedModel, start, err)
 			return false, sawCooldown
 		}
@@ -524,6 +544,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		}
 
 		if err := applyProviderAuth(outReq, prov); err != nil {
+			cancel()
 			h.fail(w, http.StatusBadGateway, "provider auth not configured", agentID, requestedModel, start, err)
 			return false, sawCooldown
 		}
@@ -531,9 +552,13 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		h.logger.LogRequestWithInfo(agentID, requestedModel, requestInfo)
 		resp, err := h.client.Do(outReq)
 		if err != nil {
-			// Transport error — no key state change, return 502.
-			h.fail(w, http.StatusBadGateway, "upstream request failed", agentID, requestedModel, start, err)
-			return false, sawCooldown
+			cancel()
+			if !canFallback {
+				h.fail(w, http.StatusBadGateway, "upstream request failed", agentID, requestedModel, start, err)
+				return false, sawCooldown
+			}
+			h.logCandidateFallback(agentID, requestedModel, "transport_error")
+			return true, sawCooldown
 		}
 
 		classification := classifyResponse(resp)
@@ -542,6 +567,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		case classAuth:
 			// 401/403/402 or quota-429: key is permanently dead.
 			resp.Body.Close()
+			cancel()
 			reason := fmt.Sprintf("http_%d", resp.StatusCode)
 			_ = h.registry.MarkDead(lease.ProviderName, lease.KeyID, reason, resp.StatusCode)
 			h.logger.LogProviderPool(lease.ProviderName, lease.KeyID, "dead", reason, "")
@@ -554,6 +580,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		case classRateLimit:
 			// Rate-limit 429: cooldown.
 			resp.Body.Close()
+			cancel()
 			cooldownDur := parseCooldownDuration(resp)
 			until := time.Now().UTC().Add(cooldownDur)
 			_ = h.registry.MarkCooldown(lease.ProviderName, lease.KeyID, "rate_limit", until)
@@ -573,13 +600,48 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			continue // try next key
 
 		default:
-			// Success or 5xx: forward response back, no key state change.
+			if canFallback && isCandidateFallbackStatus(resp.StatusCode) {
+				reason := fmt.Sprintf("http_%d", resp.StatusCode)
+				resp.Body.Close()
+				cancel()
+				h.logCandidateFallback(agentID, requestedModel, reason)
+				return true, sawCooldown
+			}
+			// Success or non-retryable status: forward response back, no key state change.
+			defer cancel()
 			h.forwardResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start, pendingCursor)
 			return false, sawCooldown
 		}
 	}
 
 	return true, sawCooldown
+}
+
+func dispatchAttemptContext(parent context.Context, downstreamStream bool) (context.Context, context.CancelFunc) {
+	if downstreamStream {
+		return parent, func() {}
+	}
+	return context.WithTimeout(parent, dispatchCandidateTimeoutDuration())
+}
+
+func dispatchCandidateTimeoutDuration() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(EnvDispatchCandidateTimeoutMS))
+	if raw == "" {
+		return time.Duration(defaultDispatchCandidateTimeoutMS) * time.Millisecond
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return time.Duration(defaultDispatchCandidateTimeoutMS) * time.Millisecond
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func isCandidateFallbackStatus(status int) bool {
+	return status >= 500 && status <= 599
+}
+
+func (h *Handler) logCandidateFallback(agentID, requestedModel, reason string) {
+	h.logger.LogIntervention(agentID, requestedModel, "provider_candidate_fallback:"+reason)
 }
 
 type responseClass int
