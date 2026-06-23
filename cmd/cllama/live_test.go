@@ -143,7 +143,7 @@ func TestLiveDashboard(t *testing.T) {
 	acc := cost.NewAccumulator()
 	logger := logging.New(os.Stdout)
 
-	apiHandler := newAPIHandler(contextRoot, reg, logger, acc, pricing, "", nil, "", nil)
+	apiHandler := newAPIHandler(contextRoot, reg, logger, acc, pricing, "", nil, "", "", "", nil)
 	uiHandler := newUIHandler(reg, acc, contextRoot, "", nil)
 
 	// ── Listen on fixed ports ────────────────────────────────────────────

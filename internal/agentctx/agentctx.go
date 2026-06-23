@@ -20,6 +20,7 @@ type AgentContext struct {
 	Tools            *ToolManifest
 	Memory           *MemoryManifest
 	ModelPolicy      *ModelPolicy
+	Budget           *BudgetPolicy
 	ChannelAllowlist map[string]struct{}
 }
 
@@ -66,6 +67,13 @@ type ToolPolicy struct {
 	TotalTimeoutMS   int `json:"total_timeout_ms"`
 }
 
+type BudgetPolicy struct {
+	LimitUSD    *float64 `json:"limit_usd,omitempty"`
+	MaxRequests *int     `json:"max_requests,omitempty"`
+	Window      string   `json:"window"`
+	Behavior    string   `json:"behavior"`
+}
+
 type ChannelAllowlistManifest struct {
 	Version  int      `json:"version"`
 	Channels []string `json:"channels"`
@@ -110,7 +118,8 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 		return nil, fmt.Errorf("load agent context %q: parse metadata: %w", agentID, err)
 	}
 	var typed struct {
-		ModelPolicy *ModelPolicy `json:"model_policy"`
+		ModelPolicy *ModelPolicy  `json:"model_policy"`
+		Budget      *BudgetPolicy `json:"budget"`
 	}
 	if err := json.Unmarshal(metaRaw, &typed); err != nil {
 		return nil, fmt.Errorf("load agent context %q: parse typed metadata: %w", agentID, err)
@@ -142,6 +151,7 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 		Tools:            tools,
 		Memory:           memory,
 		ModelPolicy:      typed.ModelPolicy,
+		Budget:           typed.Budget,
 		ChannelAllowlist: channelAllowlist,
 	}, nil
 }

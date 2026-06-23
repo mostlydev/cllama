@@ -2958,9 +2958,9 @@ func (a managedUsageAggregate) sessionUsage() sessionhistory.Usage {
 		CompletionTokens: a.CompletionTokens,
 		TotalRounds:      a.TotalRounds,
 	}
-	if a.HasReportedCost {
-		reported := a.ReportedCostUSD
-		usage.ReportedCostUSD = &reported
+	if a.SawCostUsage && a.LoggedCostKnown {
+		costUSD := a.LoggedCostUSD
+		usage.ReportedCostUSD = &costUSD
 	}
 	return usage
 }

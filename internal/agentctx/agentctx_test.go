@@ -136,6 +136,49 @@ func TestLoadParsesModelPolicyAccessors(t *testing.T) {
 	}
 }
 
+func TestLoadParsesBudgetPolicy(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{
+		"token":"tiverton:secret",
+		"budget":{
+			"limit_usd":1.25,
+			"max_requests":12,
+			"window":"1h",
+			"behavior":"hard_stop"
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(meta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "tiverton")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if ctx.Budget == nil {
+		t.Fatal("expected budget policy")
+	}
+	if ctx.Budget.LimitUSD == nil || *ctx.Budget.LimitUSD != 1.25 {
+		t.Fatalf("unexpected budget limit: %+v", ctx.Budget)
+	}
+	if ctx.Budget.MaxRequests == nil || *ctx.Budget.MaxRequests != 12 {
+		t.Fatalf("unexpected request cap: %+v", ctx.Budget)
+	}
+	if ctx.Budget.Window != "1h" || ctx.Budget.Behavior != "hard_stop" {
+		t.Fatalf("unexpected budget metadata: %+v", ctx.Budget)
+	}
+}
+
 func TestLoadReadsServiceAuthEntries(t *testing.T) {
 	dir := t.TempDir()
 	agentDir := filepath.Join(dir, "tiverton")

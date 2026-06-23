@@ -44,6 +44,7 @@ type Handler struct {
 	managedTurns                 *managedOpenAIContinuityStore
 	managedAnthropicTurns        *managedAnthropicContinuityStore
 	sessionRecorder              *sessionhistory.Recorder
+	governanceDir                string
 	channelCursors               *channelCursorStore
 	adminToken                   string
 	snapshots                    *ContextSnapshotStore
@@ -116,6 +117,12 @@ func WithSessionHistory(dir string) HandlerOption {
 func WithSessionRecorder(r *sessionhistory.Recorder) HandlerOption {
 	return func(h *Handler) {
 		h.sessionRecorder = r
+	}
+}
+
+func WithGovernanceDir(dir string) HandlerOption {
+	return func(h *Handler) {
+		h.governanceDir = strings.TrimSpace(dir)
 	}
 }
 
@@ -346,6 +353,9 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	downstreamStream, downstreamIncludeUsage := requestedOpenAIStreamOptions(payload)
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
+	if h.enforceBudget(w, agentID, agentCtx, requestedModel, start) {
+		return
+	}
 	managedTool := hasManagedTools(agentCtx)
 	h.logToolManifestState(agentID, requestedModel, agentCtx)
 	if managedTool {
@@ -432,6 +442,9 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	downstreamStream := requestedStream(payload)
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
+	if h.enforceBudget(w, agentID, agentCtx, requestedModel, start) {
+		return
+	}
 	managedTool := hasManagedTools(agentCtx)
 	h.logToolManifestState(agentID, requestedModel, agentCtx)
 	if managedTool {
@@ -904,9 +917,17 @@ func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext
 		}
 	}
 
+	hasUsage := usage.PromptTokens > 0 || usage.CompletionTokens > 0 || usage.ReportedCostUSD != nil
+	var (
+		costUSD   float64
+		costKnown bool
+	)
+	if hasUsage && (h.accumulator != nil || h.sessionRecorder != nil) {
+		costUSD, costKnown = h.resolveCost(providerName, upstreamModel, usage)
+	}
+
 	var costInfo *logging.CostInfo
-	if h.accumulator != nil && (usage.PromptTokens > 0 || usage.CompletionTokens > 0 || usage.ReportedCostUSD != nil) {
-		costUSD, costKnown := h.resolveCost(providerName, upstreamModel, usage)
+	if h.accumulator != nil && hasUsage {
 		h.accumulator.RecordWithStatus(agentID, providerName, upstreamModel,
 			usage.PromptTokens, usage.CompletionTokens, costUSD, costKnown)
 		var loggedCostUSD *float64
@@ -945,7 +966,7 @@ func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext
 			Usage: sessionhistory.Usage{
 				PromptTokens:     usage.PromptTokens,
 				CompletionTokens: usage.CompletionTokens,
-				ReportedCostUSD:  usage.ReportedCostUSD,
+				ReportedCostUSD:  sessionHistoryCostUSD(usage, costUSD, costKnown),
 			},
 		}
 		if err := entry.EnsureID(); err != nil {
@@ -969,6 +990,14 @@ func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext
 	} else {
 		h.logger.LogResponse(agentID, requestedModel, statusCode, latency)
 	}
+}
+
+func sessionHistoryCostUSD(usage cost.Usage, costUSD float64, costKnown bool) *float64 {
+	if costKnown {
+		v := costUSD
+		return &v
+	}
+	return usage.ReportedCostUSD
 }
 
 func (h *Handler) fail(w http.ResponseWriter, status int, msg, clawID, model string, start time.Time, err error) {

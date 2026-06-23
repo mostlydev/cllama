@@ -76,6 +76,40 @@ func TestReadEntriesMissingFileReturnsEmpty(t *testing.T) {
 	}
 }
 
+func TestSummarizeWindowTotalsRequestsAndKnownCost(t *testing.T) {
+	dir := t.TempDir()
+	r := New(dir)
+
+	base := time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC)
+	costA := 0.25
+	costB := 0.75
+	entries := []Entry{
+		{Version: 1, TS: base.Add(-time.Hour).Format(time.RFC3339), ClawID: "agent-1"},
+		{Version: 1, TS: base.Add(time.Minute).Format(time.RFC3339), ClawID: "agent-1", Usage: Usage{ReportedCostUSD: &costA}},
+		{Version: 1, TS: base.Add(2 * time.Minute).Format(time.RFC3339), ClawID: "agent-1", Usage: Usage{ReportedCostUSD: &costB}},
+		{Version: 1, TS: base.Add(3 * time.Minute).Format(time.RFC3339), ClawID: "agent-1"},
+	}
+	for i, entry := range entries {
+		if err := r.Record("agent-1", entry); err != nil {
+			t.Fatalf("Record(%d): %v", i, err)
+		}
+	}
+
+	summary, err := SummarizeWindow(dir, "agent-1", base)
+	if err != nil {
+		t.Fatalf("SummarizeWindow: %v", err)
+	}
+	if summary.Requests != 3 {
+		t.Fatalf("expected 3 in-window requests, got %+v", summary)
+	}
+	if summary.ReportedCostUSD != 1.0 {
+		t.Fatalf("expected cost 1.0, got %+v", summary)
+	}
+	if summary.UnknownCost != 1 {
+		t.Fatalf("expected 1 unknown-cost request, got %+v", summary)
+	}
+}
+
 func TestReadEntriesHydratesLegacyIDsFromRawJSON(t *testing.T) {
 	dir := t.TempDir()
 	agentDir := filepath.Join(dir, "agent-legacy")
