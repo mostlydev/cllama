@@ -2571,6 +2571,230 @@ func TestDispatchCandidateTimeoutDurationFallsBackOnInvalidEnv(t *testing.T) {
 	}
 }
 
+func TestStreamTimeoutDurationsFromEnv(t *testing.T) {
+	t.Setenv(EnvStreamFirstByteTimeoutMS, "321")
+	t.Setenv(EnvStreamIdleTimeoutMS, "654")
+
+	if got := streamFirstByteTimeoutDuration(); got != 321*time.Millisecond {
+		t.Fatalf("streamFirstByteTimeoutDuration = %s; want 321ms", got)
+	}
+	if got := streamIdleTimeoutDuration(); got != 654*time.Millisecond {
+		t.Fatalf("streamIdleTimeoutDuration = %s; want 654ms", got)
+	}
+}
+
+func TestStreamTimeoutDurationsFallBackOnInvalidEnv(t *testing.T) {
+	t.Setenv(EnvStreamFirstByteTimeoutMS, "not-a-number")
+	t.Setenv(EnvStreamIdleTimeoutMS, "-10")
+
+	if got := streamFirstByteTimeoutDuration(); got != time.Duration(defaultStreamFirstByteTimeoutMS)*time.Millisecond {
+		t.Fatalf("streamFirstByteTimeoutDuration = %s; want default", got)
+	}
+	if got := streamIdleTimeoutDuration(); got != time.Duration(defaultStreamIdleTimeoutMS)*time.Millisecond {
+		t.Fatalf("streamIdleTimeoutDuration = %s; want default", got)
+	}
+}
+
+func TestHandlerFallsBackToDeclaredCandidateOnStreamFirstByteTimeout(t *testing.T) {
+	t.Setenv(EnvStreamFirstByteTimeoutMS, "50")
+	t.Setenv(EnvStreamIdleTimeoutMS, "200")
+
+	var logs bytes.Buffer
+	primaryBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+		case <-time.After(250 * time.Millisecond):
+		}
+	}))
+	defer primaryBackend.Close()
+
+	var fallbackCalls int
+	fallbackBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeOpenAITextSSEChunk(t, w, "fallback")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer fallbackBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: primaryBackend.URL + "/v1", APIKey: "sk-openai", Auth: "bearer",
+	})
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: fallbackBackend.URL + "/v1", APIKey: "sk-or", Auth: "bearer",
+	})
+
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "openai/gpt-4o"},
+			{Slot: "fallback", Ref: "openrouter/anthropic/claude-haiku-4-5"},
+		},
+	}
+	h := NewHandler(reg, stubContextLoaderWithPolicy("agent-1", "agent-1:dummy123", policy), logging.New(&logs))
+	body := `{"model":"openai/gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer agent-1:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected fallback 200 after stream first-byte timeout, got %d: %s", w.Code, w.Body.String())
+	}
+	if fallbackCalls != 1 {
+		t.Fatalf("expected one fallback call after stream first-byte timeout, got %d", fallbackCalls)
+	}
+	if !strings.Contains(w.Body.String(), "fallback") {
+		t.Fatalf("expected fallback stream body, got %s", w.Body.String())
+	}
+	assertInterventionLogged(t, logs.Bytes(), "provider_candidate_fallback:stream_first_byte_timeout")
+	assertInterventionLogged(t, logs.Bytes(), "provider_exhausted_failover")
+}
+
+func TestHandlerCutsStreamOnIdleTimeoutAfterDownstreamBytes(t *testing.T) {
+	t.Setenv(EnvStreamFirstByteTimeoutMS, "200")
+	t.Setenv(EnvStreamIdleTimeoutMS, "50")
+
+	var logs bytes.Buffer
+	primaryBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeOpenAITextSSEChunk(t, w, "partial")
+		select {
+		case <-r.Context().Done():
+		case <-time.After(250 * time.Millisecond):
+		}
+	}))
+	defer primaryBackend.Close()
+
+	var fallbackCalls int
+	fallbackBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeOpenAITextSSEChunk(t, w, "fallback")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer fallbackBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: primaryBackend.URL + "/v1", APIKey: "sk-openai", Auth: "bearer",
+	})
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: fallbackBackend.URL + "/v1", APIKey: "sk-or", Auth: "bearer",
+	})
+
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "openai/gpt-4o"},
+			{Slot: "fallback", Ref: "openrouter/anthropic/claude-haiku-4-5"},
+		},
+	}
+	h := NewHandler(reg, stubContextLoaderWithPolicy("agent-1", "agent-1:dummy123", policy), logging.New(&logs))
+	body := `{"model":"openai/gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer agent-1:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected partial stream 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if fallbackCalls != 0 {
+		t.Fatalf("expected no fallback after downstream bytes were written, got %d calls", fallbackCalls)
+	}
+	bodyText := w.Body.String()
+	if !strings.Contains(bodyText, "partial") || !strings.Contains(bodyText, "event: error") || !strings.Contains(bodyText, "upstream stream idle timeout") {
+		t.Fatalf("expected partial chunk plus SSE error event, got %s", bodyText)
+	}
+	if !hasLogEntry(t, logs.Bytes(), func(entry map[string]any) bool {
+		return entry["type"] == "error" && strings.Contains(fmt.Sprint(entry["error"]), "idle timeout")
+	}) {
+		t.Fatalf("expected idle timeout error log, got %s", string(logs.Bytes()))
+	}
+}
+
+func TestHandlerDoesNotTimeoutActiveLongStream(t *testing.T) {
+	t.Setenv(EnvStreamFirstByteTimeoutMS, "200")
+	t.Setenv(EnvStreamIdleTimeoutMS, "150")
+
+	primaryBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeOpenAITextSSEChunk(t, w, "first")
+		time.Sleep(25 * time.Millisecond)
+		writeOpenAITextSSEChunk(t, w, "second")
+		time.Sleep(25 * time.Millisecond)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	defer primaryBackend.Close()
+
+	var fallbackCalls int
+	fallbackBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeOpenAITextSSEChunk(t, w, "fallback")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer fallbackBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: primaryBackend.URL + "/v1", APIKey: "sk-openai", Auth: "bearer",
+	})
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: fallbackBackend.URL + "/v1", APIKey: "sk-or", Auth: "bearer",
+	})
+
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "openai/gpt-4o"},
+			{Slot: "fallback", Ref: "openrouter/anthropic/claude-haiku-4-5"},
+		},
+	}
+	var logs bytes.Buffer
+	h := NewHandler(reg, stubContextLoaderWithPolicy("agent-1", "agent-1:dummy123", policy), logging.New(&logs))
+	body := `{"model":"openai/gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer agent-1:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected active stream 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if fallbackCalls != 0 {
+		t.Fatalf("expected no fallback for active stream, got %d calls", fallbackCalls)
+	}
+	bodyText := w.Body.String()
+	if !strings.Contains(bodyText, "first") || !strings.Contains(bodyText, "second") || !strings.Contains(bodyText, "data: [DONE]") {
+		t.Fatalf("expected complete active stream, got %s", bodyText)
+	}
+	if strings.Contains(bodyText, "event: error") {
+		t.Fatalf("did not expect stream error event, got %s", bodyText)
+	}
+	if hasLogEntry(t, logs.Bytes(), func(entry map[string]any) bool {
+		return entry["type"] == "error"
+	}) {
+		t.Fatalf("did not expect error log for active stream, got %s", string(logs.Bytes()))
+	}
+}
+
 func TestHandlerRejectsWrongSecret(t *testing.T) {
 	reg := provider.NewRegistry("")
 	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: "https://api.openai.com/v1", APIKey: "sk-real", Auth: "bearer"})
@@ -5936,6 +6160,16 @@ func parseSSEEvents(t *testing.T, raw string) []map[string]any {
 		events = append(events, event)
 	}
 	return events
+}
+
+func writeOpenAITextSSEChunk(t *testing.T, w http.ResponseWriter, text string) {
+	t.Helper()
+	if _, err := fmt.Fprintf(w, "data: {\"id\":\"chatcmpl-stream\",\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", text); err != nil {
+		t.Fatalf("write SSE chunk: %v", err)
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func readManagedKeepaliveStream(t *testing.T, body io.Reader, commentPrefix string, release func()) (string, bool) {

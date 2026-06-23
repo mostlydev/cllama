@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -53,7 +54,17 @@ type Handler struct {
 
 const (
 	EnvDispatchCandidateTimeoutMS     = "CLLAMA_DISPATCH_CANDIDATE_TIMEOUT_MS"
+	EnvStreamFirstByteTimeoutMS       = "CLLAMA_STREAM_FIRST_BYTE_TIMEOUT_MS"
+	EnvStreamIdleTimeoutMS            = "CLLAMA_STREAM_IDLE_TIMEOUT_MS"
 	defaultDispatchCandidateTimeoutMS = 60000
+	defaultStreamFirstByteTimeoutMS   = 300000
+	defaultStreamIdleTimeoutMS        = 120000
+)
+
+var (
+	errStreamFirstByteTimeout = errors.New("upstream stream timed out before first byte")
+	errStreamIdleTimeout      = errors.New("upstream stream idle timeout")
+	errStreamReadTimeout      = errors.New("upstream stream read timeout")
 )
 
 // HandlerOption configures optional Handler behaviour.
@@ -550,14 +561,15 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		}
 
 		h.logger.LogRequestWithInfo(agentID, requestedModel, requestInfo)
-		resp, err := h.client.Do(outReq)
+		resp, err := h.doUpstreamRequest(outReq, cancel, downstreamStream)
 		if err != nil {
 			cancel()
 			if !canFallback {
-				h.fail(w, http.StatusBadGateway, "upstream request failed", agentID, requestedModel, start, err)
+				status, msg := upstreamDispatchFailure(err)
+				h.fail(w, status, msg, agentID, requestedModel, start, err)
 				return false, sawCooldown
 			}
-			h.logCandidateFallback(agentID, requestedModel, "transport_error")
+			h.logCandidateFallback(agentID, requestedModel, candidateFallbackReason(err))
 			return true, sawCooldown
 		}
 
@@ -608,8 +620,16 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 				return true, sawCooldown
 			}
 			// Success or non-retryable status: forward response back, no key state change.
-			defer cancel()
-			h.forwardResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start, pendingCursor)
+			fallbackReason := h.forwardResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start, pendingCursor)
+			cancel()
+			if fallbackReason != "" {
+				if canFallback {
+					h.logCandidateFallback(agentID, requestedModel, fallbackReason)
+					return true, sawCooldown
+				}
+				status, msg := streamFallbackFailure(fallbackReason)
+				h.fail(w, status, msg, agentID, requestedModel, start, fmt.Errorf("%s", fallbackReason))
+			}
 			return false, sawCooldown
 		}
 	}
@@ -619,21 +639,96 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 
 func dispatchAttemptContext(parent context.Context, downstreamStream bool) (context.Context, context.CancelFunc) {
 	if downstreamStream {
-		return parent, func() {}
+		return context.WithCancel(parent)
 	}
 	return context.WithTimeout(parent, dispatchCandidateTimeoutDuration())
 }
 
 func dispatchCandidateTimeoutDuration() time.Duration {
-	raw := strings.TrimSpace(os.Getenv(EnvDispatchCandidateTimeoutMS))
+	return envDurationMS(EnvDispatchCandidateTimeoutMS, defaultDispatchCandidateTimeoutMS)
+}
+
+func streamFirstByteTimeoutDuration() time.Duration {
+	return envDurationMS(EnvStreamFirstByteTimeoutMS, defaultStreamFirstByteTimeoutMS)
+}
+
+func streamIdleTimeoutDuration() time.Duration {
+	return envDurationMS(EnvStreamIdleTimeoutMS, defaultStreamIdleTimeoutMS)
+}
+
+func envDurationMS(name string, fallbackMS int) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
 	if raw == "" {
-		return time.Duration(defaultDispatchCandidateTimeoutMS) * time.Millisecond
+		return time.Duration(fallbackMS) * time.Millisecond
 	}
 	ms, err := strconv.Atoi(raw)
 	if err != nil || ms <= 0 {
-		return time.Duration(defaultDispatchCandidateTimeoutMS) * time.Millisecond
+		return time.Duration(fallbackMS) * time.Millisecond
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+func (h *Handler) doUpstreamRequest(req *http.Request, cancel context.CancelFunc, downstreamStream bool) (*http.Response, error) {
+	if !downstreamStream {
+		return h.client.Do(req)
+	}
+
+	// This timeout gates the header wait here and the first body read in
+	// streamBody, so a header-only stream can consume up to two intervals.
+	timeout := streamFirstByteTimeoutDuration()
+	if timeout <= 0 {
+		return h.client.Do(req)
+	}
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		resp, err := h.client.Do(req)
+		ch <- result{resp: resp, err: err}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case res := <-ch:
+		return res.resp, res.err
+	case <-timer.C:
+		cancel()
+		go func() {
+			res := <-ch
+			if res.resp != nil && res.resp.Body != nil {
+				_ = res.resp.Body.Close()
+			}
+		}()
+		return nil, errStreamFirstByteTimeout
+	}
+}
+
+func upstreamDispatchFailure(err error) (int, string) {
+	if errors.Is(err, errStreamFirstByteTimeout) {
+		return http.StatusGatewayTimeout, "upstream stream timed out before first byte"
+	}
+	return http.StatusBadGateway, "upstream request failed"
+}
+
+func candidateFallbackReason(err error) string {
+	if errors.Is(err, errStreamFirstByteTimeout) {
+		return "stream_first_byte_timeout"
+	}
+	return "transport_error"
+}
+
+func streamFallbackFailure(reason string) (int, string) {
+	switch reason {
+	case "stream_first_byte_timeout":
+		return http.StatusGatewayTimeout, "upstream stream timed out before first byte"
+	default:
+		return http.StatusBadGateway, "upstream stream failed before sending data"
+	}
 }
 
 func isCandidateFallbackStatus(status int) bool {
@@ -730,12 +825,12 @@ func applyProviderAuth(outReq *http.Request, prov *provider.Provider) error {
 }
 
 // streamResponse forwards the upstream response to the client and logs it.
-func (h *Handler) forwardResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) {
+func (h *Handler) forwardResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) string {
 	if hasManagedTools(agentCtx) && resp.StatusCode >= 200 && resp.StatusCode < 300 && !isSSE(resp.Header) {
 		h.forwardManagedToolAwareResponse(w, resp, agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, start, pendingCursor)
-		return
+		return ""
 	}
-	h.streamResponse(w, resp, agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, start, pendingCursor)
+	return h.streamResponse(w, resp, agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, start, pendingCursor)
 }
 
 func (h *Handler) forwardManagedToolAwareResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) {
@@ -764,21 +859,39 @@ func (h *Handler) forwardManagedToolAwareResponse(w http.ResponseWriter, resp *h
 }
 
 // streamResponse forwards the upstream response to the client and logs it.
-func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) {
+// It returns a non-empty fallback reason only when no downstream bytes were
+// committed, making it safe for the caller to retry the next model candidate.
+func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) string {
 	defer resp.Body.Close()
 
-	copyResponseHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-
 	var responseBuf bytes.Buffer
-	tee := io.TeeReader(resp.Body, &responseBuf)
-	if err := streamBody(w, tee); err != nil {
+	headersWritten := false
+	writeHeaders := func() {
+		if headersWritten {
+			return
+		}
+		copyResponseHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		headersWritten = true
+	}
+
+	if err := streamBody(w, resp.Body, &responseBuf, writeHeaders, streamFirstByteTimeoutDuration(), streamIdleTimeoutDuration()); err != nil {
+		if !headersWritten {
+			if errors.Is(err, errStreamFirstByteTimeout) {
+				return "stream_first_byte_timeout"
+			}
+			return "stream_read_error"
+		}
+		if errors.Is(err, errStreamIdleTimeout) {
+			writeSSEError(w, "upstream stream idle timeout")
+		}
 		h.logger.LogError(agentID, requestedModel, resp.StatusCode, time.Since(start).Milliseconds(), err)
-		return
+		return ""
 	}
 
 	captured := responseBuf.Bytes()
 	h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, captured, start, pendingCursor)
+	return ""
 }
 
 func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, responseHeader http.Header, captured []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) {
@@ -1000,28 +1113,81 @@ func isSSE(h http.Header) bool {
 	return strings.Contains(h.Get("Content-Type"), "text/event-stream")
 }
 
-func streamBody(w http.ResponseWriter, body io.Reader) error {
+func streamBody(w http.ResponseWriter, body io.ReadCloser, captured *bytes.Buffer, writeHeaders func(), firstByteTimeout, idleTimeout time.Duration) error {
 	flusher, _ := w.(http.Flusher)
-	if flusher == nil {
-		_, err := io.Copy(w, body)
-		return err
-	}
-
 	buf := make([]byte, 32*1024)
+	wrote := false
 	for {
-		n, err := body.Read(buf)
+		timeout := idleTimeout
+		if !wrote {
+			timeout = firstByteTimeout
+		}
+		n, err := readStreamChunk(body, buf, timeout)
 		if n > 0 {
+			writeHeaders()
+			if _, werr := captured.Write(buf[:n]); werr != nil {
+				return werr
+			}
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				return werr
 			}
-			flusher.Flush()
+			if flusher != nil {
+				flusher.Flush()
+			}
+			wrote = true
 		}
 		if err == io.EOF {
+			writeHeaders()
 			return nil
 		}
 		if err != nil {
+			if errors.Is(err, errStreamReadTimeout) {
+				if wrote {
+					return errStreamIdleTimeout
+				}
+				return errStreamFirstByteTimeout
+			}
 			return err
 		}
+	}
+}
+
+func readStreamChunk(body io.ReadCloser, buf []byte, timeout time.Duration) (int, error) {
+	if timeout <= 0 {
+		return body.Read(buf)
+	}
+
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := body.Read(buf)
+		ch <- result{n: n, err: err}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case res := <-ch:
+		return res.n, res.err
+	case <-timer.C:
+		_ = body.Close()
+		return 0, errStreamReadTimeout
+	}
+}
+
+func writeSSEError(w http.ResponseWriter, msg string) {
+	payload, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": msg,
+		},
+	})
+	_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", payload)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
 	}
 }
 
