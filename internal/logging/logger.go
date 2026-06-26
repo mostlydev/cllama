@@ -57,6 +57,12 @@ type entry struct {
 	MemoryBlocks  *int    `json:"memory_blocks,omitempty"`
 	MemoryBytes   *int    `json:"memory_bytes,omitempty"`
 	MemoryRemoved *int    `json:"memory_removed,omitempty"`
+	// runtime_reminder event fields
+	RuntimeReminderID        *string `json:"runtime_reminder_id,omitempty"`
+	RuntimeReminderStatus    *string `json:"runtime_reminder_status,omitempty"`
+	RuntimeReminderCadence   *string `json:"runtime_reminder_cadence,omitempty"`
+	RuntimeReminderPlacement *string `json:"runtime_reminder_placement,omitempty"`
+	RuntimeReminderReason    *string `json:"runtime_reminder_reason,omitempty"`
 	// channel_context_op event fields
 	ChannelKind       *string  `json:"kind,omitempty"`
 	Channels          []string `json:"channels,omitempty"`
@@ -126,6 +132,14 @@ type MemoryOpInfo struct {
 	InjectedBytes *int
 	PolicyRemoved *int
 	Error         error
+}
+
+type RuntimeReminderInfo struct {
+	ID        string
+	Status    string
+	Cadence   string
+	Placement string
+	Reason    string
 }
 
 // ChannelContextOpInfo holds structured telemetry for channel awareness,
@@ -328,6 +342,21 @@ func (l *Logger) LogMemoryOp(clawID, model string, info MemoryOpInfo) {
 		e.Error = info.Error.Error()
 	}
 	l.log(e)
+}
+
+func (l *Logger) LogRuntimeReminder(clawID, model string, info RuntimeReminderInfo) {
+	l.log(entry{
+		TS:                       time.Now().UTC().Format(time.RFC3339),
+		ClawID:                   clawID,
+		Type:                     "runtime_reminder",
+		Model:                    model,
+		Intervention:             nil,
+		RuntimeReminderID:        ptrString(info.ID),
+		RuntimeReminderStatus:    ptrString(info.Status),
+		RuntimeReminderCadence:   ptrString(info.Cadence),
+		RuntimeReminderPlacement: ptrString(info.Placement),
+		RuntimeReminderReason:    ptrString(info.Reason),
+	})
 }
 
 func (l *Logger) LogChannelContextOp(clawID, model string, info ChannelContextOpInfo) {

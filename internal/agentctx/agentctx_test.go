@@ -41,11 +41,44 @@ func TestLoadReadsAllFiles(t *testing.T) {
 	if ctx.Tools != nil {
 		t.Fatalf("expected no tools manifest, got %+v", ctx.Tools)
 	}
+	if ctx.RuntimeReminders != nil {
+		t.Fatalf("expected no runtime reminder manifest, got %+v", ctx.RuntimeReminders)
+	}
 	if ctx.HasPolicy() {
 		t.Fatal("expected no model policy")
 	}
 	if ctx.ChannelAllowed("chan-1") {
 		t.Fatal("expected missing channel allowlist to deny channel")
+	}
+}
+
+func TestLoadReadsRuntimeRemindersManifest(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "agent")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"AGENTS.md":              "# Contract",
+		"CLAWDAPUS.md":           "# Infra",
+		"metadata.json":          `{"token":"agent:secret"}`,
+		"runtime-reminders.json": `{"version":1,"reminders":[{"id":"focus","text":"Keep the operating contract visible.","cadence":"every_turn","placement":"before_feeds","max_chars":120}]}`,
+	} {
+		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, err := Load(dir, "agent")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ctx.RuntimeReminders == nil || len(ctx.RuntimeReminders.Reminders) != 1 {
+		t.Fatalf("expected one runtime reminder, got %+v", ctx.RuntimeReminders)
+	}
+	reminder := ctx.RuntimeReminders.Reminders[0]
+	if reminder.ID != "focus" || reminder.Text == "" || reminder.Cadence != "every_turn" || reminder.Placement != "before_feeds" || reminder.MaxChars != 120 {
+		t.Fatalf("unexpected reminder: %+v", reminder)
 	}
 }
 

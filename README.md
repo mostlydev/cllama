@@ -137,7 +137,8 @@ Each agent is a subdirectory under `CLAW_CONTEXT_ROOT`:
 ├── tiverton/
 │   ├── metadata.json     # bearer token, pod, service, type
 │   ├── AGENTS.md         # behavioral contract
-│   └── CLAWDAPUS.md      # infrastructure map
+│   ├── CLAWDAPUS.md      # infrastructure map
+│   └── runtime-reminders.json  # optional late runtime reminder manifest
 ├── westin/
 │   └── ...
 └── allen/
@@ -155,6 +156,10 @@ Each agent is a subdirectory under `CLAW_CONTEXT_ROOT`:
 ```
 
 When orchestrated by Clawdapus, `claw up` generates all of this — tokens via `crypto/rand`, context from the pod manifest, provider keys injected only into the proxy env.
+
+If `runtime-reminders.json` is present, cllama injects enabled `every_turn`
+reminders as a distinct late runtime-context segment before memory, feeds, and
+time context. The original system prompt remains unchanged.
 
 ### Provider registry
 

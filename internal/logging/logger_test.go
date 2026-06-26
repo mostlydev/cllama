@@ -49,6 +49,29 @@ func TestLogRequestIncludesPromptHashes(t *testing.T) {
 	}
 }
 
+func TestLogRuntimeReminderIncludesSkipFields(t *testing.T) {
+	var buf bytes.Buffer
+	l := New(&buf)
+	l.LogRuntimeReminder("agent", "openai/gpt-4o", RuntimeReminderInfo{
+		ID:        "focus",
+		Status:    "skipped",
+		Cadence:   "min_interval",
+		Placement: "before_feeds",
+		Reason:    "unsupported_cadence",
+	})
+
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if entry["type"] != "runtime_reminder" || entry["runtime_reminder_id"] != "focus" || entry["runtime_reminder_status"] != "skipped" {
+		t.Fatalf("unexpected runtime reminder entry: %+v", entry)
+	}
+	if entry["runtime_reminder_cadence"] != "min_interval" || entry["runtime_reminder_placement"] != "before_feeds" || entry["runtime_reminder_reason"] != "unsupported_cadence" {
+		t.Fatalf("missing runtime reminder skip fields: %+v", entry)
+	}
+}
+
 func TestLogResponseIncludesLatency(t *testing.T) {
 	var buf bytes.Buffer
 	l := New(&buf)

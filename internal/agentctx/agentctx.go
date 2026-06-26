@@ -19,6 +19,7 @@ type AgentContext struct {
 	ServiceAuth      []ServiceAuthEntry
 	Tools            *ToolManifest
 	Memory           *MemoryManifest
+	RuntimeReminders *RuntimeReminderManifest
 	ModelPolicy      *ModelPolicy
 	Budget           *BudgetPolicy
 	ChannelAllowlist map[string]struct{}
@@ -94,6 +95,20 @@ type MemoryOp struct {
 	TimeoutMS int    `json:"timeout_ms,omitempty"`
 }
 
+type RuntimeReminderManifest struct {
+	Version   int               `json:"version"`
+	Reminders []RuntimeReminder `json:"reminders"`
+}
+
+type RuntimeReminder struct {
+	ID        string `json:"id"`
+	Text      string `json:"text"`
+	Enabled   *bool  `json:"enabled,omitempty"`
+	Placement string `json:"placement,omitempty"`
+	MaxChars  int    `json:"max_chars,omitempty"`
+	Cadence   string `json:"cadence,omitempty"`
+}
+
 // Load reads an agent's context files from contextRoot/<agentID>/.
 func Load(contextRoot, agentID string) (*AgentContext, error) {
 	dir := filepath.Join(contextRoot, agentID)
@@ -136,6 +151,10 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load agent context %q: memory.json: %w", agentID, err)
 	}
+	runtimeReminders, err := loadRuntimeReminderManifest(dir)
+	if err != nil {
+		return nil, fmt.Errorf("load agent context %q: runtime-reminders.json: %w", agentID, err)
+	}
 	channelAllowlist, err := loadChannelAllowlist(dir)
 	if err != nil {
 		return nil, fmt.Errorf("load agent context %q: channels-allowlist.json: %w", agentID, err)
@@ -150,6 +169,7 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 		ServiceAuth:      serviceAuth,
 		Tools:            tools,
 		Memory:           memory,
+		RuntimeReminders: runtimeReminders,
 		ModelPolicy:      typed.ModelPolicy,
 		Budget:           typed.Budget,
 		ChannelAllowlist: channelAllowlist,
@@ -275,6 +295,21 @@ func loadToolsManifest(dir string) (*ToolManifest, error) {
 		return nil, err
 	}
 	var manifest ToolManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return nil, err
+	}
+	return &manifest, nil
+}
+
+func loadRuntimeReminderManifest(dir string) (*RuntimeReminderManifest, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, "runtime-reminders.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var manifest RuntimeReminderManifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return nil, err
 	}
