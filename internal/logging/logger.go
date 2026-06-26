@@ -57,12 +57,13 @@ type entry struct {
 	MemoryBlocks  *int    `json:"memory_blocks,omitempty"`
 	MemoryBytes   *int    `json:"memory_bytes,omitempty"`
 	MemoryRemoved *int    `json:"memory_removed,omitempty"`
-	// runtime_reminder event fields
-	RuntimeReminderID        *string `json:"runtime_reminder_id,omitempty"`
-	RuntimeReminderStatus    *string `json:"runtime_reminder_status,omitempty"`
-	RuntimeReminderCadence   *string `json:"runtime_reminder_cadence,omitempty"`
-	RuntimeReminderPlacement *string `json:"runtime_reminder_placement,omitempty"`
-	RuntimeReminderReason    *string `json:"runtime_reminder_reason,omitempty"`
+	// context_block event fields
+	ContextBlockID        *string `json:"context_block_id,omitempty"`
+	ContextBlockKind      *string `json:"context_block_kind,omitempty"`
+	ContextBlockStatus    *string `json:"context_block_status,omitempty"`
+	ContextBlockCadence   *string `json:"context_block_cadence,omitempty"`
+	ContextBlockPlacement *string `json:"context_block_placement,omitempty"`
+	ContextBlockReason    *string `json:"context_block_reason,omitempty"`
 	// channel_context_op event fields
 	ChannelKind       *string  `json:"kind,omitempty"`
 	Channels          []string `json:"channels,omitempty"`
@@ -134,8 +135,9 @@ type MemoryOpInfo struct {
 	Error         error
 }
 
-type RuntimeReminderInfo struct {
+type ContextBlockInfo struct {
 	ID        string
+	Kind      string
 	Status    string
 	Cadence   string
 	Placement string
@@ -344,18 +346,19 @@ func (l *Logger) LogMemoryOp(clawID, model string, info MemoryOpInfo) {
 	l.log(e)
 }
 
-func (l *Logger) LogRuntimeReminder(clawID, model string, info RuntimeReminderInfo) {
+func (l *Logger) LogContextBlock(clawID, model string, info ContextBlockInfo) {
 	l.log(entry{
-		TS:                       time.Now().UTC().Format(time.RFC3339),
-		ClawID:                   clawID,
-		Type:                     "runtime_reminder",
-		Model:                    model,
-		Intervention:             nil,
-		RuntimeReminderID:        ptrString(info.ID),
-		RuntimeReminderStatus:    ptrString(info.Status),
-		RuntimeReminderCadence:   ptrString(info.Cadence),
-		RuntimeReminderPlacement: ptrString(info.Placement),
-		RuntimeReminderReason:    ptrString(info.Reason),
+		TS:                    time.Now().UTC().Format(time.RFC3339),
+		ClawID:                clawID,
+		Type:                  "context_block",
+		Model:                 model,
+		Intervention:          nil,
+		ContextBlockID:        ptrString(info.ID),
+		ContextBlockKind:      ptrString(info.Kind),
+		ContextBlockStatus:    ptrString(info.Status),
+		ContextBlockCadence:   ptrString(info.Cadence),
+		ContextBlockPlacement: ptrString(info.Placement),
+		ContextBlockReason:    ptrString(info.Reason),
 	})
 }
 

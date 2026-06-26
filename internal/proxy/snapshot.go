@@ -34,39 +34,39 @@ type ContextPlacement struct {
 }
 
 type ContextCaptureSummary struct {
-	Sequence         int64     `json:"sequence"`
-	CapturedAt       time.Time `json:"captured_at"`
-	Format           string    `json:"format"`
-	RequestedModel   string    `json:"requested_model,omitempty"`
-	ChosenRef        string    `json:"chosen_ref,omitempty"`
-	DynamicInputs    int       `json:"dynamic_inputs"`
-	RuntimeReminders int       `json:"runtime_reminders"`
-	FeedBlocks       int       `json:"feed_blocks"`
-	MemoryRecall     bool      `json:"memory_recall"`
-	TimeContext      bool      `json:"time_context"`
-	PlacementCount   int       `json:"placement_count"`
-	ManagedTool      bool      `json:"managed_tool"`
-	TurnCount        int       `json:"turn_count"`
+	Sequence       int64     `json:"sequence"`
+	CapturedAt     time.Time `json:"captured_at"`
+	Format         string    `json:"format"`
+	RequestedModel string    `json:"requested_model,omitempty"`
+	ChosenRef      string    `json:"chosen_ref,omitempty"`
+	DynamicInputs  int       `json:"dynamic_inputs"`
+	ContextBlocks  int       `json:"context_blocks"`
+	FeedBlocks     int       `json:"feed_blocks"`
+	MemoryRecall   bool      `json:"memory_recall"`
+	TimeContext    bool      `json:"time_context"`
+	PlacementCount int       `json:"placement_count"`
+	ManagedTool    bool      `json:"managed_tool"`
+	TurnCount      int       `json:"turn_count"`
 }
 
 type ContextSnapshot struct {
-	AgentID          string                    `json:"agent_id"`
-	CapturedAt       time.Time                 `json:"captured_at"`
-	Format           string                    `json:"format"`
-	System           any                       `json:"system"`
-	Tools            []any                     `json:"tools"`
-	RequestedModel   string                    `json:"requested_model"`
-	ChosenRef        string                    `json:"chosen_ref"`
-	Candidates       []CandidateSnapshot       `json:"candidates"`
-	RuntimeReminders []RuntimeReminderSnapshot `json:"runtime_reminders,omitempty"`
-	FeedBlocks       []string                  `json:"feed_blocks"`
-	MemoryRecall     string                    `json:"memory_recall"`
-	TimeContext      string                    `json:"time_context"`
-	Placements       []ContextPlacement        `json:"placements"`
-	RecentCaptures   []ContextCaptureSummary   `json:"recent_captures,omitempty"`
-	Intervention     string                    `json:"intervention"`
-	ManagedTool      bool                      `json:"managed_tool"`
-	TurnCount        int                       `json:"turn_count"`
+	AgentID        string                  `json:"agent_id"`
+	CapturedAt     time.Time               `json:"captured_at"`
+	Format         string                  `json:"format"`
+	System         any                     `json:"system"`
+	Tools          []any                   `json:"tools"`
+	RequestedModel string                  `json:"requested_model"`
+	ChosenRef      string                  `json:"chosen_ref"`
+	Candidates     []CandidateSnapshot     `json:"candidates"`
+	ContextBlocks  []ContextBlockSnapshot  `json:"context_blocks,omitempty"`
+	FeedBlocks     []string                `json:"feed_blocks"`
+	MemoryRecall   string                  `json:"memory_recall"`
+	TimeContext    string                  `json:"time_context"`
+	Placements     []ContextPlacement      `json:"placements"`
+	RecentCaptures []ContextCaptureSummary `json:"recent_captures,omitempty"`
+	Intervention   string                  `json:"intervention"`
+	ManagedTool    bool                    `json:"managed_tool"`
+	TurnCount      int                     `json:"turn_count"`
 }
 
 type ContextSnapshotStore struct {
@@ -155,28 +155,28 @@ func (s *ContextSnapshotStore) UpdateTurnCount(agentID string, turnCount int) {
 	s.historyMu.Unlock()
 }
 
-func (h *Handler) captureContextSnapshot(agentID, format, requestedModel string, payload map[string]any, resolution modelResolution, feedBlocks []string, runtimeReminders []RuntimeReminderSnapshot, memoryRecall, timeContext string, managedTool bool, turnCount int) {
+func (h *Handler) captureContextSnapshot(agentID, format, requestedModel string, payload map[string]any, resolution modelResolution, feedBlocks []string, contextBlocks []ContextBlockSnapshot, memoryRecall, timeContext string, managedTool bool, turnCount int) {
 	if h == nil || h.snapshots == nil {
 		return
 	}
 	system := snapshotSystemForFormat(format, payload)
 	h.snapshots.Put(ContextSnapshot{
-		AgentID:          agentID,
-		CapturedAt:       time.Now().UTC(),
-		Format:           format,
-		System:           system,
-		Tools:            snapshotTools(payload),
-		RequestedModel:   requestedModel,
-		ChosenRef:        resolution.ChosenRef,
-		Candidates:       candidateSnapshots(resolution.Candidates),
-		RuntimeReminders: append([]RuntimeReminderSnapshot(nil), runtimeReminders...),
-		FeedBlocks:       append([]string(nil), feedBlocks...),
-		MemoryRecall:     memoryRecall,
-		TimeContext:      timeContext,
-		Placements:       contextPlacements(format, payload, system, feedBlocks, runtimeReminders, memoryRecall, timeContext),
-		Intervention:     resolution.Intervention,
-		ManagedTool:      managedTool,
-		TurnCount:        turnCount,
+		AgentID:        agentID,
+		CapturedAt:     time.Now().UTC(),
+		Format:         format,
+		System:         system,
+		Tools:          snapshotTools(payload),
+		RequestedModel: requestedModel,
+		ChosenRef:      resolution.ChosenRef,
+		Candidates:     candidateSnapshots(resolution.Candidates),
+		ContextBlocks:  append([]ContextBlockSnapshot(nil), contextBlocks...),
+		FeedBlocks:     append([]string(nil), feedBlocks...),
+		MemoryRecall:   memoryRecall,
+		TimeContext:    timeContext,
+		Placements:     contextPlacements(format, payload, system, feedBlocks, contextBlocks, memoryRecall, timeContext),
+		Intervention:   resolution.Intervention,
+		ManagedTool:    managedTool,
+		TurnCount:      turnCount,
 	})
 }
 
@@ -218,7 +218,7 @@ func (s *ContextSnapshotStore) appendHistory(snapshot ContextSnapshot) {
 }
 
 func summarizeContextSnapshot(snapshot ContextSnapshot) ContextCaptureSummary {
-	dynamicInputs := len(snapshot.RuntimeReminders) + len(snapshot.FeedBlocks)
+	dynamicInputs := len(snapshot.ContextBlocks) + len(snapshot.FeedBlocks)
 	if strings.TrimSpace(snapshot.MemoryRecall) != "" {
 		dynamicInputs++
 	}
@@ -226,23 +226,23 @@ func summarizeContextSnapshot(snapshot ContextSnapshot) ContextCaptureSummary {
 		dynamicInputs++
 	}
 	return ContextCaptureSummary{
-		CapturedAt:       snapshot.CapturedAt,
-		Format:           snapshot.Format,
-		RequestedModel:   snapshot.RequestedModel,
-		ChosenRef:        snapshot.ChosenRef,
-		DynamicInputs:    dynamicInputs,
-		RuntimeReminders: len(snapshot.RuntimeReminders),
-		FeedBlocks:       len(snapshot.FeedBlocks),
-		MemoryRecall:     strings.TrimSpace(snapshot.MemoryRecall) != "",
-		TimeContext:      strings.TrimSpace(snapshot.TimeContext) != "",
-		PlacementCount:   len(snapshot.Placements),
-		ManagedTool:      snapshot.ManagedTool,
-		TurnCount:        snapshot.TurnCount,
+		CapturedAt:     snapshot.CapturedAt,
+		Format:         snapshot.Format,
+		RequestedModel: snapshot.RequestedModel,
+		ChosenRef:      snapshot.ChosenRef,
+		DynamicInputs:  dynamicInputs,
+		ContextBlocks:  len(snapshot.ContextBlocks),
+		FeedBlocks:     len(snapshot.FeedBlocks),
+		MemoryRecall:   strings.TrimSpace(snapshot.MemoryRecall) != "",
+		TimeContext:    strings.TrimSpace(snapshot.TimeContext) != "",
+		PlacementCount: len(snapshot.Placements),
+		ManagedTool:    snapshot.ManagedTool,
+		TurnCount:      snapshot.TurnCount,
 	}
 }
 
-func contextPlacements(format string, payload map[string]any, system any, feedBlocks []string, runtimeReminders []RuntimeReminderSnapshot, memoryRecall, timeContext string) []ContextPlacement {
-	segments := contextPlacementSegments(feedBlocks, runtimeReminders, memoryRecall, timeContext)
+func contextPlacements(format string, payload map[string]any, system any, feedBlocks []string, contextBlocks []ContextBlockSnapshot, memoryRecall, timeContext string) []ContextPlacement {
+	segments := contextPlacementSegments(feedBlocks, contextBlocks, memoryRecall, timeContext)
 	if len(segments) == 0 {
 		return nil
 	}
@@ -262,22 +262,16 @@ type contextPlacementSegment struct {
 	Text  string
 }
 
-func contextPlacementSegments(feedBlocks []string, runtimeReminders []RuntimeReminderSnapshot, memoryRecall, timeContext string) []contextPlacementSegment {
+func contextPlacementSegments(feedBlocks []string, contextBlocks []ContextBlockSnapshot, memoryRecall, timeContext string) []contextPlacementSegment {
 	var segments []contextPlacementSegment
-	for _, reminder := range runtimeReminders {
-		if strings.TrimSpace(reminder.Text) == "" {
-			continue
-		}
-		label := strings.TrimSpace(reminder.ID)
-		if label == "" {
-			label = "Runtime reminder"
-		} else {
-			label = "Runtime reminder: " + label
-		}
-		segments = append(segments, contextPlacementSegment{Kind: "runtime_reminder", Label: label, Text: reminder.Text})
-	}
 	if strings.TrimSpace(memoryRecall) != "" {
 		segments = append(segments, contextPlacementSegment{Kind: "memory", Label: "Memory recall", Text: memoryRecall})
+	}
+	for _, block := range contextBlocks {
+		if block.Placement != contextBlockPlacementBefore || strings.TrimSpace(block.Text) == "" {
+			continue
+		}
+		segments = append(segments, contextPlacementSegment{Kind: contextBlockSnapshotKind(block), Label: contextBlockSnapshotLabel(block), Text: block.Text})
 	}
 	for _, block := range feedBlocks {
 		if strings.TrimSpace(block) == "" {
@@ -285,10 +279,33 @@ func contextPlacementSegments(feedBlocks []string, runtimeReminders []RuntimeRem
 		}
 		segments = append(segments, contextPlacementSegment{Kind: "feed", Label: feedBlockLabel(block), Text: block})
 	}
+	for _, block := range contextBlocks {
+		if block.Placement != contextBlockPlacementAfter || strings.TrimSpace(block.Text) == "" {
+			continue
+		}
+		segments = append(segments, contextPlacementSegment{Kind: contextBlockSnapshotKind(block), Label: contextBlockSnapshotLabel(block), Text: block.Text})
+	}
 	if strings.TrimSpace(timeContext) != "" {
 		segments = append(segments, contextPlacementSegment{Kind: "time", Label: "Current time", Text: timeContext})
 	}
 	return segments
+}
+
+func contextBlockSnapshotKind(block ContextBlockSnapshot) string {
+	kind := strings.TrimSpace(block.Kind)
+	if kind == "" {
+		return defaultContextBlockKind
+	}
+	return kind
+}
+
+func contextBlockSnapshotLabel(block ContextBlockSnapshot) string {
+	kind := contextBlockSnapshotKind(block)
+	id := strings.TrimSpace(block.ID)
+	if id == "" {
+		return "Context block: " + kind
+	}
+	return "Context block: " + kind + "/" + id
 }
 
 func textContextPlacements(segments []contextPlacementSegment, text, carrier, role string, messageIndex, blockIndex int) []ContextPlacement {
@@ -574,7 +591,7 @@ func cloneContextSnapshot(snapshot ContextSnapshot) ContextSnapshot {
 	cloned.System = cloneJSONValue(snapshot.System)
 	cloned.Tools = snapshotTools(map[string]any{"tools": snapshot.Tools})
 	cloned.Candidates = append([]CandidateSnapshot(nil), snapshot.Candidates...)
-	cloned.RuntimeReminders = append([]RuntimeReminderSnapshot(nil), snapshot.RuntimeReminders...)
+	cloned.ContextBlocks = append([]ContextBlockSnapshot(nil), snapshot.ContextBlocks...)
 	cloned.FeedBlocks = append([]string(nil), snapshot.FeedBlocks...)
 	cloned.Placements = append([]ContextPlacement(nil), snapshot.Placements...)
 	cloned.RecentCaptures = append([]ContextCaptureSummary(nil), snapshot.RecentCaptures...)

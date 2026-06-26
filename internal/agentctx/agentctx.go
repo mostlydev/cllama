@@ -19,7 +19,7 @@ type AgentContext struct {
 	ServiceAuth      []ServiceAuthEntry
 	Tools            *ToolManifest
 	Memory           *MemoryManifest
-	RuntimeReminders *RuntimeReminderManifest
+	ContextBlocks    *ContextBlockManifest
 	ModelPolicy      *ModelPolicy
 	Budget           *BudgetPolicy
 	ChannelAllowlist map[string]struct{}
@@ -95,13 +95,14 @@ type MemoryOp struct {
 	TimeoutMS int    `json:"timeout_ms,omitempty"`
 }
 
-type RuntimeReminderManifest struct {
-	Version   int               `json:"version"`
-	Reminders []RuntimeReminder `json:"reminders"`
+type ContextBlockManifest struct {
+	Version int            `json:"version"`
+	Blocks  []ContextBlock `json:"blocks"`
 }
 
-type RuntimeReminder struct {
+type ContextBlock struct {
 	ID        string `json:"id"`
+	Kind      string `json:"kind,omitempty"`
 	Text      string `json:"text"`
 	Enabled   *bool  `json:"enabled,omitempty"`
 	Placement string `json:"placement,omitempty"`
@@ -151,9 +152,9 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load agent context %q: memory.json: %w", agentID, err)
 	}
-	runtimeReminders, err := loadRuntimeReminderManifest(dir)
+	contextBlocks, err := loadContextBlockManifest(dir)
 	if err != nil {
-		return nil, fmt.Errorf("load agent context %q: runtime-reminders.json: %w", agentID, err)
+		return nil, fmt.Errorf("load agent context %q: context-blocks.json: %w", agentID, err)
 	}
 	channelAllowlist, err := loadChannelAllowlist(dir)
 	if err != nil {
@@ -169,7 +170,7 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 		ServiceAuth:      serviceAuth,
 		Tools:            tools,
 		Memory:           memory,
-		RuntimeReminders: runtimeReminders,
+		ContextBlocks:    contextBlocks,
 		ModelPolicy:      typed.ModelPolicy,
 		Budget:           typed.Budget,
 		ChannelAllowlist: channelAllowlist,
@@ -301,15 +302,15 @@ func loadToolsManifest(dir string) (*ToolManifest, error) {
 	return &manifest, nil
 }
 
-func loadRuntimeReminderManifest(dir string) (*RuntimeReminderManifest, error) {
-	raw, err := os.ReadFile(filepath.Join(dir, "runtime-reminders.json"))
+func loadContextBlockManifest(dir string) (*ContextBlockManifest, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, "context-blocks.json"))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	var manifest RuntimeReminderManifest
+	var manifest ContextBlockManifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return nil, err
 	}

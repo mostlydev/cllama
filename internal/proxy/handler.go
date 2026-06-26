@@ -364,13 +364,13 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		// effective transcript that produced the runner-visible assistant reply.
 		h.managedTurns.Inject(agentID, payload)
 	}
-	runtimeReminders, runtimeReminderSnapshots, runtimeReminderSkips := renderRuntimeReminders(agentCtx)
-	h.logRuntimeReminderSkips(agentID, requestedModel, runtimeReminderSkips)
+	contextBlocks := renderContextBlocks(agentCtx)
+	h.logContextBlockSkips(agentID, requestedModel, contextBlocks.Skips)
 	memoryRecall := h.recallOpenAIMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
 	incomingEpoch := strings.TrimSpace(r.Header.Get("X-Claw-Consumer-Session-Epoch"))
 	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx, incomingEpoch, requestedModel)
 	timeContext := currentTimeLine(agentCtx, time.Now())
-	dynamicContext := joinRuntimeContext(runtimeReminders, memoryRecall, feedCtx.Combined, timeContext)
+	dynamicContext := joinRuntimeContext(memoryRecall, contextBlocks.BeforeFeeds, feedCtx.Combined, contextBlocks.AfterFeeds, timeContext)
 	feeds.AppendLateContext(payload, dynamicContext)
 	if err := injectManagedOpenAITools(payload, agentCtx); err != nil {
 		h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
@@ -386,7 +386,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		h.fail(w, status, err.Error(), agentID, requestedModel, start, err)
 		return
 	}
-	h.captureContextSnapshot(agentID, "openai", requestedModel, payload, resolution, feedCtx.Blocks, runtimeReminderSnapshots, memoryRecall, timeContext, managedTool, 1)
+	h.captureContextSnapshot(agentID, "openai", requestedModel, payload, resolution, feedCtx.Blocks, contextBlocks.Snapshots, memoryRecall, timeContext, managedTool, 1)
 
 	if h.accumulator != nil && h.pricing != nil && isStreamingChatCompletions(r.URL.Path, payload) {
 		ensureStreamUsage(payload)
@@ -456,13 +456,13 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		// one that produced the runner-visible assistant reply.
 		h.managedAnthropicTurns.Inject(agentID, payload)
 	}
-	runtimeReminders, runtimeReminderSnapshots, runtimeReminderSkips := renderRuntimeReminders(agentCtx)
-	h.logRuntimeReminderSkips(agentID, requestedModel, runtimeReminderSkips)
+	contextBlocks := renderContextBlocks(agentCtx)
+	h.logContextBlockSkips(agentID, requestedModel, contextBlocks.Skips)
 	memoryRecall := h.recallAnthropicMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
 	incomingEpoch := strings.TrimSpace(r.Header.Get("X-Claw-Consumer-Session-Epoch"))
 	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx, incomingEpoch, requestedModel)
 	timeContext := currentTimeLine(agentCtx, time.Now())
-	dynamicContext := joinRuntimeContext(runtimeReminders, memoryRecall, feedCtx.Combined, timeContext)
+	dynamicContext := joinRuntimeContext(memoryRecall, contextBlocks.BeforeFeeds, feedCtx.Combined, contextBlocks.AfterFeeds, timeContext)
 	feeds.AppendAnthropicLateContext(payload, dynamicContext)
 	if managedTool {
 		if err := injectManagedAnthropicTools(payload, agentCtx); err != nil {
@@ -480,7 +480,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		h.fail(w, status, err.Error(), agentID, requestedModel, start, err)
 		return
 	}
-	h.captureContextSnapshot(agentID, "anthropic", requestedModel, payload, resolution, feedCtx.Blocks, runtimeReminderSnapshots, memoryRecall, timeContext, managedTool, 1)
+	h.captureContextSnapshot(agentID, "anthropic", requestedModel, payload, resolution, feedCtx.Blocks, contextBlocks.Snapshots, memoryRecall, timeContext, managedTool, 1)
 	if resolution.Intervention != "" {
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}

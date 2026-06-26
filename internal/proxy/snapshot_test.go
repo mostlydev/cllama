@@ -35,12 +35,12 @@ func TestHandlerCapturesOpenAIContextSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, content := range map[string]string{
-		"AGENTS.md":              "# Contract",
-		"CLAWDAPUS.md":           "# Infra",
-		"metadata.json":          `{"token":"weston:secret","pod":"test-pod","timezone":"America/New_York"}`,
-		"feeds.json":             `[{"name":"market-context","source":"trading-api","path":"/api/v1/market_context/weston","ttl":300,"url":"` + feedSrv.URL + `"}]`,
-		"memory.json":            `{"version":1,"service":"team-memory","base_url":"` + memorySrv.URL + `","recall":{"path":"/recall","timeout_ms":1000}}`,
-		"runtime-reminders.json": `{"version":1,"reminders":[{"id":"focus","text":"Keep the operating contract visible.","cadence":"every_turn","placement":"before_feeds","max_chars":200}]}`,
+		"AGENTS.md":           "# Contract",
+		"CLAWDAPUS.md":        "# Infra",
+		"metadata.json":       `{"token":"weston:secret","pod":"test-pod","timezone":"America/New_York"}`,
+		"feeds.json":          `[{"name":"market-context","source":"trading-api","path":"/api/v1/market_context/weston","ttl":300,"url":"` + feedSrv.URL + `"}]`,
+		"memory.json":         `{"version":1,"service":"team-memory","base_url":"` + memorySrv.URL + `","recall":{"path":"/recall","timeout_ms":1000}}`,
+		"context-blocks.json": `{"version":1,"blocks":[{"id":"pre","kind":"feed_frame","text":"Treat catalysts as sizing inputs.","cadence":"every_turn","placement":"before_feeds","max_chars":200},{"id":"focus","kind":"runtime_motivation","text":"Keep the operating contract visible.","cadence":"every_turn","placement":"after_feeds","max_chars":200}]}`,
 	} {
 		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
@@ -109,30 +109,32 @@ func TestHandlerCapturesOpenAIContextSnapshot(t *testing.T) {
 	if !strings.Contains(snapshot.TimeContext, "Current time:") {
 		t.Fatalf("unexpected TimeContext: %q", snapshot.TimeContext)
 	}
-	if len(snapshot.RuntimeReminders) != 1 || snapshot.RuntimeReminders[0].ID != "focus" || !strings.Contains(snapshot.RuntimeReminders[0].Text, "Keep the operating contract visible.") {
-		t.Fatalf("unexpected RuntimeReminders: %+v", snapshot.RuntimeReminders)
+	if len(snapshot.ContextBlocks) != 2 || snapshot.ContextBlocks[0].ID != "pre" || snapshot.ContextBlocks[0].Kind != "feed_frame" || snapshot.ContextBlocks[1].ID != "focus" || !strings.Contains(snapshot.ContextBlocks[1].Text, "Keep the operating contract visible.") {
+		t.Fatalf("unexpected ContextBlocks: %+v", snapshot.ContextBlocks)
 	}
 
 	system, ok := snapshot.System.(string)
 	if !ok {
 		t.Fatalf("expected string system content, got %T", snapshot.System)
 	}
-	if !strings.Contains(system, "RUNTIME REMINDER: focus") || !strings.Contains(system, "BEGIN MEMORY") || !strings.Contains(system, "BEGIN FEED: market-context") || !strings.Contains(system, "Current time:") {
+	if !strings.Contains(system, "CONTEXT BLOCK: feed_frame/pre") || !strings.Contains(system, "CONTEXT BLOCK: runtime_motivation/focus") || !strings.Contains(system, "BEGIN MEMORY") || !strings.Contains(system, "BEGIN FEED: market-context") || !strings.Contains(system, "Current time:") {
 		t.Fatalf("unexpected system content: %q", system)
 	}
-	if reminderIdx := strings.Index(system, "RUNTIME REMINDER: focus"); reminderIdx == -1 {
-		t.Fatalf("runtime reminder missing from system: %q", system)
-	} else if memoryIdx := strings.Index(system, "BEGIN MEMORY"); memoryIdx < reminderIdx {
-		t.Fatalf("expected reminder before memory, got system=%q", system)
-	} else if feedIdx := strings.Index(system, "BEGIN FEED:"); feedIdx < memoryIdx {
-		t.Fatalf("expected memory before feeds, got system=%q", system)
-	} else if timeIdx := strings.Index(system, "Current time:"); timeIdx < feedIdx {
-		t.Fatalf("expected time after feeds, got system=%q", system)
+	if memoryIdx := strings.Index(system, "BEGIN MEMORY"); memoryIdx == -1 {
+		t.Fatalf("memory missing from system: %q", system)
+	} else if preIdx := strings.Index(system, "CONTEXT BLOCK: feed_frame/pre"); preIdx < memoryIdx {
+		t.Fatalf("expected before-feed context block after memory, got system=%q", system)
+	} else if feedIdx := strings.Index(system, "BEGIN FEED:"); feedIdx < preIdx {
+		t.Fatalf("expected feeds after before-feed context block, got system=%q", system)
+	} else if focusIdx := strings.Index(system, "CONTEXT BLOCK: runtime_motivation/focus"); focusIdx < feedIdx {
+		t.Fatalf("expected after-feed context block after feeds, got system=%q", system)
+	} else if timeIdx := strings.Index(system, "Current time:"); timeIdx < focusIdx {
+		t.Fatalf("expected time after after-feed context block, got system=%q", system)
 	}
-	if len(snapshot.Placements) != 4 {
-		t.Fatalf("expected reminder/memory/feed/time placements, got %+v", snapshot.Placements)
+	if len(snapshot.Placements) != 5 {
+		t.Fatalf("expected memory/context/feed/context/time placements, got %+v", snapshot.Placements)
 	}
-	for i, want := range []string{"runtime_reminder", "memory", "feed", "time"} {
+	for i, want := range []string{"memory", "feed_frame", "feed", "runtime_motivation", "time"} {
 		placement := snapshot.Placements[i]
 		if placement.Order != i+1 || placement.Kind != want {
 			t.Fatalf("unexpected placement %d: %+v", i, placement)
@@ -147,14 +149,14 @@ func TestHandlerCapturesOpenAIContextSnapshot(t *testing.T) {
 			t.Fatalf("unexpected placement position: %+v", placement)
 		}
 	}
-	if !(snapshot.Placements[0].StartChar < snapshot.Placements[1].StartChar && snapshot.Placements[1].StartChar < snapshot.Placements[2].StartChar && snapshot.Placements[2].StartChar < snapshot.Placements[3].StartChar) {
+	if !(snapshot.Placements[0].StartChar < snapshot.Placements[1].StartChar && snapshot.Placements[1].StartChar < snapshot.Placements[2].StartChar && snapshot.Placements[2].StartChar < snapshot.Placements[3].StartChar && snapshot.Placements[3].StartChar < snapshot.Placements[4].StartChar) {
 		t.Fatalf("expected placement offsets in assembly order, got %+v", snapshot.Placements)
 	}
 	if len(snapshot.RecentCaptures) != 1 {
 		t.Fatalf("expected one recent capture, got %+v", snapshot.RecentCaptures)
 	}
 	recent := snapshot.RecentCaptures[0]
-	if recent.DynamicInputs != 4 || recent.RuntimeReminders != 1 || recent.FeedBlocks != 1 || !recent.MemoryRecall || !recent.TimeContext || recent.PlacementCount != 4 {
+	if recent.DynamicInputs != 5 || recent.ContextBlocks != 2 || recent.FeedBlocks != 1 || !recent.MemoryRecall || !recent.TimeContext || recent.PlacementCount != 5 {
 		t.Fatalf("unexpected recent capture summary: %+v", recent)
 	}
 
@@ -194,13 +196,14 @@ func TestHandlerCapturesAnthropicContextSnapshotWithBlockSystem(t *testing.T) {
 				"token":    "nano-bot:secret456",
 				"timezone": "America/New_York",
 			},
-			RuntimeReminders: &agentctx.RuntimeReminderManifest{
+			ContextBlocks: &agentctx.ContextBlockManifest{
 				Version: 1,
-				Reminders: []agentctx.RuntimeReminder{{
+				Blocks: []agentctx.ContextBlock{{
 					ID:        "focus",
+					Kind:      "runtime_motivation",
 					Text:      "Keep the operating contract visible.",
 					Cadence:   "every_turn",
-					Placement: "before_feeds",
+					Placement: "after_feeds",
 					MaxChars:  200,
 				}},
 			},
@@ -248,13 +251,13 @@ func TestHandlerCapturesAnthropicContextSnapshotWithBlockSystem(t *testing.T) {
 	if first["text"] != "You are a trader." {
 		t.Fatalf("unexpected first system block: %+v", first)
 	}
-	if len(snapshot.RuntimeReminders) != 1 || snapshot.RuntimeReminders[0].ID != "focus" {
-		t.Fatalf("unexpected RuntimeReminders: %+v", snapshot.RuntimeReminders)
+	if len(snapshot.ContextBlocks) != 1 || snapshot.ContextBlocks[0].ID != "focus" || snapshot.ContextBlocks[0].Kind != "runtime_motivation" {
+		t.Fatalf("unexpected ContextBlocks: %+v", snapshot.ContextBlocks)
 	}
 	if len(snapshot.Placements) != 2 {
-		t.Fatalf("expected reminder/time placements, got %+v", snapshot.Placements)
+		t.Fatalf("expected context block/time placements, got %+v", snapshot.Placements)
 	}
-	if snapshot.Placements[0].Kind != "runtime_reminder" || snapshot.Placements[1].Kind != "time" {
+	if snapshot.Placements[0].Kind != "runtime_motivation" || snapshot.Placements[1].Kind != "time" {
 		t.Fatalf("unexpected anthropic placement order: %+v", snapshot.Placements)
 	}
 	for _, placement := range snapshot.Placements {
@@ -263,7 +266,7 @@ func TestHandlerCapturesAnthropicContextSnapshotWithBlockSystem(t *testing.T) {
 		}
 	}
 	if snapshot.Placements[0].StartChar >= snapshot.Placements[1].StartChar {
-		t.Fatalf("expected reminder before time, got %+v", snapshot.Placements)
+		t.Fatalf("expected context block before time, got %+v", snapshot.Placements)
 	}
 }
 

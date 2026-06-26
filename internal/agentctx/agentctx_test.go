@@ -41,8 +41,8 @@ func TestLoadReadsAllFiles(t *testing.T) {
 	if ctx.Tools != nil {
 		t.Fatalf("expected no tools manifest, got %+v", ctx.Tools)
 	}
-	if ctx.RuntimeReminders != nil {
-		t.Fatalf("expected no runtime reminder manifest, got %+v", ctx.RuntimeReminders)
+	if ctx.ContextBlocks != nil {
+		t.Fatalf("expected no context block manifest, got %+v", ctx.ContextBlocks)
 	}
 	if ctx.HasPolicy() {
 		t.Fatal("expected no model policy")
@@ -52,17 +52,17 @@ func TestLoadReadsAllFiles(t *testing.T) {
 	}
 }
 
-func TestLoadReadsRuntimeRemindersManifest(t *testing.T) {
+func TestLoadReadsContextBlocksManifest(t *testing.T) {
 	dir := t.TempDir()
 	agentDir := filepath.Join(dir, "agent")
 	if err := os.MkdirAll(agentDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	for name, content := range map[string]string{
-		"AGENTS.md":              "# Contract",
-		"CLAWDAPUS.md":           "# Infra",
-		"metadata.json":          `{"token":"agent:secret"}`,
-		"runtime-reminders.json": `{"version":1,"reminders":[{"id":"focus","text":"Keep the operating contract visible.","cadence":"every_turn","placement":"before_feeds","max_chars":120}]}`,
+		"AGENTS.md":           "# Contract",
+		"CLAWDAPUS.md":        "# Infra",
+		"metadata.json":       `{"token":"agent:secret"}`,
+		"context-blocks.json": `{"version":1,"blocks":[{"id":"focus","kind":"runtime_motivation","text":"Keep the operating contract visible.","cadence":"every_turn","placement":"after_feeds","max_chars":120}]}`,
 	} {
 		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
@@ -73,12 +73,12 @@ func TestLoadReadsRuntimeRemindersManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if ctx.RuntimeReminders == nil || len(ctx.RuntimeReminders.Reminders) != 1 {
-		t.Fatalf("expected one runtime reminder, got %+v", ctx.RuntimeReminders)
+	if ctx.ContextBlocks == nil || len(ctx.ContextBlocks.Blocks) != 1 {
+		t.Fatalf("expected one context block, got %+v", ctx.ContextBlocks)
 	}
-	reminder := ctx.RuntimeReminders.Reminders[0]
-	if reminder.ID != "focus" || reminder.Text == "" || reminder.Cadence != "every_turn" || reminder.Placement != "before_feeds" || reminder.MaxChars != 120 {
-		t.Fatalf("unexpected reminder: %+v", reminder)
+	block := ctx.ContextBlocks.Blocks[0]
+	if block.ID != "focus" || block.Kind != "runtime_motivation" || block.Text == "" || block.Cadence != "every_turn" || block.Placement != "after_feeds" || block.MaxChars != 120 {
+		t.Fatalf("unexpected context block: %+v", block)
 	}
 }
 

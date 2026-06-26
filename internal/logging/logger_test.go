@@ -49,11 +49,12 @@ func TestLogRequestIncludesPromptHashes(t *testing.T) {
 	}
 }
 
-func TestLogRuntimeReminderIncludesSkipFields(t *testing.T) {
+func TestLogContextBlockIncludesSkipFields(t *testing.T) {
 	var buf bytes.Buffer
 	l := New(&buf)
-	l.LogRuntimeReminder("agent", "openai/gpt-4o", RuntimeReminderInfo{
+	l.LogContextBlock("agent", "openai/gpt-4o", ContextBlockInfo{
 		ID:        "focus",
+		Kind:      "runtime_motivation",
 		Status:    "skipped",
 		Cadence:   "min_interval",
 		Placement: "before_feeds",
@@ -64,11 +65,11 @@ func TestLogRuntimeReminderIncludesSkipFields(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
 		t.Fatalf("invalid JSON: %v", err)
 	}
-	if entry["type"] != "runtime_reminder" || entry["runtime_reminder_id"] != "focus" || entry["runtime_reminder_status"] != "skipped" {
-		t.Fatalf("unexpected runtime reminder entry: %+v", entry)
+	if entry["type"] != "context_block" || entry["context_block_id"] != "focus" || entry["context_block_kind"] != "runtime_motivation" || entry["context_block_status"] != "skipped" {
+		t.Fatalf("unexpected context block entry: %+v", entry)
 	}
-	if entry["runtime_reminder_cadence"] != "min_interval" || entry["runtime_reminder_placement"] != "before_feeds" || entry["runtime_reminder_reason"] != "unsupported_cadence" {
-		t.Fatalf("missing runtime reminder skip fields: %+v", entry)
+	if entry["context_block_cadence"] != "min_interval" || entry["context_block_placement"] != "before_feeds" || entry["context_block_reason"] != "unsupported_cadence" {
+		t.Fatalf("missing context block skip fields: %+v", entry)
 	}
 }
 
