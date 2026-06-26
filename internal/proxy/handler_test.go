@@ -22,6 +22,7 @@ import (
 	"github.com/mostlydev/cllama/internal/feeds"
 	"github.com/mostlydev/cllama/internal/logging"
 	"github.com/mostlydev/cllama/internal/provider"
+	"github.com/mostlydev/cllama/internal/sessionhistory"
 )
 
 func TestHandlerForwardsAndSwapsAuth(t *testing.T) {
@@ -2016,6 +2017,209 @@ func TestHandlerRejectsUnknownProvider(t *testing.T) {
 	}
 }
 
+func TestHandlerRejectsOpenAIWhenBudgetExceeded(t *testing.T) {
+	limit := 0.50
+	histDir := t.TempDir()
+	writeHistoryEntry(t, histDir, "tiverton", time.Now().UTC().Add(-time.Minute), &limit)
+
+	var logs lockedBuffer
+	h := NewHandler(provider.NewRegistry(""), stubContextLoaderWithBudget("tiverton", "tiverton:dummy123", &agentctx.BudgetPolicy{
+		LimitUSD: &limit,
+		Window:   "1h",
+		Behavior: "hard_stop",
+	}), logging.New(&logs), WithSessionHistory(histDir))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d body=%s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	errPayload := payload["error"].(map[string]any)
+	if errPayload["code"] != budgetExceededIntervention {
+		t.Fatalf("expected budget_exceeded error, got %+v", payload)
+	}
+	assertInterventionLogged(t, logs.Bytes(), budgetExceededIntervention)
+}
+
+func TestHandlerRejectsAnthropicWhenRequestRateLimited(t *testing.T) {
+	maxRequests := 1
+	cost := 0.01
+	histDir := t.TempDir()
+	writeHistoryEntry(t, histDir, "nano-bot", time.Now().UTC().Add(-time.Minute), &cost)
+
+	var logs lockedBuffer
+	h := NewHandler(provider.NewRegistry(""), stubContextLoaderWithBudget("nano-bot", "nano-bot:dummy456", &agentctx.BudgetPolicy{
+		MaxRequests: &maxRequests,
+		Window:      "1h",
+		Behavior:    "rate_limit",
+	}), logging.New(&logs), WithSessionHistory(histDir))
+
+	body := `{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d body=%s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	errPayload := payload["error"].(map[string]any)
+	if errPayload["code"] != rateLimitedIntervention {
+		t.Fatalf("expected rate_limited error, got %+v", payload)
+	}
+	assertInterventionLogged(t, logs.Bytes(), rateLimitedIntervention)
+}
+
+func TestHandlerBudgetOverrideRaisesCapAndTrafficResumes(t *testing.T) {
+	staticLimit := 0.50
+	overrideLimit := 1.00
+	histDir := t.TempDir()
+	writeHistoryEntry(t, histDir, "tiverton", time.Now().UTC().Add(-time.Minute), &staticLimit)
+
+	governanceDir := t.TempDir()
+	overrideDir := filepath.Join(governanceDir, "tiverton")
+	if err := os.MkdirAll(overrideDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	override := map[string]any{
+		"limit_usd": overrideLimit,
+		"window":    "1h",
+		"behavior":  "hard_stop",
+	}
+	overrideRaw, err := json.Marshal(override)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(overrideDir, "budget.json"), overrideRaw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithBudget("tiverton", "tiverton:dummy123", &agentctx.BudgetPolicy{
+		LimitUSD: &staticLimit,
+		Window:   "1h",
+		Behavior: "hard_stop",
+	}), logging.New(io.Discard), WithSessionHistory(histDir), WithGovernanceDir(governanceDir))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected traffic to resume with raised cap, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandlerBudgetCheckUnavailableFailsOpenByDefault(t *testing.T) {
+	limit := 0.50
+	histDir := t.TempDir()
+	agentDir := filepath.Join(histDir, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "history.jsonl"), []byte("{bad-json\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hello"}}]}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	var logs lockedBuffer
+	h := NewHandler(reg, stubContextLoaderWithBudget("tiverton", "tiverton:dummy123", &agentctx.BudgetPolicy{
+		LimitUSD: &limit,
+		Window:   "1h",
+		Behavior: "hard_stop",
+	}), logging.New(&logs), WithSessionHistory(histDir))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected fail-open request to continue, got %d body=%s", w.Code, w.Body.String())
+	}
+	assertInterventionLogged(t, logs.Bytes(), budgetCheckUnavailableIntervention)
+}
+
+func TestHandlerBudgetCheckUnavailableFailsClosedWhenConfigured(t *testing.T) {
+	t.Setenv(EnvBudgetFailMode, budgetFailModeClosed)
+
+	limit := 0.50
+	histDir := t.TempDir()
+	agentDir := filepath.Join(histDir, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "history.jsonl"), []byte("{bad-json\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs lockedBuffer
+	h := NewHandler(provider.NewRegistry(""), stubContextLoaderWithBudget("tiverton", "tiverton:dummy123", &agentctx.BudgetPolicy{
+		LimitUSD: &limit,
+		Window:   "1h",
+		Behavior: "hard_stop",
+	}), logging.New(&logs), WithSessionHistory(histDir))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected fail-closed 503, got %d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), budgetEnforcementUnavailableMessage) {
+		t.Fatalf("expected budget-unavailable response, got %s", w.Body.String())
+	}
+}
+
 func TestHandlerFallsBackToOpenRouterForVendorPrefixedModel(t *testing.T) {
 	var gotAuth string
 	var gotBody []byte
@@ -2852,6 +3056,53 @@ func TestHandlerRecordsCost(t *testing.T) {
 	}
 	if entries[0].TotalCostUSD <= 0 {
 		t.Error("expected positive cost")
+	}
+}
+
+func TestHandlerPersistsComputedCostForBudgetWindows(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"id": "chatcmpl-1",
+			"choices": [{"message": {"content": "hello"}}],
+			"usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL, APIKey: "sk-real", Auth: "bearer",
+	})
+
+	histDir := t.TempDir()
+	acc := cost.NewAccumulator()
+	pricing := cost.DefaultPricing()
+	h := NewHandler(reg, stubContextLoaderWithToken("tiverton", "tiverton:dummy123"), logging.New(io.Discard),
+		WithCostTracking(acc, pricing),
+		WithSessionHistory(histDir))
+
+	body := `{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	summary, err := sessionhistory.SummarizeWindow(histDir, "tiverton", time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("SummarizeWindow: %v", err)
+	}
+	if summary.Requests != 1 {
+		t.Fatalf("expected one history request, got %+v", summary)
+	}
+	if summary.ReportedCostUSD <= 0 {
+		t.Fatalf("expected computed cost persisted for budget enforcement, got %+v", summary)
+	}
+	if summary.UnknownCost != 0 {
+		t.Fatalf("expected known cost request, got %+v", summary)
 	}
 }
 
@@ -6044,6 +6295,24 @@ func stubContextLoaderWithPolicy(agentID, token string, policy *agentctx.ModelPo
 	}
 }
 
+func stubContextLoaderWithBudget(agentID, token string, budget *agentctx.BudgetPolicy) ContextLoader {
+	return func(id string) (*agentctx.AgentContext, error) {
+		if id != agentID {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{
+			AgentID:     id,
+			ContextDir:  "/claw/context/" + id,
+			AgentsMD:    []byte("# Contract"),
+			ClawdapusMD: []byte("# Infra"),
+			Metadata: map[string]any{
+				"token": token,
+			},
+			Budget: budget,
+		}, nil
+	}
+}
+
 func stubContextLoaderWithTools(agentID, token string, tools *agentctx.ToolManifest) ContextLoader {
 	return func(id string) (*agentctx.AgentContext, error) {
 		if id != agentID {
@@ -6059,6 +6328,30 @@ func stubContextLoaderWithTools(agentID, token string, tools *agentctx.ToolManif
 			},
 			Tools: tools,
 		}, nil
+	}
+}
+
+func writeHistoryEntry(t *testing.T, histDir, agentID string, ts time.Time, reportedCost *float64) {
+	t.Helper()
+	recorder := sessionhistory.New(histDir)
+	entry := sessionhistory.Entry{
+		Version: 1,
+		ClawID:  agentID,
+		TS:      ts.UTC().Format(time.RFC3339),
+		Path:    "/v1/chat/completions",
+		Response: sessionhistory.Payload{
+			Format: "json",
+			JSON:   json.RawMessage(`{}`),
+		},
+		Usage: sessionhistory.Usage{
+			ReportedCostUSD: reportedCost,
+		},
+	}
+	if err := recorder.Record(agentID, entry); err != nil {
+		t.Fatalf("record history entry: %v", err)
+	}
+	if err := recorder.Close(); err != nil {
+		t.Fatalf("close recorder: %v", err)
 	}
 }
 

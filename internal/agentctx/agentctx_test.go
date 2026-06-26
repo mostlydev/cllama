@@ -41,11 +41,44 @@ func TestLoadReadsAllFiles(t *testing.T) {
 	if ctx.Tools != nil {
 		t.Fatalf("expected no tools manifest, got %+v", ctx.Tools)
 	}
+	if ctx.ContextBlocks != nil {
+		t.Fatalf("expected no context block manifest, got %+v", ctx.ContextBlocks)
+	}
 	if ctx.HasPolicy() {
 		t.Fatal("expected no model policy")
 	}
 	if ctx.ChannelAllowed("chan-1") {
 		t.Fatal("expected missing channel allowlist to deny channel")
+	}
+}
+
+func TestLoadReadsContextBlocksManifest(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "agent")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"AGENTS.md":           "# Contract",
+		"CLAWDAPUS.md":        "# Infra",
+		"metadata.json":       `{"token":"agent:secret"}`,
+		"context-blocks.json": `{"version":1,"blocks":[{"id":"focus","kind":"runtime_motivation","text":"Keep the operating contract visible.","cadence":"every_turn","placement":"after_feeds","max_chars":120}]}`,
+	} {
+		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, err := Load(dir, "agent")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ctx.ContextBlocks == nil || len(ctx.ContextBlocks.Blocks) != 1 {
+		t.Fatalf("expected one context block, got %+v", ctx.ContextBlocks)
+	}
+	block := ctx.ContextBlocks.Blocks[0]
+	if block.ID != "focus" || block.Kind != "runtime_motivation" || block.Text == "" || block.Cadence != "every_turn" || block.Placement != "after_feeds" || block.MaxChars != 120 {
+		t.Fatalf("unexpected context block: %+v", block)
 	}
 }
 
@@ -133,6 +166,49 @@ func TestLoadParsesModelPolicyAccessors(t *testing.T) {
 	}
 	if failover[0] != "xai/grok-4.1-fast" || failover[1] != "anthropic/claude-haiku-4-5" {
 		t.Fatalf("unexpected failover refs: %#v", failover)
+	}
+}
+
+func TestLoadParsesBudgetPolicy(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{
+		"token":"tiverton:secret",
+		"budget":{
+			"limit_usd":1.25,
+			"max_requests":12,
+			"window":"1h",
+			"behavior":"hard_stop"
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(meta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "tiverton")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if ctx.Budget == nil {
+		t.Fatal("expected budget policy")
+	}
+	if ctx.Budget.LimitUSD == nil || *ctx.Budget.LimitUSD != 1.25 {
+		t.Fatalf("unexpected budget limit: %+v", ctx.Budget)
+	}
+	if ctx.Budget.MaxRequests == nil || *ctx.Budget.MaxRequests != 12 {
+		t.Fatalf("unexpected request cap: %+v", ctx.Budget)
+	}
+	if ctx.Budget.Window != "1h" || ctx.Budget.Behavior != "hard_stop" {
+		t.Fatalf("unexpected budget metadata: %+v", ctx.Budget)
 	}
 }
 

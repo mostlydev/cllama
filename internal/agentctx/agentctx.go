@@ -19,7 +19,9 @@ type AgentContext struct {
 	ServiceAuth      []ServiceAuthEntry
 	Tools            *ToolManifest
 	Memory           *MemoryManifest
+	ContextBlocks    *ContextBlockManifest
 	ModelPolicy      *ModelPolicy
+	Budget           *BudgetPolicy
 	ChannelAllowlist map[string]struct{}
 }
 
@@ -66,6 +68,13 @@ type ToolPolicy struct {
 	TotalTimeoutMS   int `json:"total_timeout_ms"`
 }
 
+type BudgetPolicy struct {
+	LimitUSD    *float64 `json:"limit_usd,omitempty"`
+	MaxRequests *int     `json:"max_requests,omitempty"`
+	Window      string   `json:"window"`
+	Behavior    string   `json:"behavior"`
+}
+
 type ChannelAllowlistManifest struct {
 	Version  int      `json:"version"`
 	Channels []string `json:"channels"`
@@ -84,6 +93,21 @@ type MemoryManifest struct {
 type MemoryOp struct {
 	Path      string `json:"path"`
 	TimeoutMS int    `json:"timeout_ms,omitempty"`
+}
+
+type ContextBlockManifest struct {
+	Version int            `json:"version"`
+	Blocks  []ContextBlock `json:"blocks"`
+}
+
+type ContextBlock struct {
+	ID        string `json:"id"`
+	Kind      string `json:"kind,omitempty"`
+	Text      string `json:"text"`
+	Enabled   *bool  `json:"enabled,omitempty"`
+	Placement string `json:"placement,omitempty"`
+	MaxChars  int    `json:"max_chars,omitempty"`
+	Cadence   string `json:"cadence,omitempty"`
 }
 
 // Load reads an agent's context files from contextRoot/<agentID>/.
@@ -110,7 +134,8 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 		return nil, fmt.Errorf("load agent context %q: parse metadata: %w", agentID, err)
 	}
 	var typed struct {
-		ModelPolicy *ModelPolicy `json:"model_policy"`
+		ModelPolicy *ModelPolicy  `json:"model_policy"`
+		Budget      *BudgetPolicy `json:"budget"`
 	}
 	if err := json.Unmarshal(metaRaw, &typed); err != nil {
 		return nil, fmt.Errorf("load agent context %q: parse typed metadata: %w", agentID, err)
@@ -127,6 +152,10 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load agent context %q: memory.json: %w", agentID, err)
 	}
+	contextBlocks, err := loadContextBlockManifest(dir)
+	if err != nil {
+		return nil, fmt.Errorf("load agent context %q: context-blocks.json: %w", agentID, err)
+	}
 	channelAllowlist, err := loadChannelAllowlist(dir)
 	if err != nil {
 		return nil, fmt.Errorf("load agent context %q: channels-allowlist.json: %w", agentID, err)
@@ -141,7 +170,9 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 		ServiceAuth:      serviceAuth,
 		Tools:            tools,
 		Memory:           memory,
+		ContextBlocks:    contextBlocks,
 		ModelPolicy:      typed.ModelPolicy,
+		Budget:           typed.Budget,
 		ChannelAllowlist: channelAllowlist,
 	}, nil
 }
@@ -265,6 +296,21 @@ func loadToolsManifest(dir string) (*ToolManifest, error) {
 		return nil, err
 	}
 	var manifest ToolManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return nil, err
+	}
+	return &manifest, nil
+}
+
+func loadContextBlockManifest(dir string) (*ContextBlockManifest, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, "context-blocks.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var manifest ContextBlockManifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return nil, err
 	}

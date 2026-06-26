@@ -57,6 +57,13 @@ type entry struct {
 	MemoryBlocks  *int    `json:"memory_blocks,omitempty"`
 	MemoryBytes   *int    `json:"memory_bytes,omitempty"`
 	MemoryRemoved *int    `json:"memory_removed,omitempty"`
+	// context_block event fields
+	ContextBlockID        *string `json:"context_block_id,omitempty"`
+	ContextBlockKind      *string `json:"context_block_kind,omitempty"`
+	ContextBlockStatus    *string `json:"context_block_status,omitempty"`
+	ContextBlockCadence   *string `json:"context_block_cadence,omitempty"`
+	ContextBlockPlacement *string `json:"context_block_placement,omitempty"`
+	ContextBlockReason    *string `json:"context_block_reason,omitempty"`
 	// channel_context_op event fields
 	ChannelKind       *string  `json:"kind,omitempty"`
 	Channels          []string `json:"channels,omitempty"`
@@ -126,6 +133,15 @@ type MemoryOpInfo struct {
 	InjectedBytes *int
 	PolicyRemoved *int
 	Error         error
+}
+
+type ContextBlockInfo struct {
+	ID        string
+	Kind      string
+	Status    string
+	Cadence   string
+	Placement string
+	Reason    string
 }
 
 // ChannelContextOpInfo holds structured telemetry for channel awareness,
@@ -328,6 +344,22 @@ func (l *Logger) LogMemoryOp(clawID, model string, info MemoryOpInfo) {
 		e.Error = info.Error.Error()
 	}
 	l.log(e)
+}
+
+func (l *Logger) LogContextBlock(clawID, model string, info ContextBlockInfo) {
+	l.log(entry{
+		TS:                    time.Now().UTC().Format(time.RFC3339),
+		ClawID:                clawID,
+		Type:                  "context_block",
+		Model:                 model,
+		Intervention:          nil,
+		ContextBlockID:        ptrString(info.ID),
+		ContextBlockKind:      ptrString(info.Kind),
+		ContextBlockStatus:    ptrString(info.Status),
+		ContextBlockCadence:   ptrString(info.Cadence),
+		ContextBlockPlacement: ptrString(info.Placement),
+		ContextBlockReason:    ptrString(info.Reason),
+	})
 }
 
 func (l *Logger) LogChannelContextOp(clawID, model string, info ChannelContextOpInfo) {

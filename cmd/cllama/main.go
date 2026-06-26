@@ -34,6 +34,7 @@ type config struct {
 	UIToken           string
 	SessionHistoryDir string
 	ContextLedgerDir  string
+	GovernanceDir     string
 }
 
 func main() {
@@ -75,7 +76,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 	apiServer := &http.Server{
 		Addr:              cfg.APIAddr,
-		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, recorder, cfg.ContextLedgerDir, cfg.UIToken, snapshots),
+		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, recorder, cfg.ContextLedgerDir, cfg.GovernanceDir, cfg.UIToken, snapshots),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	uiServer := &http.Server{
@@ -117,7 +118,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder, contextLedgerDir string, adminToken string, snapshots *proxy.ContextSnapshotStore) http.Handler {
+func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder, contextLedgerDir string, governanceDir string, adminToken string, snapshots *proxy.ContextSnapshotStore) http.Handler {
 	mux := http.NewServeMux()
 	opts := []proxy.HandlerOption{proxy.WithCostTracking(acc, pricing), proxy.WithSnapshotStore(snapshots)}
 	if podName != "" {
@@ -125,6 +126,9 @@ func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.L
 	}
 	if recorder != nil {
 		opts = append(opts, proxy.WithSessionRecorder(recorder))
+	}
+	if governanceDir != "" {
+		opts = append(opts, proxy.WithGovernanceDir(governanceDir))
 	}
 	opts = append(opts, proxy.WithChannelCursorLedger(contextLedgerDir))
 	if adminToken != "" {
@@ -209,6 +213,7 @@ func configFromEnv() config {
 		UIToken:           os.Getenv("CLLAMA_UI_TOKEN"),
 		SessionHistoryDir: sessionHistoryDir,
 		ContextLedgerDir:  contextLedgerDir,
+		GovernanceDir:     os.Getenv("CLAW_GOVERNANCE_DIR"),
 	}
 }
 

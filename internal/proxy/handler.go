@@ -44,6 +44,7 @@ type Handler struct {
 	managedTurns                 *managedOpenAIContinuityStore
 	managedAnthropicTurns        *managedAnthropicContinuityStore
 	sessionRecorder              *sessionhistory.Recorder
+	governanceDir                string
 	channelCursors               *channelCursorStore
 	adminToken                   string
 	snapshots                    *ContextSnapshotStore
@@ -116,6 +117,12 @@ func WithSessionHistory(dir string) HandlerOption {
 func WithSessionRecorder(r *sessionhistory.Recorder) HandlerOption {
 	return func(h *Handler) {
 		h.sessionRecorder = r
+	}
+}
+
+func WithGovernanceDir(dir string) HandlerOption {
+	return func(h *Handler) {
+		h.governanceDir = strings.TrimSpace(dir)
 	}
 }
 
@@ -346,6 +353,9 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	downstreamStream, downstreamIncludeUsage := requestedOpenAIStreamOptions(payload)
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
+	if h.enforceBudget(w, agentID, agentCtx, requestedModel, start) {
+		return
+	}
 	managedTool := hasManagedTools(agentCtx)
 	h.logToolManifestState(agentID, requestedModel, agentCtx)
 	if managedTool {
@@ -354,11 +364,13 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		// effective transcript that produced the runner-visible assistant reply.
 		h.managedTurns.Inject(agentID, payload)
 	}
+	contextBlocks := renderContextBlocks(agentCtx)
+	h.logContextBlockSkips(agentID, requestedModel, contextBlocks.Skips)
 	memoryRecall := h.recallOpenAIMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
 	incomingEpoch := strings.TrimSpace(r.Header.Get("X-Claw-Consumer-Session-Epoch"))
 	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx, incomingEpoch, requestedModel)
 	timeContext := currentTimeLine(agentCtx, time.Now())
-	dynamicContext := joinRuntimeContext(memoryRecall, feedCtx.Combined, timeContext)
+	dynamicContext := joinRuntimeContext(memoryRecall, contextBlocks.BeforeFeeds, feedCtx.Combined, contextBlocks.AfterFeeds, timeContext)
 	feeds.AppendLateContext(payload, dynamicContext)
 	if err := injectManagedOpenAITools(payload, agentCtx); err != nil {
 		h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
@@ -374,7 +386,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		h.fail(w, status, err.Error(), agentID, requestedModel, start, err)
 		return
 	}
-	h.captureContextSnapshot(agentID, "openai", requestedModel, payload, resolution, feedCtx.Blocks, memoryRecall, timeContext, managedTool, 1)
+	h.captureContextSnapshot(agentID, "openai", requestedModel, payload, resolution, feedCtx.Blocks, contextBlocks.Snapshots, memoryRecall, timeContext, managedTool, 1)
 
 	if h.accumulator != nil && h.pricing != nil && isStreamingChatCompletions(r.URL.Path, payload) {
 		ensureStreamUsage(payload)
@@ -432,6 +444,9 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	downstreamStream := requestedStream(payload)
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
+	if h.enforceBudget(w, agentID, agentCtx, requestedModel, start) {
+		return
+	}
 	managedTool := hasManagedTools(agentCtx)
 	h.logToolManifestState(agentID, requestedModel, agentCtx)
 	if managedTool {
@@ -441,11 +456,13 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		// one that produced the runner-visible assistant reply.
 		h.managedAnthropicTurns.Inject(agentID, payload)
 	}
+	contextBlocks := renderContextBlocks(agentCtx)
+	h.logContextBlockSkips(agentID, requestedModel, contextBlocks.Skips)
 	memoryRecall := h.recallAnthropicMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
 	incomingEpoch := strings.TrimSpace(r.Header.Get("X-Claw-Consumer-Session-Epoch"))
 	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx, incomingEpoch, requestedModel)
 	timeContext := currentTimeLine(agentCtx, time.Now())
-	dynamicContext := joinRuntimeContext(memoryRecall, feedCtx.Combined, timeContext)
+	dynamicContext := joinRuntimeContext(memoryRecall, contextBlocks.BeforeFeeds, feedCtx.Combined, contextBlocks.AfterFeeds, timeContext)
 	feeds.AppendAnthropicLateContext(payload, dynamicContext)
 	if managedTool {
 		if err := injectManagedAnthropicTools(payload, agentCtx); err != nil {
@@ -463,7 +480,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		h.fail(w, status, err.Error(), agentID, requestedModel, start, err)
 		return
 	}
-	h.captureContextSnapshot(agentID, "anthropic", requestedModel, payload, resolution, feedCtx.Blocks, memoryRecall, timeContext, managedTool, 1)
+	h.captureContextSnapshot(agentID, "anthropic", requestedModel, payload, resolution, feedCtx.Blocks, contextBlocks.Snapshots, memoryRecall, timeContext, managedTool, 1)
 	if resolution.Intervention != "" {
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}
@@ -904,9 +921,17 @@ func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext
 		}
 	}
 
+	hasUsage := usage.PromptTokens > 0 || usage.CompletionTokens > 0 || usage.ReportedCostUSD != nil
+	var (
+		costUSD   float64
+		costKnown bool
+	)
+	if hasUsage && (h.accumulator != nil || h.sessionRecorder != nil) {
+		costUSD, costKnown = h.resolveCost(providerName, upstreamModel, usage)
+	}
+
 	var costInfo *logging.CostInfo
-	if h.accumulator != nil && (usage.PromptTokens > 0 || usage.CompletionTokens > 0 || usage.ReportedCostUSD != nil) {
-		costUSD, costKnown := h.resolveCost(providerName, upstreamModel, usage)
+	if h.accumulator != nil && hasUsage {
 		h.accumulator.RecordWithStatus(agentID, providerName, upstreamModel,
 			usage.PromptTokens, usage.CompletionTokens, costUSD, costKnown)
 		var loggedCostUSD *float64
@@ -945,7 +970,7 @@ func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext
 			Usage: sessionhistory.Usage{
 				PromptTokens:     usage.PromptTokens,
 				CompletionTokens: usage.CompletionTokens,
-				ReportedCostUSD:  usage.ReportedCostUSD,
+				ReportedCostUSD:  sessionHistoryCostUSD(usage, costUSD, costKnown),
 			},
 		}
 		if err := entry.EnsureID(); err != nil {
@@ -969,6 +994,14 @@ func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext
 	} else {
 		h.logger.LogResponse(agentID, requestedModel, statusCode, latency)
 	}
+}
+
+func sessionHistoryCostUSD(usage cost.Usage, costUSD float64, costKnown bool) *float64 {
+	if costKnown {
+		v := costUSD
+		return &v
+	}
+	return usage.ReportedCostUSD
 }
 
 func (h *Handler) fail(w http.ResponseWriter, status int, msg, clawID, model string, start time.Time, err error) {
