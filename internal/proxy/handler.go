@@ -1,0 +1,1481 @@
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/mostlydev/cllama/internal/agentctx"
+	"github.com/mostlydev/cllama/internal/alert"
+	"github.com/mostlydev/cllama/internal/cost"
+	"github.com/mostlydev/cllama/internal/feeds"
+	"github.com/mostlydev/cllama/internal/identity"
+	"github.com/mostlydev/cllama/internal/logging"
+	"github.com/mostlydev/cllama/internal/mcp"
+	"github.com/mostlydev/cllama/internal/provider"
+	"github.com/mostlydev/cllama/internal/sessionhistory"
+)
+
+// ContextLoader resolves per-agent context by ID.
+type ContextLoader func(agentID string) (*agentctx.AgentContext, error)
+
+// Handler proxies OpenAI-compatible chat requests to upstream providers.
+type Handler struct {
+	registry                     *provider.Registry
+	loadContext                  ContextLoader
+	client                       *http.Client
+	logger                       *logging.Logger
+	notifier                     *alert.Notifier
+	accumulator                  *cost.Accumulator
+	pricing                      *cost.Pricing
+	feedFetcher                  *feeds.Fetcher
+	feedBudget                   feeds.Budget
+	mcpClient                    *mcp.Client
+	managedTurns                 *managedOpenAIContinuityStore
+	managedAnthropicTurns        *managedAnthropicContinuityStore
+	sessionRecorder              *sessionhistory.Recorder
+	governanceDir                string
+	channelCursors               *channelCursorStore
+	adminToken                   string
+	snapshots                    *ContextSnapshotStore
+	toolSchemaValidation         bool
+	managedDuplicatePolicy       string
+	managedDuplicateStreakCutoff int
+}
+
+const (
+	EnvDispatchCandidateTimeoutMS     = "CLLAMA_DISPATCH_CANDIDATE_TIMEOUT_MS"
+	EnvStreamFirstByteTimeoutMS       = "CLLAMA_STREAM_FIRST_BYTE_TIMEOUT_MS"
+	EnvStreamIdleTimeoutMS            = "CLLAMA_STREAM_IDLE_TIMEOUT_MS"
+	defaultDispatchCandidateTimeoutMS = 60000
+	defaultStreamFirstByteTimeoutMS   = 300000
+	defaultStreamIdleTimeoutMS        = 120000
+)
+
+var (
+	errStreamFirstByteTimeout = errors.New("upstream stream timed out before first byte")
+	errStreamIdleTimeout      = errors.New("upstream stream idle timeout")
+	errStreamReadTimeout      = errors.New("upstream stream read timeout")
+)
+
+// HandlerOption configures optional Handler behaviour.
+type HandlerOption func(*Handler)
+
+// WithCostTracking enables per-request cost recording.
+func WithCostTracking(acc *cost.Accumulator, pricing *cost.Pricing) HandlerOption {
+	return func(h *Handler) {
+		h.accumulator = acc
+		h.pricing = pricing
+	}
+}
+
+// WithFeeds enables feed injection using the given pod name for identity headers.
+func WithFeeds(podName string) HandlerOption {
+	return func(h *Handler) {
+		budget := feeds.BudgetFromEnv()
+		h.feedBudget = budget
+		h.feedFetcher = feeds.NewFetcherWithBudget(podName, nil, h.logger, budget)
+	}
+}
+
+func WithFeedBudget(podName string, budget feeds.Budget) HandlerOption {
+	return func(h *Handler) {
+		h.feedBudget = budget.Normalize()
+		h.feedFetcher = feeds.NewFetcherWithBudget(podName, nil, h.logger, h.feedBudget)
+	}
+}
+
+// WithNotifier attaches an alert notifier for pool transition events.
+func WithNotifier(n *alert.Notifier) HandlerOption {
+	return func(h *Handler) {
+		h.notifier = n
+	}
+}
+
+// WithSessionHistory enables session recording to dir. If dir is empty, this
+// option is a no-op.
+func WithSessionHistory(dir string) HandlerOption {
+	return func(h *Handler) {
+		if dir != "" {
+			h.sessionRecorder = sessionhistory.New(dir)
+		}
+	}
+}
+
+// WithSessionRecorder attaches an already-constructed session recorder to the handler.
+// Use this when the caller needs to retain the recorder for explicit Close on shutdown.
+func WithSessionRecorder(r *sessionhistory.Recorder) HandlerOption {
+	return func(h *Handler) {
+		h.sessionRecorder = r
+	}
+}
+
+func WithGovernanceDir(dir string) HandlerOption {
+	return func(h *Handler) {
+		h.governanceDir = strings.TrimSpace(dir)
+	}
+}
+
+func WithChannelCursorLedger(dir string) HandlerOption {
+	return func(h *Handler) {
+		h.channelCursors = newChannelCursorStore(dir)
+	}
+}
+
+// WithAdminToken enables an operator-scoped bearer token for non-chat API
+// routes such as history export.
+func WithAdminToken(token string) HandlerOption {
+	return func(h *Handler) {
+		h.adminToken = strings.TrimSpace(token)
+	}
+}
+
+func WithSnapshotStore(store *ContextSnapshotStore) HandlerOption {
+	return func(h *Handler) {
+		if store != nil {
+			h.snapshots = store
+		}
+	}
+}
+
+type fetchedFeedContext struct {
+	Combined      string
+	Blocks        []string
+	PendingCommit *pendingChannelCursorCommit
+}
+
+func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger *logging.Logger, opts ...HandlerOption) *Handler {
+	if registry == nil {
+		registry = provider.NewRegistry("")
+	}
+	if contextLoader == nil {
+		contextLoader = func(string) (*agentctx.AgentContext, error) {
+			return nil, fmt.Errorf("context loader not configured")
+		}
+	}
+	if logger == nil {
+		logger = logging.New(io.Discard)
+	}
+	h := &Handler{
+		registry:                     registry,
+		loadContext:                  contextLoader,
+		client:                       &http.Client{},
+		logger:                       logger,
+		managedTurns:                 newManagedOpenAIContinuityStore(defaultManagedToolContinuityTurns),
+		managedAnthropicTurns:        newManagedAnthropicContinuityStore(defaultManagedToolContinuityTurns),
+		channelCursors:               newChannelCursorStore(""),
+		snapshots:                    NewContextSnapshotStore(),
+		feedBudget:                   feeds.DefaultBudget(),
+		toolSchemaValidation:         toolSchemaValidationFromEnv(),
+		managedDuplicatePolicy:       managedToolDuplicatePolicyFromEnv(),
+		managedDuplicateStreakCutoff: managedToolDuplicateStreakCutoffFromEnv(),
+	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	h.mcpClient = mcp.NewClient(h.client, maxManagedToolResultBytes)
+	return h
+}
+
+func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *agentctx.AgentContext, incomingEpoch string, requestedModel string) fetchedFeedContext {
+	var out fetchedFeedContext
+	if h.feedFetcher == nil || agentCtx == nil || agentCtx.ContextDir == "" {
+		return out
+	}
+
+	entries, err := feeds.LoadManifest(agentCtx.ContextDir)
+	if err != nil {
+		h.logger.LogError(agentID, "", 0, 0, fmt.Errorf("load feed manifest: %w", err))
+		return out
+	}
+	if len(entries) == 0 {
+		return out
+	}
+
+	results := make([]feeds.FeedResult, 0, len(entries))
+	channelMetadataByFeed := make(map[string]channelContextMetadata)
+	for _, entry := range entries {
+		var channelContextDecision channelContextPrepareDecision
+		channelFeed := isChannelContextFeed(entry)
+		channelAwarenessFeed := isChannelAwarenessFeed(entry)
+		if channelFeed {
+			var err error
+			entry, channelContextDecision, err = h.prepareChannelContextFeed(agentID, entry, incomingEpoch)
+			if err != nil {
+				h.logger.LogError(agentID, "", 0, 0, err)
+			}
+			entry.NoCache = true
+		}
+		result, err := h.feedFetcher.Fetch(reqCtx, agentID, entry)
+		if err != nil {
+			continue
+		}
+		if channelFeed {
+			if channelContextDecision.Bootstrapped && !result.Unavailable {
+				if out.PendingCommit == nil {
+					out.PendingCommit = &pendingChannelCursorCommit{}
+				}
+				out.PendingCommit.SetEpoch(channelContextDecision.PriorEpoch, channelContextDecision.IncomingEpoch)
+			}
+			metadata := parseChannelContextMetadata(result.Content)
+			if channelContextDecision.AppliedAfter && metadata.Omitted > 0 {
+				result.Content = appendChannelContextPartialAnnotation(result.Content, metadata)
+			}
+			if len(metadata.Cursor) > 0 {
+				if out.PendingCommit == nil {
+					out.PendingCommit = &pendingChannelCursorCommit{}
+				}
+				out.PendingCommit.Merge(metadata.Cursor)
+			}
+		}
+		if channelFeed || channelAwarenessFeed {
+			metadata := parseChannelContextMetadata(result.Content)
+			status := metadata.Status
+			if result.Unavailable {
+				status = "error"
+			}
+			channelMetadataByFeed[channelMetadataKey(result.Name, result.Source)] = metadata
+			h.logger.LogChannelContextOp(agentID, "", logging.ChannelContextOpInfo{
+				Kind:              metadata.Kind,
+				Channels:          metadata.Channels,
+				Retained:          metadata.Retained,
+				Returned:          metadata.Returned,
+				Omitted:           metadata.Omitted,
+				RawBytes:          metadata.RawBytes,
+				DigestBytes:       metadata.DigestBytes,
+				DigestBlocks:      metadata.DigestBlocks,
+				CoverageGaps:      metadata.CoverageGaps,
+				DeterministicOnly: boolPtr(metadata.DeterministicOnly, metadata.Kind == "raw_window+digest"),
+				Source:            result.Source,
+				Status:            status,
+			})
+		}
+		results = append(results, result)
+	}
+	formatted := feeds.FormatFeeds(results, h.feedBudget)
+	out.Blocks = formatted.Blocks
+	out.Combined = formatted.Combined
+	for _, feed := range formatted.Feeds {
+		metadata := channelMetadataByFeed[channelMetadataKey(feed.Name, feed.Source)]
+		h.logger.LogFeedInjection(agentID, requestedModel, logging.FeedInjectionInfo{
+			Name:                 feed.Name,
+			Source:               feed.Source,
+			Status:               feed.Status,
+			Truncated:            feed.Truncated,
+			SourceBytes:          feed.SourceBytes,
+			SourceBytesExact:     feed.SourceBytesExact,
+			ContentBytes:         feed.ContentBytes,
+			BlockBytes:           feed.BlockBytes,
+			TotalBytesBefore:     feed.TotalBytesBefore,
+			TotalBytesAfter:      feed.TotalBytesAfter,
+			MaxFeedResponseBytes: feed.MaxFeedResponseBytes,
+			MaxTotalFeedBytes:    feed.MaxTotalFeedBytes,
+			RawBytes:             metadata.RawBytes,
+			DigestBytes:          metadata.DigestBytes,
+		})
+	}
+	return out
+}
+
+func channelMetadataKey(name, source string) string {
+	return strings.TrimSpace(name) + "\x00" + strings.TrimSpace(source)
+}
+
+func boolPtr(value bool, include bool) *bool {
+	if !include {
+		return nil
+	}
+	return &value
+}
+
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
+	if r.Method != http.MethodPost {
+		h.fail(w, http.StatusMethodNotAllowed, "method not allowed", "", "", start, nil)
+		return
+	}
+
+	agentAuth := r.Header.Get("Authorization")
+	if strings.TrimSpace(agentAuth) == "" {
+		if xAPIKey := strings.TrimSpace(r.Header.Get("x-api-key")); xAPIKey != "" {
+			agentAuth = "Bearer " + xAPIKey
+		}
+	}
+	agentID, secret, err := identity.ParseBearer(agentAuth)
+	if err != nil {
+		h.fail(w, http.StatusUnauthorized, "invalid bearer token", "", "", start, err)
+		return
+	}
+
+	ctx, err := h.loadContext(agentID)
+	if err != nil {
+		h.fail(w, http.StatusForbidden, "agent context not found", agentID, "", start, err)
+		return
+	}
+	if err := validateSecret(ctx, agentID, secret); err != nil {
+		h.fail(w, http.StatusForbidden, "invalid agent secret", agentID, "", start, err)
+		return
+	}
+
+	// Route based on path: /v1/messages → Anthropic flow, everything else → OpenAI flow
+	if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+		h.handleAnthropicMessages(w, r, agentID, ctx, start)
+		return
+	}
+
+	h.handleOpenAI(w, r, agentID, ctx, start)
+}
+
+func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, start time.Time) {
+	inBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.fail(w, http.StatusBadRequest, "failed to read request body", agentID, "", start, err)
+		return
+	}
+	defer r.Body.Close()
+
+	var payload map[string]any
+	if err := json.Unmarshal(inBody, &payload); err != nil {
+		h.fail(w, http.StatusBadRequest, "invalid JSON body", agentID, "", start, err)
+		return
+	}
+	downstreamStream, downstreamIncludeUsage := requestedOpenAIStreamOptions(payload)
+	requestedModel, _ := payload["model"].(string)
+	requestedModel = strings.TrimSpace(requestedModel)
+	if h.enforceBudget(w, agentID, agentCtx, requestedModel, start) {
+		return
+	}
+	managedTool := hasManagedTools(agentCtx)
+	h.logToolManifestState(agentID, requestedModel, agentCtx)
+	if managedTool {
+		// Continuity reinjection must happen before memory recall and feed/time
+		// injection so both the recall backend and the upstream model see the
+		// effective transcript that produced the runner-visible assistant reply.
+		h.managedTurns.Inject(agentID, payload)
+	}
+	contextBlocks := renderContextBlocks(agentCtx)
+	h.logContextBlockSkips(agentID, requestedModel, contextBlocks.Skips)
+	memoryRecall := h.recallOpenAIMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
+	incomingEpoch := strings.TrimSpace(r.Header.Get("X-Claw-Consumer-Session-Epoch"))
+	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx, incomingEpoch, requestedModel)
+	timeContext := currentTimeLine(agentCtx, time.Now())
+	dynamicContext := joinRuntimeContext(memoryRecall, contextBlocks.BeforeFeeds, feedCtx.Combined, contextBlocks.AfterFeeds, timeContext)
+	feeds.AppendLateContext(payload, dynamicContext)
+	if err := injectManagedOpenAITools(payload, agentCtx); err != nil {
+		h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
+		return
+	}
+	requestInfo := requestTelemetry("openai", payload, dynamicContext)
+	resolution, err := h.resolveOpenAIExecution(agentCtx, requestedModel)
+	if err != nil {
+		status := http.StatusBadGateway
+		if err.Error() == "missing model" {
+			status = http.StatusBadRequest
+		}
+		h.fail(w, status, err.Error(), agentID, requestedModel, start, err)
+		return
+	}
+	h.captureContextSnapshot(agentID, "openai", requestedModel, payload, resolution, feedCtx.Blocks, contextBlocks.Snapshots, memoryRecall, timeContext, managedTool, 1)
+
+	if h.accumulator != nil && h.pricing != nil && isStreamingChatCompletions(r.URL.Path, payload) {
+		ensureStreamUsage(payload)
+	}
+	if resolution.Intervention != "" {
+		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
+	}
+	if managedTool {
+		h.handleManagedOpenAI(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, downstreamStream, downstreamIncludeUsage, start, feedCtx.PendingCommit, requestInfo)
+		return
+	}
+
+	h.dispatchCandidates(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, start, requestInfo, feedCtx.PendingCommit)
+}
+
+// resolveOpenAIProvider maps a parsed provider name to the actual provider name
+// and potentially rewrites the upstream model (format bridge).
+// Returns the final (providerName, upstreamModel) to use.
+func (h *Handler) resolveOpenAIProvider(providerName, upstreamModel string) (string, string, error) {
+	prov, err := h.registry.Get(providerName)
+	if err != nil {
+		// Vendor-prefix bridge: route unknown provider prefix through openrouter.
+		bridge, bridgeErr := h.registry.Get("openrouter")
+		if bridgeErr != nil || strings.EqualFold(providerName, "openrouter") {
+			return "", "", fmt.Errorf("unknown provider %q", providerName)
+		}
+		return bridge.Name, providerName + "/" + upstreamModel, nil
+	}
+
+	// Format bridge: anthropic provider on OpenAI path → route via openrouter.
+	if strings.EqualFold(prov.APIFormat, "anthropic") {
+		bridge, bridgeErr := h.registry.Get("openrouter")
+		if bridgeErr != nil {
+			return "", "", fmt.Errorf("provider %q uses anthropic format but request is openai format; configure openrouter for format bridging", providerName)
+		}
+		return bridge.Name, providerName + "/" + upstreamModel, nil
+	}
+
+	return providerName, upstreamModel, nil
+}
+
+func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, start time.Time) {
+	inBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.fail(w, http.StatusBadRequest, "failed to read request body", agentID, "", start, err)
+		return
+	}
+	defer r.Body.Close()
+
+	var payload map[string]any
+	if err := json.Unmarshal(inBody, &payload); err != nil {
+		h.fail(w, http.StatusBadRequest, "invalid JSON body", agentID, "", start, err)
+		return
+	}
+	downstreamStream := requestedStream(payload)
+	requestedModel, _ := payload["model"].(string)
+	requestedModel = strings.TrimSpace(requestedModel)
+	if h.enforceBudget(w, agentID, agentCtx, requestedModel, start) {
+		return
+	}
+	managedTool := hasManagedTools(agentCtx)
+	h.logToolManifestState(agentID, requestedModel, agentCtx)
+	if managedTool {
+		// Anthropic continuity reinjection follows the same rule as OpenAI:
+		// hidden mediated turns must be restored before recall/feed injection so
+		// the effective transcript seen by recall and the upstream model is the
+		// one that produced the runner-visible assistant reply.
+		h.managedAnthropicTurns.Inject(agentID, payload)
+	}
+	contextBlocks := renderContextBlocks(agentCtx)
+	h.logContextBlockSkips(agentID, requestedModel, contextBlocks.Skips)
+	memoryRecall := h.recallAnthropicMemory(r.Context(), agentID, agentCtx, requestedModel, payload)
+	incomingEpoch := strings.TrimSpace(r.Header.Get("X-Claw-Consumer-Session-Epoch"))
+	feedCtx := h.fetchFeeds(r.Context(), agentID, agentCtx, incomingEpoch, requestedModel)
+	timeContext := currentTimeLine(agentCtx, time.Now())
+	dynamicContext := joinRuntimeContext(memoryRecall, contextBlocks.BeforeFeeds, feedCtx.Combined, contextBlocks.AfterFeeds, timeContext)
+	feeds.AppendAnthropicLateContext(payload, dynamicContext)
+	if managedTool {
+		if err := injectManagedAnthropicTools(payload, agentCtx); err != nil {
+			h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
+			return
+		}
+	}
+	requestInfo := requestTelemetry("anthropic", payload, dynamicContext)
+	resolution, err := h.resolveAnthropicExecution(agentCtx, requestedModel)
+	if err != nil {
+		status := http.StatusBadGateway
+		if err.Error() == "missing model" {
+			status = http.StatusBadRequest
+		}
+		h.fail(w, status, err.Error(), agentID, requestedModel, start, err)
+		return
+	}
+	h.captureContextSnapshot(agentID, "anthropic", requestedModel, payload, resolution, feedCtx.Blocks, contextBlocks.Snapshots, memoryRecall, timeContext, managedTool, 1)
+	if resolution.Intervention != "" {
+		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
+	}
+	if managedTool {
+		h.handleManagedAnthropic(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, downstreamStream, start, feedCtx.PendingCommit, requestInfo)
+		return
+	}
+
+	h.dispatchCandidates(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, start, requestInfo, feedCtx.PendingCommit)
+}
+
+func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit) {
+	sawCooldown := false
+	downstreamStream := payloadRequestsStream(payload)
+	for i, candidate := range candidates {
+		canFallback := i+1 < len(candidates)
+		payload["model"] = candidate.UpstreamModel
+		outBody, err := json.Marshal(payload)
+		if err != nil {
+			h.fail(w, http.StatusInternalServerError, "failed to encode upstream body", agentID, requestedModel, start, err)
+			return
+		}
+		tryNextCandidate, candidateCooldown := h.dispatchWithRetry(w, r, agentID, agentCtx, requestedModel, candidate, outBody, requestOriginal, start, requestInfo, pendingCursor, downstreamStream, canFallback)
+		if !tryNextCandidate {
+			return
+		}
+		sawCooldown = sawCooldown || candidateCooldown
+		if i+1 < len(candidates) {
+			h.logger.LogIntervention(agentID, requestedModel, "provider_exhausted_failover")
+		}
+	}
+
+	if sawCooldown {
+		h.fail(w, http.StatusServiceUnavailable, "all declared provider keys in cooldown", agentID, requestedModel, start, fmt.Errorf("all declared providers cooling down"))
+		return
+	}
+	h.fail(w, http.StatusBadGateway, "no usable declared provider key after retries", agentID, requestedModel, start, fmt.Errorf("exhausted declared model candidates"))
+}
+
+func payloadRequestsStream(payload map[string]any) bool {
+	if payload == nil {
+		return false
+	}
+	stream, _ := payload["stream"].(bool)
+	return stream
+}
+
+// dispatchWithRetry selects a key, dispatches the request, and retries on key-level
+// failures (401/403/402/quota-429 → dead, rate-limit-429 → cooldown).
+// 5xx and transport errors do NOT cause key state changes, but can advance to
+// the next declared model candidate before any downstream response is written.
+// It returns (advanceToNextCandidate, candidateSawCooldown).
+func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, candidate dispatchCandidate, outBody []byte, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit, downstreamStream bool, canFallback bool) (bool, bool) {
+	const maxKeyAttempts = 5
+	sawCooldown := false
+
+	for attempt := 0; attempt < maxKeyAttempts; attempt++ {
+		prov, lease, err := h.registry.SelectKey(candidate.ProviderName)
+		if err != nil {
+			if _, ok := err.(*provider.CooldownError); ok {
+				return true, true
+			}
+			return true, sawCooldown
+		}
+
+		targetURL, err := buildUpstreamURL(prov.BaseURL, r.URL.Path, r.URL.RawQuery)
+		if err != nil {
+			h.fail(w, http.StatusBadGateway, "invalid provider URL", agentID, requestedModel, start, err)
+			return false, sawCooldown
+		}
+
+		reqCtx, cancel := dispatchAttemptContext(r.Context(), downstreamStream)
+		outReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(outBody))
+		if err != nil {
+			cancel()
+			h.fail(w, http.StatusBadGateway, "failed to create upstream request", agentID, requestedModel, start, err)
+			return false, sawCooldown
+		}
+		copyRequestHeaders(outReq.Header, r.Header)
+		outReq.Header.Set("Content-Type", "application/json")
+
+		// Forward Anthropic-specific headers for the Anthropic path.
+		if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+			for _, hdr := range []string{"Anthropic-Version", "Anthropic-Beta"} {
+				if v := r.Header.Get(hdr); v != "" {
+					outReq.Header.Set(hdr, v)
+				}
+			}
+		}
+
+		if err := applyProviderAuth(outReq, prov); err != nil {
+			cancel()
+			h.fail(w, http.StatusBadGateway, "provider auth not configured", agentID, requestedModel, start, err)
+			return false, sawCooldown
+		}
+
+		h.logger.LogRequestWithInfo(agentID, requestedModel, requestInfo)
+		resp, err := h.doUpstreamRequest(outReq, cancel, downstreamStream)
+		if err != nil {
+			cancel()
+			if !canFallback {
+				status, msg := upstreamDispatchFailure(err)
+				h.fail(w, status, msg, agentID, requestedModel, start, err)
+				return false, sawCooldown
+			}
+			h.logCandidateFallback(agentID, requestedModel, candidateFallbackReason(err))
+			return true, sawCooldown
+		}
+
+		classification := classifyResponse(resp)
+
+		switch classification {
+		case classAuth:
+			// 401/403/402 or quota-429: key is permanently dead.
+			resp.Body.Close()
+			cancel()
+			reason := fmt.Sprintf("http_%d", resp.StatusCode)
+			_ = h.registry.MarkDead(lease.ProviderName, lease.KeyID, reason, resp.StatusCode)
+			h.logger.LogProviderPool(lease.ProviderName, lease.KeyID, "dead", reason, "")
+			if h.notifier != nil {
+				h.notifier.Notify(alert.PoolEvent{Provider: lease.ProviderName, KeyID: lease.KeyID, Action: "dead", Reason: reason})
+			}
+			_ = h.registry.SaveToFile()
+			continue // try next key
+
+		case classRateLimit:
+			// Rate-limit 429: cooldown.
+			resp.Body.Close()
+			cancel()
+			cooldownDur := parseCooldownDuration(resp)
+			until := time.Now().UTC().Add(cooldownDur)
+			_ = h.registry.MarkCooldown(lease.ProviderName, lease.KeyID, "rate_limit", until)
+			cooldownUntil := until.Format(time.RFC3339)
+			sawCooldown = true
+			h.logger.LogProviderPool(lease.ProviderName, lease.KeyID, "cooldown", "rate_limit", cooldownUntil)
+			if h.notifier != nil {
+				h.notifier.Notify(alert.PoolEvent{
+					Provider:      lease.ProviderName,
+					KeyID:         lease.KeyID,
+					Action:        "cooldown",
+					Reason:        "rate_limit",
+					CooldownUntil: cooldownUntil,
+				})
+			}
+			_ = h.registry.SaveToFile()
+			continue // try next key
+
+		default:
+			if canFallback && isCandidateFallbackStatus(resp.StatusCode) {
+				reason := fmt.Sprintf("http_%d", resp.StatusCode)
+				resp.Body.Close()
+				cancel()
+				h.logCandidateFallback(agentID, requestedModel, reason)
+				return true, sawCooldown
+			}
+			// Success or non-retryable status: forward response back, no key state change.
+			fallbackReason := h.forwardResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start, pendingCursor)
+			cancel()
+			if fallbackReason != "" {
+				if canFallback {
+					h.logCandidateFallback(agentID, requestedModel, fallbackReason)
+					return true, sawCooldown
+				}
+				status, msg := streamFallbackFailure(fallbackReason)
+				h.fail(w, status, msg, agentID, requestedModel, start, fmt.Errorf("%s", fallbackReason))
+			}
+			return false, sawCooldown
+		}
+	}
+
+	return true, sawCooldown
+}
+
+func dispatchAttemptContext(parent context.Context, downstreamStream bool) (context.Context, context.CancelFunc) {
+	if downstreamStream {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, dispatchCandidateTimeoutDuration())
+}
+
+func dispatchCandidateTimeoutDuration() time.Duration {
+	return envDurationMS(EnvDispatchCandidateTimeoutMS, defaultDispatchCandidateTimeoutMS)
+}
+
+func streamFirstByteTimeoutDuration() time.Duration {
+	return envDurationMS(EnvStreamFirstByteTimeoutMS, defaultStreamFirstByteTimeoutMS)
+}
+
+func streamIdleTimeoutDuration() time.Duration {
+	return envDurationMS(EnvStreamIdleTimeoutMS, defaultStreamIdleTimeoutMS)
+}
+
+func envDurationMS(name string, fallbackMS int) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return time.Duration(fallbackMS) * time.Millisecond
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return time.Duration(fallbackMS) * time.Millisecond
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func (h *Handler) doUpstreamRequest(req *http.Request, cancel context.CancelFunc, downstreamStream bool) (*http.Response, error) {
+	if !downstreamStream {
+		return h.client.Do(req)
+	}
+
+	// This timeout gates the header wait here and the first body read in
+	// streamBody, so a header-only stream can consume up to two intervals.
+	timeout := streamFirstByteTimeoutDuration()
+	if timeout <= 0 {
+		return h.client.Do(req)
+	}
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		resp, err := h.client.Do(req)
+		ch <- result{resp: resp, err: err}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case res := <-ch:
+		return res.resp, res.err
+	case <-timer.C:
+		cancel()
+		go func() {
+			res := <-ch
+			if res.resp != nil && res.resp.Body != nil {
+				_ = res.resp.Body.Close()
+			}
+		}()
+		return nil, errStreamFirstByteTimeout
+	}
+}
+
+func upstreamDispatchFailure(err error) (int, string) {
+	if errors.Is(err, errStreamFirstByteTimeout) {
+		return http.StatusGatewayTimeout, "upstream stream timed out before first byte"
+	}
+	return http.StatusBadGateway, "upstream request failed"
+}
+
+func candidateFallbackReason(err error) string {
+	if errors.Is(err, errStreamFirstByteTimeout) {
+		return "stream_first_byte_timeout"
+	}
+	return "transport_error"
+}
+
+func streamFallbackFailure(reason string) (int, string) {
+	switch reason {
+	case "stream_first_byte_timeout":
+		return http.StatusGatewayTimeout, "upstream stream timed out before first byte"
+	default:
+		return http.StatusBadGateway, "upstream stream failed before sending data"
+	}
+}
+
+func isCandidateFallbackStatus(status int) bool {
+	return status >= 500 && status <= 599
+}
+
+func (h *Handler) logCandidateFallback(agentID, requestedModel, reason string) {
+	h.logger.LogIntervention(agentID, requestedModel, "provider_candidate_fallback:"+reason)
+}
+
+type responseClass int
+
+const (
+	classOK        responseClass = iota
+	classAuth                    // dead key: 401, 403, 402, quota-429
+	classRateLimit               // cooldown: rate-limit 429
+)
+
+func classifyResponse(resp *http.Response) responseClass {
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusPaymentRequired:
+		return classAuth
+	case http.StatusTooManyRequests:
+		if isQuotaExhausted(resp) {
+			return classAuth
+		}
+		return classRateLimit
+	default:
+		return classOK
+	}
+}
+
+// isQuotaExhausted peeks at the response body to distinguish billing/quota
+// exhaustion from ordinary rate limiting. The body is replaced so the caller
+// can still read it.
+func isQuotaExhausted(resp *http.Response) bool {
+	if resp.Body == nil {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "insufficient_quota") ||
+		strings.Contains(lower, "billing") ||
+		strings.Contains(lower, "exceeded your current quota")
+}
+
+// parseCooldownDuration returns how long to cool down this key.
+// It respects Retry-After if present, with a cap of 60s as a sane default.
+func parseCooldownDuration(resp *http.Response) time.Duration {
+	const defaultCooldown = 10 * time.Second
+	const maxCooldown = 60 * time.Second
+
+	ra := resp.Header.Get("Retry-After")
+	if ra == "" {
+		return defaultCooldown
+	}
+	// Retry-After may be seconds (integer) or an HTTP-date; only parse integer form.
+	var secs int
+	if _, err := fmt.Sscanf(ra, "%d", &secs); err == nil && secs > 0 {
+		d := time.Duration(secs) * time.Second
+		if d > maxCooldown {
+			return maxCooldown
+		}
+		return d
+	}
+	return defaultCooldown
+}
+
+// applyProviderAuth sets the appropriate auth header on the outgoing request.
+func applyProviderAuth(outReq *http.Request, prov *provider.Provider) error {
+	switch strings.ToLower(strings.TrimSpace(prov.Auth)) {
+	case "", "bearer":
+		if strings.TrimSpace(prov.APIKey) == "" {
+			return fmt.Errorf("missing API key for %s", prov.Name)
+		}
+		outReq.Header.Set("Authorization", "Bearer "+prov.APIKey)
+	case "x-api-key":
+		if strings.TrimSpace(prov.APIKey) == "" {
+			return fmt.Errorf("missing API key for %s", prov.Name)
+		}
+		outReq.Header.Del("Authorization")
+		outReq.Header.Set("X-Api-Key", prov.APIKey)
+	case "none":
+		outReq.Header.Del("Authorization")
+	default:
+		return fmt.Errorf("unsupported auth mode: %s", prov.Auth)
+	}
+	return nil
+}
+
+// streamResponse forwards the upstream response to the client and logs it.
+func (h *Handler) forwardResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) string {
+	if hasManagedTools(agentCtx) && resp.StatusCode >= 200 && resp.StatusCode < 300 && !isSSE(resp.Header) {
+		h.forwardManagedToolAwareResponse(w, resp, agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, start, pendingCursor)
+		return ""
+	}
+	return h.streamResponse(w, resp, agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, start, pendingCursor)
+}
+
+func (h *Handler) forwardManagedToolAwareResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) {
+	defer resp.Body.Close()
+
+	captured, err := io.ReadAll(resp.Body)
+	if err != nil {
+		h.logger.LogError(agentID, requestedModel, resp.StatusCode, time.Since(start).Milliseconds(), err)
+		return
+	}
+	if responseContainsManagedToolCall(requestPath, captured) {
+		h.fail(w, http.StatusNotImplemented, "managed tool execution loop not implemented", agentID, requestedModel, start, fmt.Errorf("upstream returned managed tool call"))
+		return
+	}
+
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if len(captured) > 0 {
+		if _, err := w.Write(captured); err != nil {
+			h.logger.LogError(agentID, requestedModel, resp.StatusCode, time.Since(start).Milliseconds(), err)
+			return
+		}
+	}
+
+	h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, captured, start, pendingCursor)
+}
+
+// streamResponse forwards the upstream response to the client and logs it.
+// It returns a non-empty fallback reason only when no downstream bytes were
+// committed, making it safe for the caller to retry the next model candidate.
+func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) string {
+	defer resp.Body.Close()
+
+	var responseBuf bytes.Buffer
+	headersWritten := false
+	writeHeaders := func() {
+		if headersWritten {
+			return
+		}
+		copyResponseHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		headersWritten = true
+	}
+
+	if err := streamBody(w, resp.Body, &responseBuf, writeHeaders, streamFirstByteTimeoutDuration(), streamIdleTimeoutDuration()); err != nil {
+		if !headersWritten {
+			if errors.Is(err, errStreamFirstByteTimeout) {
+				return "stream_first_byte_timeout"
+			}
+			return "stream_read_error"
+		}
+		if errors.Is(err, errStreamIdleTimeout) {
+			writeSSEError(w, "upstream stream idle timeout")
+		}
+		h.logger.LogError(agentID, requestedModel, resp.StatusCode, time.Since(start).Milliseconds(), err)
+		return ""
+	}
+
+	captured := responseBuf.Bytes()
+	h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, captured, start, pendingCursor)
+	return ""
+}
+
+func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, responseHeader http.Header, captured []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) {
+	var usage cost.Usage
+	if h.accumulator != nil || h.sessionRecorder != nil {
+		if isSSE(responseHeader) {
+			usage, _ = cost.ExtractUsageFromSSE(captured)
+		} else {
+			usage, _ = cost.ExtractUsage(captured)
+		}
+	}
+
+	hasUsage := usage.PromptTokens > 0 || usage.CompletionTokens > 0 || usage.ReportedCostUSD != nil
+	var (
+		costUSD   float64
+		costKnown bool
+	)
+	if hasUsage && (h.accumulator != nil || h.sessionRecorder != nil) {
+		costUSD, costKnown = h.resolveCost(providerName, upstreamModel, usage)
+	}
+
+	var costInfo *logging.CostInfo
+	if h.accumulator != nil && hasUsage {
+		h.accumulator.RecordWithStatus(agentID, providerName, upstreamModel,
+			usage.PromptTokens, usage.CompletionTokens, costUSD, costKnown)
+		var loggedCostUSD *float64
+		if costKnown {
+			loggedCostUSD = &costUSD
+		}
+		costInfo = &logging.CostInfo{
+			InputTokens:      usage.PromptTokens,
+			OutputTokens:     usage.CompletionTokens,
+			CachedTokens:     usage.CachedTokens,
+			CacheWriteTokens: usage.CacheWriteTokens,
+			CostUSD:          loggedCostUSD,
+		}
+	}
+
+	if statusCode >= 200 && statusCode < 300 {
+		var responsePayload sessionhistory.Payload
+		if isSSE(responseHeader) {
+			responsePayload = sessionhistory.Payload{Format: "sse", Text: string(captured)}
+		} else {
+			responsePayload = sessionhistory.Payload{Format: "json", JSON: json.RawMessage(captured)}
+		}
+		entry := sessionhistory.Entry{
+			Version:           1,
+			ClawID:            agentID,
+			TS:                start.UTC().Format(time.RFC3339),
+			Path:              requestPath,
+			RequestedModel:    requestedModel,
+			EffectiveProvider: providerName,
+			EffectiveModel:    upstreamModel,
+			StatusCode:        statusCode,
+			Stream:            isSSE(responseHeader),
+			RequestOriginal:   json.RawMessage(requestOriginal),
+			RequestEffective:  json.RawMessage(requestEffective),
+			Response:          responsePayload,
+			Usage: sessionhistory.Usage{
+				PromptTokens:     usage.PromptTokens,
+				CompletionTokens: usage.CompletionTokens,
+				ReportedCostUSD:  sessionHistoryCostUSD(usage, costUSD, costKnown),
+			},
+		}
+		if err := entry.EnsureID(); err != nil {
+			h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("session history id: %w", err))
+			return
+		}
+		if h.sessionRecorder != nil {
+			if err := h.sessionRecorder.Record(agentID, entry); err != nil {
+				h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("session history write: %w", err))
+			}
+		}
+		if pendingCursor != nil {
+			pendingCursor.Commit(h, agentID, requestedModel)
+		}
+		h.retainMemory(agentID, agentCtx, entry)
+	}
+
+	latency := time.Since(start).Milliseconds()
+	if costInfo != nil {
+		h.logger.LogResponseWithCost(agentID, requestedModel, statusCode, latency, costInfo)
+	} else {
+		h.logger.LogResponse(agentID, requestedModel, statusCode, latency)
+	}
+}
+
+func sessionHistoryCostUSD(usage cost.Usage, costUSD float64, costKnown bool) *float64 {
+	if costKnown {
+		v := costUSD
+		return &v
+	}
+	return usage.ReportedCostUSD
+}
+
+func (h *Handler) fail(w http.ResponseWriter, status int, msg, clawID, model string, start time.Time, err error) {
+	writeJSONError(w, status, msg)
+	h.logger.LogError(clawID, model, status, time.Since(start).Milliseconds(), err)
+}
+
+func validateSecret(ctx *agentctx.AgentContext, agentID, presentedSecret string) error {
+	stored := strings.TrimSpace(ctx.MetadataToken())
+	if stored == "" {
+		return fmt.Errorf("metadata token missing")
+	}
+
+	if strings.HasPrefix(strings.ToLower(stored), "bearer ") {
+		stored = strings.TrimSpace(stored[7:])
+	}
+
+	storedAgent, storedSecret, hasColon := strings.Cut(stored, ":")
+	if hasColon {
+		if storedAgent != "" && storedAgent != agentID {
+			return fmt.Errorf("token agent mismatch")
+		}
+		if !constantTimeEqual(storedSecret, presentedSecret) {
+			return fmt.Errorf("secret mismatch")
+		}
+		return nil
+	}
+
+	if !constantTimeEqual(stored, presentedSecret) {
+		return fmt.Errorf("secret mismatch")
+	}
+	return nil
+}
+
+func splitModel(model string) (providerName, upstreamModel string, err error) {
+	providerName, upstreamModel, ok := strings.Cut(strings.TrimSpace(model), "/")
+	if !ok || providerName == "" || upstreamModel == "" {
+		return "", "", fmt.Errorf("model must be provider-prefixed: <provider>/<model>")
+	}
+	return strings.ToLower(providerName), upstreamModel, nil
+}
+
+func isStreamingChatCompletions(path string, payload map[string]any) bool {
+	if !strings.HasPrefix(path, "/v1/chat/completions") {
+		return false
+	}
+	return requestedStream(payload)
+}
+
+func ensureStreamUsage(payload map[string]any) {
+	streamOptions, _ := payload["stream_options"].(map[string]any)
+	if streamOptions == nil {
+		streamOptions = make(map[string]any)
+	}
+	streamOptions["include_usage"] = true
+	payload["stream_options"] = streamOptions
+}
+
+func buildUpstreamURL(baseURL, incomingPath, rawQuery string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("invalid base URL: %q", baseURL)
+	}
+
+	suffix := incomingPath
+	if !strings.HasPrefix(suffix, "/") {
+		suffix = "/" + suffix
+	}
+	if strings.HasPrefix(suffix, "/v1/") {
+		suffix = strings.TrimPrefix(suffix, "/v1")
+	} else if suffix == "/v1" {
+		suffix = "/"
+	}
+
+	u.Path = strings.TrimRight(u.Path, "/") + suffix
+	u.RawQuery = rawQuery
+	return u.String(), nil
+}
+
+func (h *Handler) resolveCost(providerName, upstreamModel string, usage cost.Usage) (float64, bool) {
+	if usage.ReportedCostUSD != nil && providerReportedCostIsUSD(providerName) {
+		return *usage.ReportedCostUSD, true
+	}
+	if h.pricing == nil {
+		return 0, false
+	}
+	rate, ok := h.pricing.Lookup(providerName, upstreamModel)
+	if !ok {
+		return 0, false
+	}
+	return rate.Compute(usage.PromptTokens, usage.CompletionTokens), true
+}
+
+func providerReportedCostIsUSD(providerName string) bool {
+	switch strings.ToLower(strings.TrimSpace(providerName)) {
+	case "openrouter":
+		return true
+	default:
+		return false
+	}
+}
+
+func copyRequestHeaders(dst, src http.Header) {
+	for k, vals := range src {
+		if isHopByHopHeader(k) ||
+			strings.EqualFold(k, "Authorization") ||
+			strings.EqualFold(k, "Accept-Encoding") ||
+			strings.EqualFold(k, "X-Claw-Consumer-Session-Epoch") {
+			continue
+		}
+		for _, v := range vals {
+			dst.Add(k, v)
+		}
+	}
+}
+
+func copyResponseHeaders(dst, src http.Header) {
+	for k, vals := range src {
+		if isHopByHopHeader(k) {
+			continue
+		}
+		dst.Del(k)
+		for _, v := range vals {
+			dst.Add(k, v)
+		}
+	}
+}
+
+func isHopByHopHeader(name string) bool {
+	switch strings.ToLower(name) {
+	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSSE(h http.Header) bool {
+	return strings.Contains(h.Get("Content-Type"), "text/event-stream")
+}
+
+func streamBody(w http.ResponseWriter, body io.ReadCloser, captured *bytes.Buffer, writeHeaders func(), firstByteTimeout, idleTimeout time.Duration) error {
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	wrote := false
+	for {
+		timeout := idleTimeout
+		if !wrote {
+			timeout = firstByteTimeout
+		}
+		n, err := readStreamChunk(body, buf, timeout)
+		if n > 0 {
+			writeHeaders()
+			if _, werr := captured.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			wrote = true
+		}
+		if err == io.EOF {
+			writeHeaders()
+			return nil
+		}
+		if err != nil {
+			if errors.Is(err, errStreamReadTimeout) {
+				if wrote {
+					return errStreamIdleTimeout
+				}
+				return errStreamFirstByteTimeout
+			}
+			return err
+		}
+	}
+}
+
+func readStreamChunk(body io.ReadCloser, buf []byte, timeout time.Duration) (int, error) {
+	if timeout <= 0 {
+		return body.Read(buf)
+	}
+
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := body.Read(buf)
+		ch <- result{n: n, err: err}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case res := <-ch:
+		return res.n, res.err
+	case <-timer.C:
+		_ = body.Close()
+		return 0, errStreamReadTimeout
+	}
+}
+
+func writeSSEError(w http.ResponseWriter, msg string) {
+	payload, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": msg,
+		},
+	})
+	_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", payload)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": msg,
+		},
+	})
+}
+
+func constantTimeEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func (h *Handler) logToolManifestState(agentID, requestedModel string, agentCtx *agentctx.AgentContext) {
+	if agentCtx == nil {
+		return
+	}
+	manifestPresent := agentCtx.Tools != nil
+	toolsCount := 0
+	if agentCtx.Tools != nil {
+		toolsCount = len(agentCtx.Tools.Tools)
+	}
+	h.logger.LogToolManifest(agentID, requestedModel, manifestPresent, toolsCount)
+}
+
+func injectManagedOpenAITools(payload map[string]any, agentCtx *agentctx.AgentContext) error {
+	if !hasManagedTools(agentCtx) {
+		return nil
+	}
+	if requestedStream(payload) {
+		payload["stream"] = false
+		delete(payload, "stream_options")
+	}
+	tools := existingOpenAIToolSchemas(payload)
+	for _, tool := range buildOpenAIToolSchemas(agentCtx.Tools.Tools) {
+		tools = append(tools, tool)
+	}
+	payload["tools"] = tools
+	if _, ok := payload["tool_choice"]; !ok {
+		if toolChoice, ok := legacyFunctionCallToToolChoice(payload["function_call"]); ok {
+			payload["tool_choice"] = toolChoice
+		}
+	}
+	if toolChoice, ok := payload["tool_choice"]; ok {
+		payload["tool_choice"] = rewriteManagedOpenAIToolChoice(toolChoice, agentCtx)
+	}
+	delete(payload, "functions")
+	delete(payload, "function_call")
+	return nil
+}
+
+func injectManagedAnthropicTools(payload map[string]any, agentCtx *agentctx.AgentContext) error {
+	if !hasManagedTools(agentCtx) {
+		return nil
+	}
+	if requestedStream(payload) {
+		payload["stream"] = false
+	}
+	tools, _ := payload["tools"].([]any)
+	merged := append([]any{}, tools...)
+	for _, tool := range buildAnthropicToolSchemas(agentCtx.Tools.Tools) {
+		merged = append(merged, tool)
+	}
+	payload["tools"] = merged
+	if toolChoice, ok := payload["tool_choice"]; ok {
+		payload["tool_choice"] = rewriteManagedAnthropicToolChoice(toolChoice, agentCtx)
+	}
+	return nil
+}
+
+func hasManagedTools(agentCtx *agentctx.AgentContext) bool {
+	return agentCtx != nil && agentCtx.Tools != nil && len(agentCtx.Tools.Tools) > 0
+}
+
+func existingOpenAIToolSchemas(payload map[string]any) []any {
+	var tools []any
+	if existing, ok := payload["tools"].([]any); ok {
+		tools = append(tools, existing...)
+	}
+	if functions, ok := payload["functions"].([]any); ok {
+		for _, raw := range functions {
+			function, _ := raw.(map[string]any)
+			if function == nil {
+				continue
+			}
+			tools = append(tools, map[string]any{
+				"type":     "function",
+				"function": function,
+			})
+		}
+	}
+	return tools
+}
+
+func legacyFunctionCallToToolChoice(raw any) (any, bool) {
+	switch typed := raw.(type) {
+	case string:
+		value := strings.TrimSpace(typed)
+		if value == "" {
+			return nil, false
+		}
+		return value, true
+	case map[string]any:
+		name, _ := typed["name"].(string)
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, false
+		}
+		return map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": name,
+			},
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+func rewriteManagedOpenAIToolChoice(toolChoice any, agentCtx *agentctx.AgentContext) any {
+	choice, _ := toolChoice.(map[string]any)
+	if choice == nil {
+		return toolChoice
+	}
+	function, _ := choice["function"].(map[string]any)
+	if function == nil {
+		return toolChoice
+	}
+	name, _ := function["name"].(string)
+	resolved, ok := resolveManagedTool(agentCtx, name)
+	if !ok {
+		return toolChoice
+	}
+	function["name"] = resolved.PresentedName
+	choice["function"] = function
+	return choice
+}
+
+func rewriteManagedAnthropicToolChoice(toolChoice any, agentCtx *agentctx.AgentContext) any {
+	choice, _ := toolChoice.(map[string]any)
+	if choice == nil {
+		return toolChoice
+	}
+	kind, _ := choice["type"].(string)
+	if !strings.EqualFold(strings.TrimSpace(kind), "tool") {
+		return toolChoice
+	}
+	name, _ := choice["name"].(string)
+	resolved, ok := resolveManagedTool(agentCtx, name)
+	if !ok {
+		return toolChoice
+	}
+	choice["name"] = resolved.PresentedName
+	return choice
+}
+
+func buildOpenAIToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]any {
+	presented := managedToolPresentedNames(tools)
+	schemas := make([]map[string]any, 0, len(tools))
+	for _, tool := range tools {
+		schemas = append(schemas, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        presented[strings.TrimSpace(tool.Name)],
+				"description": tool.Description,
+				"parameters":  tool.InputSchema,
+			},
+		})
+	}
+	return schemas
+}
+
+func buildAnthropicToolSchemas(tools []agentctx.ToolManifestEntry) []map[string]any {
+	presented := managedToolPresentedNames(tools)
+	schemas := make([]map[string]any, 0, len(tools))
+	for _, tool := range tools {
+		schemas = append(schemas, map[string]any{
+			"name":         presented[strings.TrimSpace(tool.Name)],
+			"description":  tool.Description,
+			"input_schema": tool.InputSchema,
+		})
+	}
+	return schemas
+}
+
+func requestedStream(payload map[string]any) bool {
+	stream, _ := payload["stream"].(bool)
+	return stream
+}
+
+func requestedOpenAIStreamOptions(payload map[string]any) (bool, bool) {
+	stream := requestedStream(payload)
+	if !stream {
+		return false, false
+	}
+	streamOptions, _ := payload["stream_options"].(map[string]any)
+	includeUsage, _ := streamOptions["include_usage"].(bool)
+	return true, includeUsage
+}
+
+func responseContainsManagedToolCall(requestPath string, captured []byte) bool {
+	if len(bytes.TrimSpace(captured)) == 0 {
+		return false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(captured, &payload); err != nil {
+		return false
+	}
+	if strings.HasPrefix(requestPath, "/v1/messages") {
+		return anthropicToolUsePresent(payload)
+	}
+	return openAIToolCallPresent(payload)
+}
+
+func openAIToolCallPresent(payload map[string]any) bool {
+	choices, _ := payload["choices"].([]any)
+	for _, choiceAny := range choices {
+		choice, _ := choiceAny.(map[string]any)
+		if choice == nil {
+			continue
+		}
+		if finishReason, _ := choice["finish_reason"].(string); finishReason == "tool_calls" {
+			return true
+		}
+		message, _ := choice["message"].(map[string]any)
+		if message == nil {
+			continue
+		}
+		if toolCalls, _ := message["tool_calls"].([]any); len(toolCalls) > 0 {
+			return true
+		}
+		if functionCall, _ := message["function_call"].(map[string]any); len(functionCall) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func anthropicToolUsePresent(payload map[string]any) bool {
+	content, _ := payload["content"].([]any)
+	for _, blockAny := range content {
+		block, _ := blockAny.(map[string]any)
+		if block == nil {
+			continue
+		}
+		if blockType, _ := block["type"].(string); blockType == "tool_use" {
+			return true
+		}
+	}
+	return false
+}

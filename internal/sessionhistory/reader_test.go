@@ -1,0 +1,223 @@
+package sessionhistory
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestReadEntriesAppliesAfterAndLimit(t *testing.T) {
+	dir := t.TempDir()
+	r := New(dir)
+
+	base := time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		entry := Entry{
+			Version: 1,
+			TS:      base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+			ClawID:  "agent-1",
+			Response: Payload{
+				Format: "json",
+				JSON:   json.RawMessage(`{}`),
+			},
+		}
+		if err := r.Record("agent-1", entry); err != nil {
+			t.Fatalf("Record(%d): %v", i, err)
+		}
+	}
+
+	after := base
+	entries, err := ReadEntries(dir, "agent-1", &after, 1)
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry after filtering+limit, got %d", len(entries))
+	}
+	if entries[0].TS != base.Add(time.Minute).Format(time.RFC3339) {
+		t.Fatalf("unexpected first filtered timestamp: %+v", entries[0])
+	}
+	if entries[0].ID == "" {
+		t.Fatalf("expected read entries to include stable ID, got %+v", entries[0])
+	}
+}
+
+func TestReadEntriesHandlesLineLargerThanScannerDefault(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "agent-big")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bigPayload := strings.Repeat("x", 200_000)
+	raw := `{"version":1,"ts":"2026-04-01T00:00:00Z","claw_id":"agent-big","response":{"format":"json","json":{"big":"` + bigPayload + `"}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(agentDir, "history.jsonl"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := ReadEntries(dir, "agent-big", nil, 1)
+	if err != nil {
+		t.Fatalf("ReadEntries on >64KB line: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+}
+
+func TestReadEntriesMissingFileReturnsEmpty(t *testing.T) {
+	entries, err := ReadEntries(t.TempDir(), "missing-agent", nil, 100)
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected no entries, got %+v", entries)
+	}
+}
+
+func TestReadEntriesSpansRotationBoundary(t *testing.T) {
+	dir := t.TempDir()
+	first := rotationTestEntry("agent-span", "2026-04-01T00:00:00Z", "model-1")
+	second := rotationTestEntry("agent-span", "2026-04-01T00:01:00Z", "model-2")
+	t.Setenv(EnvSessionHistoryMaxBytes, strconv.Itoa(encodedEntryLineLen(t, first)))
+
+	r := New(dir)
+	if err := r.Record("agent-span", first); err != nil {
+		t.Fatalf("record first: %v", err)
+	}
+	if err := r.Record("agent-span", second); err != nil {
+		t.Fatalf("record second: %v", err)
+	}
+
+	entries, err := ReadEntries(dir, "agent-span", nil, 10)
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries across rotation, got %d", len(entries))
+	}
+	if entries[0].RequestedModel != "model-1" || entries[1].RequestedModel != "model-2" {
+		t.Fatalf("unexpected entries across rotation: %+v", entries)
+	}
+
+	after := time.Date(2026, 4, 1, 0, 0, 30, 0, time.UTC)
+	entries, err = ReadEntries(dir, "agent-span", &after, 10)
+	if err != nil {
+		t.Fatalf("ReadEntries after: %v", err)
+	}
+	if len(entries) != 1 || entries[0].RequestedModel != "model-2" {
+		t.Fatalf("expected only current entry after boundary filter, got %+v", entries)
+	}
+}
+
+func TestSummarizeWindowTotalsRequestsAndKnownCost(t *testing.T) {
+	dir := t.TempDir()
+	r := New(dir)
+
+	base := time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC)
+	costA := 0.25
+	costB := 0.75
+	entries := []Entry{
+		{Version: 1, TS: base.Add(-time.Hour).Format(time.RFC3339), ClawID: "agent-1"},
+		{Version: 1, TS: base.Add(time.Minute).Format(time.RFC3339), ClawID: "agent-1", Usage: Usage{ReportedCostUSD: &costA}},
+		{Version: 1, TS: base.Add(2 * time.Minute).Format(time.RFC3339), ClawID: "agent-1", Usage: Usage{ReportedCostUSD: &costB}},
+		{Version: 1, TS: base.Add(3 * time.Minute).Format(time.RFC3339), ClawID: "agent-1"},
+	}
+	for i, entry := range entries {
+		if err := r.Record("agent-1", entry); err != nil {
+			t.Fatalf("Record(%d): %v", i, err)
+		}
+	}
+
+	summary, err := SummarizeWindow(dir, "agent-1", base)
+	if err != nil {
+		t.Fatalf("SummarizeWindow: %v", err)
+	}
+	if summary.Requests != 3 {
+		t.Fatalf("expected 3 in-window requests, got %+v", summary)
+	}
+	if summary.ReportedCostUSD != 1.0 {
+		t.Fatalf("expected cost 1.0, got %+v", summary)
+	}
+	if summary.UnknownCost != 1 {
+		t.Fatalf("expected 1 unknown-cost request, got %+v", summary)
+	}
+}
+
+func TestReadEntriesHydratesLegacyIDsFromRawJSON(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "agent-legacy")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	raw := `{"version":1,"ts":"2026-04-01T00:00:00Z","claw_id":"agent-legacy","response":{"format":"json","json":{}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(agentDir, "history.jsonl"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := ReadEntries(dir, "agent-legacy", nil, 1)
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0].ID == "" {
+		t.Fatalf("expected legacy entry ID to be hydrated, got %+v", entries[0])
+	}
+}
+
+func TestReadEntriesCreatesHistoryIndex(t *testing.T) {
+	dir := t.TempDir()
+	r := New(dir)
+	entry := Entry{
+		Version: 1,
+		TS:      time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC).Format(time.RFC3339),
+		ClawID:  "agent-1",
+		Response: Payload{
+			Format: "json",
+			JSON:   json.RawMessage(`{}`),
+		},
+	}
+	if err := r.Record("agent-1", entry); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	if _, err := ReadEntries(dir, "agent-1", &time.Time{}, 1); err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "agent-1", "history.index.json")); err != nil {
+		t.Fatalf("expected history index file to exist: %v", err)
+	}
+}
+
+func TestReadStartOffsetUsesCheckpointIndex(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "agent-1")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var raw strings.Builder
+	base := time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < historyIndexCheckpointEvery*3; i++ {
+		raw.WriteString(`{"version":1,"ts":"`)
+		raw.WriteString(base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339))
+		raw.WriteString(`","claw_id":"agent-1","response":{"format":"json","json":{}}}` + "\n")
+	}
+	historyPath := filepath.Join(agentDir, "history.jsonl")
+	if err := os.WriteFile(historyPath, []byte(raw.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	after := base.Add(time.Duration(historyIndexCheckpointEvery*2) * time.Minute)
+	offset, err := readStartOffset(historyPath, &after)
+	if err != nil {
+		t.Fatalf("readStartOffset: %v", err)
+	}
+	if offset <= 0 {
+		t.Fatalf("expected indexed start offset > 0, got %d", offset)
+	}
+}

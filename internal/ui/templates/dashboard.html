@@ -1,0 +1,913 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>cllama{{if .PodName}} &mdash; {{.PodName}}{{end}}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0c1017;
+      --bg-raised: #131a24;
+      --bg-surface: #19222f;
+      --ink: #d4dce8;
+      --ink-bright: #edf2f7;
+      --muted: #5e7085;
+      --line: #1f2d3d;
+      --line-bright: #2a3a4d;
+      --amber: #f0a500;
+      --amber-dim: #a07000;
+      --amber-glow: rgba(240, 165, 0, 0.12);
+      --cyan: #22d3ee;
+      --cyan-dim: #0e7490;
+      --cyan-glow: rgba(34, 211, 238, 0.08);
+      --red: #ef4444;
+      --red-dim: #7f1d1d;
+      --green: #34d399;
+      --green-dim: #065f46;
+      --purple: #a78bfa;
+      --purple-dim: #4c1d95;
+      --purple-glow: rgba(167, 139, 250, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Outfit", sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      min-height: 100vh;
+      position: relative;
+    }
+
+    /* subtle scan-line texture */
+    body::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0,0,0,0.03) 2px,
+        rgba(0,0,0,0.03) 4px
+      );
+      z-index: 9999;
+    }
+
+    /* ── header bar ─────────────────────────────────── */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      height: 48px;
+      background: var(--bg-raised);
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+    }
+    .topbar-brand {
+      font-family: "Geist Mono", monospace;
+      font-weight: 600;
+      color: var(--muted);
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      font-size: 11px;
+    }
+    .topbar-brand span { color: var(--cyan); }
+
+    .topbar-center {
+      font-family: "Geist Mono", monospace;
+      font-size: 12px;
+      color: var(--ink);
+      font-weight: 500;
+    }
+
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .topbar-stat {
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .topbar-stat.topbar-alert {
+      color: var(--amber);
+    }
+    .topbar-spend {
+      font-family: "Geist Mono", monospace;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--amber);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .live-indicator {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      color: var(--green);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .live-indicator.disconnected {
+      color: var(--red);
+    }
+    .live-indicator.disconnected .live-dot {
+      background: var(--red);
+      animation: none;
+    }
+    .live-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      animation: pulse 2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.4); }
+      50% { opacity: 0.6; box-shadow: 0 0 0 4px rgba(52, 211, 153, 0); }
+    }
+
+    /* ── layout ──────────────────────────────────────── */
+    main {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 32px 24px;
+    }
+
+    /* ── panels ──────────────────────────────────────── */
+    .panel {
+      background: var(--bg-raised);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-bottom: 20px;
+      overflow: hidden;
+    }
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .panel-title {
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin: 0;
+    }
+    .panel-count {
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      color: var(--muted);
+      background: var(--bg);
+      padding: 2px 8px;
+      border-radius: 4px;
+    }
+
+    /* ── providers table ─────────────────────────────── */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th {
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      font-weight: 500;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      text-align: left;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--bg);
+    }
+    td {
+      padding: 11px 14px;
+      font-size: 13px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: middle;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(34, 211, 238, 0.02); }
+
+    .cell-name {
+      font-family: "Geist Mono", monospace;
+      font-weight: 600;
+      color: var(--cyan);
+      font-size: 13px;
+    }
+    .cell-url {
+      font-family: "Geist Mono", monospace;
+      font-size: 12px;
+      color: var(--ink);
+      word-break: break-all;
+    }
+    .cell-auth {
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 3px;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      color: var(--muted);
+    }
+    .cell-key {
+      font-family: "Geist Mono", monospace;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    /* ── pool status badges ──────────────────────────── */
+    .pool-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 3px;
+      margin-right: 3px;
+    }
+    .badge-ready   { background: rgba(52,211,153,0.1); border: 1px solid rgba(52,211,153,0.3); color: var(--green); }
+    .badge-cooldown{ background: rgba(240,165,0,0.1);  border: 1px solid rgba(240,165,0,0.3);  color: var(--amber); }
+    .badge-dead    { background: rgba(239,68,68,0.1);  border: 1px solid rgba(239,68,68,0.3);  color: var(--red); }
+    .badge-disabled{ background: rgba(94,112,133,0.1); border: 1px solid rgba(94,112,133,0.3); color: var(--muted); }
+
+    /* ── key list ────────────────────────────────────── */
+    .key-list {
+      border-top: 1px solid var(--line);
+      padding: 0;
+    }
+    .key-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto auto;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 14px;
+      border-bottom: 1px solid var(--line);
+      font-size: 12px;
+    }
+    .key-row:last-child { border-bottom: none; }
+    .key-id {
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      color: var(--ink);
+    }
+    .key-label {
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      color: var(--muted);
+      margin-left: 6px;
+    }
+    .key-actions {
+      display: flex;
+      gap: 5px;
+    }
+    .btn-sm {
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      padding: 3px 8px;
+      border-radius: 3px;
+      border: 1px solid;
+      cursor: pointer;
+      background: transparent;
+      transition: background 0.1s;
+    }
+    .btn-activate { border-color: rgba(52,211,153,0.4);  color: var(--green); }
+    .btn-activate:hover { background: rgba(52,211,153,0.1); }
+    .btn-disable  { border-color: rgba(94,112,133,0.4);  color: var(--muted); }
+    .btn-disable:hover  { background: rgba(94,112,133,0.1); }
+    .btn-delete   { border-color: rgba(239,68,68,0.4);   color: var(--red); }
+    .btn-delete:hover   { background: rgba(239,68,68,0.1); }
+
+    /* ── add-key form ────────────────────────────────── */
+    .add-key-form {
+      padding: 14px 18px;
+      border-top: 1px solid var(--line);
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: flex-end;
+    }
+    .add-key-form label {
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      display: block;
+      margin-bottom: 4px;
+    }
+    .add-key-form input, .add-key-form select {
+      font-family: "Geist Mono", monospace;
+      font-size: 12px;
+      background: var(--bg);
+      border: 1px solid var(--line-bright);
+      border-radius: 4px;
+      color: var(--ink);
+      padding: 6px 10px;
+      outline: none;
+    }
+    .add-key-form input:focus, .add-key-form select:focus {
+      border-color: var(--cyan-dim);
+    }
+    .btn-primary {
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      padding: 7px 14px;
+      border-radius: 4px;
+      border: 1px solid var(--cyan-dim);
+      background: var(--cyan-glow);
+      color: var(--cyan);
+      cursor: pointer;
+      transition: background 0.1s;
+      align-self: flex-end;
+    }
+    .btn-primary:hover { background: rgba(34,211,238,0.15); }
+
+    .empty-row {
+      text-align: center;
+      padding: 32px 14px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    /* ── pricing coverage ───────────────────────────── */
+    .coverage-wrap {
+      padding: 18px;
+    }
+    .coverage-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .coverage-card {
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 14px;
+    }
+    .coverage-card.warn {
+      border-color: rgba(240,165,0,0.35);
+      box-shadow: inset 0 0 0 1px rgba(240,165,0,0.08);
+    }
+    .coverage-value {
+      font-family: "Geist Mono", monospace;
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--ink-bright);
+      font-variant-numeric: tabular-nums;
+      margin-bottom: 4px;
+    }
+    .coverage-card.warn .coverage-value {
+      color: var(--amber);
+    }
+    .coverage-label {
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .coverage-note {
+      margin: 0 0 14px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .gap-table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .gap-table td, .gap-table th {
+      padding: 11px 14px;
+      border-bottom: 1px solid var(--line);
+      font-size: 12px;
+      vertical-align: top;
+    }
+    .gap-table tr:last-child td {
+      border-bottom: none;
+    }
+    .gap-model {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .gap-model strong {
+      font-family: "Geist Mono", monospace;
+      color: var(--ink-bright);
+      font-size: 12px;
+    }
+    .gap-model span {
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .gap-agent {
+      font-family: "Geist Mono", monospace;
+      color: var(--cyan);
+      font-size: 12px;
+    }
+    .gap-metric {
+      font-family: "Geist Mono", monospace;
+      color: var(--ink);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .gap-empty {
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    /* ── agent cards ─────────────────────────────────── */
+    .agent-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 14px;
+      padding: 18px;
+    }
+
+    .agent-card {
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 18px;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    .agent-card:hover {
+      border-color: var(--line-bright);
+      box-shadow: 0 0 20px rgba(34, 211, 238, 0.04);
+    }
+
+    .agent-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }
+    .agent-name {
+      font-family: "Geist Mono", monospace;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--cyan);
+    }
+    .agent-type {
+      font-family: "Geist Mono", monospace;
+      font-size: 10px;
+      padding: 3px 8px;
+      border-radius: 3px;
+      background: var(--purple-glow);
+      border: 1px solid var(--purple-dim);
+      color: var(--purple);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .agent-stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .agent-stat {
+      background: var(--bg-raised);
+      border-radius: 4px;
+      padding: 10px 12px;
+    }
+    .agent-stat-value {
+      font-family: "Geist Mono", monospace;
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--ink-bright);
+      font-variant-numeric: tabular-nums;
+      line-height: 1;
+      margin-bottom: 3px;
+    }
+    .agent-stat-value.cost { color: var(--amber); }
+    .agent-stat-label {
+      font-family: "Geist Mono", monospace;
+      font-size: 9px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .agent-models {
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+    }
+    .agent-models-label {
+      font-family: "Geist Mono", monospace;
+      font-size: 9px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 6px;
+    }
+    .model-tag {
+      display: inline-block;
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      padding: 3px 8px;
+      margin: 0 4px 4px 0;
+      border-radius: 3px;
+      background: var(--bg-surface);
+      border: 1px solid var(--line);
+      color: var(--ink);
+    }
+    .model-tag.unpriced {
+      border-color: rgba(240,165,0,0.35);
+      color: var(--amber);
+      background: rgba(240,165,0,0.08);
+    }
+    .model-tag.partial {
+      border-color: rgba(167,139,250,0.35);
+      color: var(--purple);
+      background: rgba(167,139,250,0.08);
+    }
+    .no-models {
+      font-family: "Geist Mono", monospace;
+      font-size: 11px;
+      color: var(--muted);
+      font-style: italic;
+    }
+
+    /* ── empty state ─────────────────────────────────── */
+    .empty-state {
+      text-align: center;
+      padding: 48px 24px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .empty-state code {
+      font-family: "Geist Mono", monospace;
+      color: var(--cyan);
+      font-size: 12px;
+    }
+
+    /* ── animations ──────────────────────────────────── */
+    .fade-in {
+      animation: fadeIn 0.3s ease-out both;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .panel:nth-child(1) { animation-delay: 0s; }
+    .panel:nth-child(2) { animation-delay: 0.06s; }
+    .panel:nth-child(3) { animation-delay: 0.12s; }
+
+    .agent-card:nth-child(1) { animation-delay: 0s; }
+    .agent-card:nth-child(2) { animation-delay: 0.04s; }
+    .agent-card:nth-child(3) { animation-delay: 0.08s; }
+    .agent-card:nth-child(4) { animation-delay: 0.12s; }
+    .agent-card:nth-child(5) { animation-delay: 0.16s; }
+    .agent-card:nth-child(6) { animation-delay: 0.20s; }
+
+    /* ── responsive ──────────────────────────────────── */
+    @media (max-width: 720px) {
+      .agent-grid { grid-template-columns: 1fr; }
+      .coverage-grid { grid-template-columns: 1fr 1fr; }
+      .topbar-center { display: none; }
+      .topbar-stat { display: none; }
+      .topbar-spend { font-size: 11px; }
+      th:nth-child(3), td:nth-child(3) { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-brand"><span>cllama</span> passthrough</div>
+    <div class="topbar-center">{{if .PodName}}{{.PodName}}{{end}}</div>
+    <div class="topbar-right">
+      <span class="topbar-stat" data-total-requests>{{.TotalReqs}} reqs</span>
+      <span class="topbar-stat" data-total-tokens>{{.TotalTokens}} tok</span>
+      <span class="topbar-stat{{if gt .UnpricedRequests 0}} topbar-alert{{end}}" data-unpriced-requests>{{.UnpricedRequests}} unpriced</span>
+      <span class="topbar-spend" data-total-cost>${{printf "%.4f" .TotalCostUSD}}</span>
+      <div class="live-indicator">
+        <span class="live-dot"></span>
+        live
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- ── Providers Section ────────────────────────── -->
+    <section class="panel fade-in">
+      <div class="panel-header">
+        <h2 class="panel-title">Providers</h2>
+        <span class="panel-count">{{len .Providers}}</span>
+      </div>
+      {{if .Providers}}
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Base URL</th>
+            <th>Auth</th>
+            <th>Active Key</th>
+            <th>Pool</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{range .Providers}}
+          {{$p := .}}
+          <tr>
+            <td><span class="cell-name">{{.Name}}</span></td>
+            <td><span class="cell-url">{{.BaseURL}}</span></td>
+            <td><span class="cell-auth">{{.Auth}}</span></td>
+            <td><span class="cell-key">{{.MaskedKey}}</span></td>
+            <td>
+              {{if gt .ReadyCount 0}}<span class="pool-badge badge-ready">{{.ReadyCount}} ready</span>{{end}}
+              {{if gt .CooldownCount 0}}<span class="pool-badge badge-cooldown">{{.CooldownCount}} cool</span>{{end}}
+              {{if gt .DeadCount 0}}<span class="pool-badge badge-dead">{{.DeadCount}} dead</span>{{end}}
+            </td>
+          </tr>
+          {{if .Keys}}
+          <tr>
+            <td colspan="5" style="padding:0">
+              <div class="key-list">
+                {{range .Keys}}
+                <div class="key-row">
+                  <div>
+                    <span class="key-id">{{.ID}}</span>
+                    {{if .Label}}<span class="key-label">({{.Label}})</span>{{end}}
+                    &nbsp;<span class="pool-badge badge-{{.State}}">{{.State}}</span>
+                    {{if .CooldownUntil}}<span style="font-family:monospace;font-size:10px;color:var(--muted)">until {{.CooldownUntil}}</span>{{end}}
+                    {{if .LastErrorAt}}<span style="font-family:monospace;font-size:10px;color:var(--red)"> err:{{.LastErrorCode}} @ {{.LastErrorAt}}</span>{{end}}
+                  </div>
+                  <span class="cell-key">{{.MaskedSecret}}</span>
+                  <span style="font-family:monospace;font-size:10px;color:var(--muted)">{{.Source}}</span>
+                  <div class="key-actions">
+                    <form method="POST" action="/keys/activate" style="display:inline">
+                      <input type="hidden" name="provider" value="{{$p.Name}}">
+                      <input type="hidden" name="key_id" value="{{.ID}}">
+                      <button type="submit" class="btn-sm btn-activate">activate</button>
+                    </form>
+                    <form method="POST" action="/keys/disable" style="display:inline">
+                      <input type="hidden" name="provider" value="{{$p.Name}}">
+                      <input type="hidden" name="key_id" value="{{.ID}}">
+                      <button type="submit" class="btn-sm btn-disable">disable</button>
+                    </form>
+                    <form method="POST" action="/keys/delete" style="display:inline">
+                      <input type="hidden" name="provider" value="{{$p.Name}}">
+                      <input type="hidden" name="key_id" value="{{.ID}}">
+                      <button type="submit" class="btn-sm btn-delete">delete</button>
+                    </form>
+                  </div>
+                </div>
+                {{end}}
+              </div>
+            </td>
+          </tr>
+          {{end}}
+          {{end}}
+        </tbody>
+      </table>
+
+      <!-- Add Key form -->
+      <form class="add-key-form" method="POST" action="/keys/add">
+        <div>
+          <label>Provider</label>
+          <select name="provider">
+            {{range .Providers}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
+          </select>
+        </div>
+        <div>
+          <label>Label</label>
+          <input type="text" name="label" placeholder="backup-2" style="width:120px">
+        </div>
+        <div>
+          <label>API Key</label>
+          <input type="password" name="secret" placeholder="sk-..." required style="width:240px">
+        </div>
+        <button type="submit" class="btn-primary">+ Add Key</button>
+      </form>
+      {{else}}
+      <div class="empty-row">No providers configured.</div>
+      {{end}}
+    </section>
+
+    <!-- ── Add Provider Section ─────────────────────── -->
+    <section class="panel fade-in">
+      <div class="panel-header">
+        <h2 class="panel-title">Add Provider</h2>
+      </div>
+      <form class="add-key-form" method="post" action="/providers/add">
+        <div>
+          <label>Name</label>
+          <input type="text" name="name" placeholder="mistral" required style="width:120px">
+        </div>
+        <div>
+          <label>Base URL</label>
+          <input type="text" name="base_url" placeholder="https://api.mistral.ai/v1" required style="width:280px">
+        </div>
+        <div>
+          <label>Auth</label>
+          <select name="auth">
+            <option value="bearer" selected>bearer</option>
+            <option value="x-api-key">x-api-key</option>
+            <option value="none">none</option>
+          </select>
+        </div>
+        <div>
+          <label>API Format</label>
+          <select name="api_format">
+            <option value="openai" selected>openai</option>
+            <option value="anthropic">anthropic</option>
+          </select>
+        </div>
+        <div>
+          <label>Key Label</label>
+          <input type="text" name="key_label" placeholder="primary" style="width:100px">
+        </div>
+        <div>
+          <label>API Key</label>
+          <input type="password" name="secret" placeholder="API key" required style="width:240px">
+        </div>
+        <button type="submit" class="btn-primary">+ Add Provider</button>
+      </form>
+    </section>
+
+    <!-- ── Pricing Coverage Section ─────────────────── -->
+    <section class="panel fade-in">
+      <div class="panel-header">
+        <h2 class="panel-title">Pricing Coverage</h2>
+        <span class="panel-count">{{len .PricingGaps}} gaps</span>
+      </div>
+      <div class="coverage-wrap">
+        <div class="coverage-grid">
+          <div class="coverage-card">
+            <div class="coverage-value">${{printf "%.4f" .TotalCostUSD}}</div>
+            <div class="coverage-label">Known Spend</div>
+          </div>
+          <div class="coverage-card">
+            <div class="coverage-value">{{.TotalReqs}}</div>
+            <div class="coverage-label">Observed Requests</div>
+          </div>
+          <div class="coverage-card{{if gt .UnpricedRequests 0}} warn{{end}}">
+            <div class="coverage-value">{{.UnpricedRequests}}</div>
+            <div class="coverage-label">Requests Missing Pricing</div>
+          </div>
+          <div class="coverage-card">
+            <div class="coverage-value">{{len .Agents}}</div>
+            <div class="coverage-label">Tracked Agents</div>
+          </div>
+        </div>
+
+        <p class="coverage-note">
+          Provider-reported cost is preferred when available. Requests without pricing coverage still count tokens and request volume; they are listed below instead of being silently flattened into zero.
+        </p>
+
+        {{if .PricingGaps}}
+        <table class="gap-table">
+          <thead>
+            <tr>
+              <th>Agent</th>
+              <th>Model</th>
+              <th>Requests</th>
+              <th>Tokens</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {{range .PricingGaps}}
+            <tr>
+              <td><span class="gap-agent">{{.AgentID}}</span></td>
+              <td>
+                <div class="gap-model">
+                  <strong>{{.Provider}}/{{.Model}}</strong>
+                  <span>{{.UnpricedRequests}} request(s) currently missing price coverage</span>
+                </div>
+              </td>
+              <td><span class="gap-metric">{{.Requests}}</span></td>
+              <td><span class="gap-metric">{{.TokensIn}} in / {{.TokensOut}} out</span></td>
+              <td><span class="pool-badge {{if eq .PricingStatus "partial"}}badge-disabled{{else}}badge-cooldown{{end}}">{{.PricingStatus}}</span></td>
+            </tr>
+            {{end}}
+          </tbody>
+        </table>
+        {{else}}
+        <div class="gap-empty">All observed requests currently have pricing coverage.</div>
+        {{end}}
+      </div>
+    </section>
+
+    <!-- ── Agents Section ───────────────────────────── -->
+    <section class="panel fade-in">
+      <div class="panel-header">
+        <h2 class="panel-title">Agents</h2>
+        <span class="panel-count">{{len .Agents}}</span>
+      </div>
+      {{if .Agents}}
+      <div class="agent-grid">
+        {{range .Agents}}
+        <div class="agent-card fade-in" data-agent="{{.AgentID}}">
+          <div class="agent-card-header">
+            <span class="agent-name">{{.AgentID}}</span>
+            {{if .Type}}<span class="agent-type">{{.Type}}</span>{{end}}
+          </div>
+
+          <div class="agent-stats">
+            <div class="agent-stat">
+              <div class="agent-stat-value" data-field="requests">{{.TotalRequests}}</div>
+              <div class="agent-stat-label">Requests</div>
+            </div>
+            <div class="agent-stat">
+              <div class="agent-stat-value cost" data-field="cost">${{printf "%.4f" .TotalCostUSD}}</div>
+              <div class="agent-stat-label">Cost</div>
+            </div>
+            <div class="agent-stat">
+              <div class="agent-stat-value" data-field="tokens-in">{{.TotalTokensIn}}</div>
+              <div class="agent-stat-label">Tokens In</div>
+            </div>
+            <div class="agent-stat">
+              <div class="agent-stat-value" data-field="tokens-out">{{.TotalTokensOut}}</div>
+              <div class="agent-stat-label">Tokens Out</div>
+            </div>
+          </div>
+
+          <div class="agent-models">
+            <div class="agent-models-label">Models Used</div>
+            {{if .Models}}
+              {{range .Models}}<span class="model-tag {{if eq .PricingStatus "unpriced"}}unpriced{{else if eq .PricingStatus "partial"}}partial{{end}}">{{.Provider}}/{{.Model}}{{if ne .PricingStatus "priced"}} · {{.PricingStatus}}{{end}}</span>{{end}}
+            {{else}}
+              <span class="no-models">no requests yet</span>
+            {{end}}
+          </div>
+        </div>
+        {{end}}
+      </div>
+      {{else}}
+      <div class="empty-state">
+        <p>No agent activity yet.</p>
+      </div>
+      {{end}}
+    </section>
+  </main>
+
+  <script>
+    var es = new EventSource('/events');
+    es.onmessage = function(e) {
+      var state = JSON.parse(e.data);
+      var el = function(sel) { return document.querySelector(sel); };
+      // Update header stats
+      var costEl = el('[data-total-cost]');
+      if (costEl) costEl.textContent = '$' + state.totalCostUSD.toFixed(4);
+      var reqsEl = el('[data-total-requests]');
+      if (reqsEl) reqsEl.textContent = state.totalRequests + ' reqs';
+      var toksEl = el('[data-total-tokens]');
+      if (toksEl) toksEl.textContent = state.totalTokens + ' tok';
+      var unpricedEl = el('[data-unpriced-requests]');
+      if (unpricedEl) {
+        unpricedEl.textContent = state.unpricedRequests + ' unpriced';
+        if (state.unpricedRequests > 0) unpricedEl.classList.add('topbar-alert');
+        else unpricedEl.classList.remove('topbar-alert');
+      }
+      // Update agent cards
+      (state.agents || []).forEach(function(a) {
+        var card = document.querySelector('[data-agent="' + a.agentId + '"]');
+        if (!card) return;
+        var f = function(name) { return card.querySelector('[data-field="' + name + '"]'); };
+        var reqEl = f('requests');
+        if (reqEl) reqEl.textContent = a.totalRequests;
+        var costEl = f('cost');
+        if (costEl) costEl.textContent = '$' + a.totalCostUSD.toFixed(4);
+        var inEl = f('tokens-in');
+        if (inEl) inEl.textContent = a.totalTokensIn;
+        var outEl = f('tokens-out');
+        if (outEl) outEl.textContent = a.totalTokensOut;
+      });
+    };
+    es.onerror = function() {
+      var ind = document.querySelector('.live-indicator');
+      if (ind) ind.classList.add('disconnected');
+    };
+    es.onopen = function() {
+      var ind = document.querySelector('.live-indicator');
+      if (ind) ind.classList.remove('disconnected');
+    };
+  </script>
+</body>
+</html>

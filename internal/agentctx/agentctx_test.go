@@ -1,0 +1,432 @@
+package agentctx
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestLoadReadsAllFiles(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"service":"tiverton","pod":"ops","token":"tiverton:secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "tiverton")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(ctx.AgentsMD) != "# Contract" {
+		t.Errorf("wrong AGENTS.md content: %q", ctx.AgentsMD)
+	}
+	if string(ctx.ClawdapusMD) != "# Infra" {
+		t.Errorf("wrong CLAWDAPUS.md content: %q", ctx.ClawdapusMD)
+	}
+	if ctx.Metadata["service"] != "tiverton" {
+		t.Errorf("wrong metadata: %v", ctx.Metadata)
+	}
+	if ctx.MetadataToken() != "tiverton:secret" {
+		t.Errorf("wrong token: %q", ctx.MetadataToken())
+	}
+	if ctx.Tools != nil {
+		t.Fatalf("expected no tools manifest, got %+v", ctx.Tools)
+	}
+	if ctx.ContextBlocks != nil {
+		t.Fatalf("expected no context block manifest, got %+v", ctx.ContextBlocks)
+	}
+	if ctx.HasPolicy() {
+		t.Fatal("expected no model policy")
+	}
+	if ctx.ChannelAllowed("chan-1") {
+		t.Fatal("expected missing channel allowlist to deny channel")
+	}
+}
+
+func TestLoadReadsContextBlocksManifest(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "agent")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"AGENTS.md":           "# Contract",
+		"CLAWDAPUS.md":        "# Infra",
+		"metadata.json":       `{"token":"agent:secret"}`,
+		"context-blocks.json": `{"version":1,"blocks":[{"id":"focus","kind":"runtime_motivation","text":"Keep the operating contract visible.","cadence":"every_turn","placement":"after_feeds","max_chars":120}]}`,
+	} {
+		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, err := Load(dir, "agent")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ctx.ContextBlocks == nil || len(ctx.ContextBlocks.Blocks) != 1 {
+		t.Fatalf("expected one context block, got %+v", ctx.ContextBlocks)
+	}
+	block := ctx.ContextBlocks.Blocks[0]
+	if block.ID != "focus" || block.Kind != "runtime_motivation" || block.Text == "" || block.Cadence != "every_turn" || block.Placement != "after_feeds" || block.MaxChars != 120 {
+		t.Fatalf("unexpected context block: %+v", block)
+	}
+}
+
+func TestLoadMissingDirErrors(t *testing.T) {
+	_, err := Load("/nonexistent", "ghost")
+	if err == nil {
+		t.Error("expected error for missing dir")
+	}
+}
+
+func TestAgentContextFeedsPath(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "weston")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# C"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# I"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"weston:x"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "feeds.json"), []byte(`[{"name":"test"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "weston")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expected := filepath.Join(agentDir, "feeds.json")
+	if ctx.FeedsPath() != expected {
+		t.Errorf("expected %q, got %q", expected, ctx.FeedsPath())
+	}
+}
+
+func TestLoadParsesModelPolicyAccessors(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "logan")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{
+		"token":"logan:secret",
+		"model_policy":{
+			"mode":"clamp",
+			"allowed":[
+				{"slot":"primary","ref":"xai/grok-4.1-fast"},
+				{"slot":"fallback","ref":"anthropic/claude-haiku-4-5"},
+				{"slot":"analysis","ref":"openai/gpt-4o-mini"}
+			]
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(meta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "logan")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ctx.HasPolicy() {
+		t.Fatal("expected model policy to be present")
+	}
+	if ctx.DefaultModel() != "xai/grok-4.1-fast" {
+		t.Fatalf("unexpected default model: %q", ctx.DefaultModel())
+	}
+	allowed := ctx.AllowedModelRefs()
+	if len(allowed) != 3 {
+		t.Fatalf("expected 3 allowed refs, got %d", len(allowed))
+	}
+	failover := ctx.FailoverRefs()
+	if len(failover) != 2 {
+		t.Fatalf("expected 2 failover refs, got %d", len(failover))
+	}
+	if failover[0] != "xai/grok-4.1-fast" || failover[1] != "anthropic/claude-haiku-4-5" {
+		t.Fatalf("unexpected failover refs: %#v", failover)
+	}
+}
+
+func TestLoadParsesBudgetPolicy(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{
+		"token":"tiverton:secret",
+		"budget":{
+			"limit_usd":1.25,
+			"max_requests":12,
+			"window":"1h",
+			"behavior":"hard_stop"
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(meta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "tiverton")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if ctx.Budget == nil {
+		t.Fatal("expected budget policy")
+	}
+	if ctx.Budget.LimitUSD == nil || *ctx.Budget.LimitUSD != 1.25 {
+		t.Fatalf("unexpected budget limit: %+v", ctx.Budget)
+	}
+	if ctx.Budget.MaxRequests == nil || *ctx.Budget.MaxRequests != 12 {
+		t.Fatalf("unexpected request cap: %+v", ctx.Budget)
+	}
+	if ctx.Budget.Window != "1h" || ctx.Budget.Behavior != "hard_stop" {
+		t.Fatalf("unexpected budget metadata: %+v", ctx.Budget)
+	}
+}
+
+func TestLoadReadsServiceAuthEntries(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "tiverton")
+	if err := os.MkdirAll(filepath.Join(agentDir, "service-auth"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"tiverton:secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "service-auth", "team-memory.json"), []byte(`{"service":"team-memory","auth_type":"bearer","token":"memory-token"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "tiverton")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(ctx.ServiceAuth) != 1 {
+		t.Fatalf("expected 1 service auth entry, got %+v", ctx.ServiceAuth)
+	}
+	if ctx.ServiceAuth[0].Service != "team-memory" || ctx.ServiceAuth[0].Token != "memory-token" {
+		t.Fatalf("unexpected service auth entry: %+v", ctx.ServiceAuth[0])
+	}
+}
+
+func TestLoadReadsChannelAllowlist(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"tiverton:secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "channels-allowlist.json"), []byte(`{"version":1,"channels":["chan-1","chan-2"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "tiverton")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ctx.ChannelAllowed("chan-1") || !ctx.ChannelAllowed("chan-2") {
+		t.Fatalf("expected channels to be allowed: %+v", ctx.ChannelAllowlist)
+	}
+	if ctx.ChannelAllowed("chan-3") {
+		t.Fatal("expected unlisted channel to be denied")
+	}
+}
+
+func TestLoadReadsMemoryManifest(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"tiverton:secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "memory.json"), []byte(`{
+		"version": 1,
+		"service": "team-memory",
+		"base_url": "http://team-memory:8080",
+		"recall": {"path": "/recall", "timeout_ms": 300},
+		"retain": {"path": "/retain"}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "tiverton")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ctx.Memory == nil {
+		t.Fatal("expected memory manifest")
+	}
+	if ctx.Memory.Service != "team-memory" || ctx.Memory.Recall == nil || ctx.Memory.Recall.TimeoutMS != 300 {
+		t.Fatalf("unexpected memory manifest: %+v", ctx.Memory)
+	}
+}
+
+func TestLoadReadsToolsManifest(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"tiverton:secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tools := `{
+		"version": 1,
+		"tools": [
+			{
+				"name": "trading-api.propose_trade",
+				"description": "Submit trade proposal",
+				"inputSchema": {"type": "object"},
+				"annotations": {"readOnly": true},
+				"execution": {
+					"transport": "http",
+					"service": "trading-api",
+					"base_url": "http://trading-api:4000",
+					"method": "POST",
+					"path": "/api/v1/trades",
+					"body_key": "trade",
+					"auth": {"type": "bearer", "token": "tool-token"}
+				}
+			}
+		],
+		"policy": {
+			"max_rounds": 8,
+			"timeout_per_tool_ms": 30000,
+			"total_timeout_ms": 120000
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(agentDir, "tools.json"), []byte(tools), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "tiverton")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ctx.Tools == nil {
+		t.Fatal("expected tools manifest")
+	}
+	if ctx.Tools.Version != 1 || len(ctx.Tools.Tools) != 1 {
+		t.Fatalf("unexpected tools manifest header: %+v", ctx.Tools)
+	}
+	tool := ctx.Tools.Tools[0]
+	if tool.Name != "trading-api.propose_trade" {
+		t.Fatalf("unexpected tool name: %+v", tool)
+	}
+	if tool.Execution.Service != "trading-api" || tool.Execution.Auth == nil || tool.Execution.Auth.Token != "tool-token" {
+		t.Fatalf("unexpected tool execution: %+v", tool.Execution)
+	}
+	if tool.Execution.BodyKey != "trade" {
+		t.Fatalf("unexpected tool body key: %+v", tool.Execution)
+	}
+	if ctx.Tools.Policy.MaxRounds != 8 || ctx.Tools.Policy.TimeoutPerToolMS != 30000 || ctx.Tools.Policy.TotalTimeoutMS != 120000 {
+		t.Fatalf("unexpected tool policy: %+v", ctx.Tools.Policy)
+	}
+}
+
+func TestLoadReadsMCPToolManifest(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "tiverton")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "AGENTS.md"), []byte("# Contract"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# Infra"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"tiverton:secret"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tools := `{
+		"version": 1,
+		"tools": [
+			{
+				"name": "perplexity-mcp.search",
+				"description": "Search the web",
+				"inputSchema": {"type": "object"},
+				"execution": {
+					"transport": "mcp",
+					"service": "perplexity-mcp",
+					"base_url": "http://perplexity-mcp:8080",
+					"path": "/mcp",
+					"tool_name": "search"
+				}
+			}
+		],
+		"policy": {
+			"max_rounds": 8,
+			"timeout_per_tool_ms": 30000,
+			"total_timeout_ms": 120000
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(agentDir, "tools.json"), []byte(tools), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, err := Load(dir, "tiverton")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	tool := ctx.Tools.Tools[0]
+	if tool.Execution.Transport != "mcp" || tool.Execution.ToolName != "search" || tool.Execution.Method != "" {
+		t.Fatalf("unexpected MCP tool execution: %+v", tool.Execution)
+	}
+}
