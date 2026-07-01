@@ -305,10 +305,10 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				streamKeepalive.writeFinal(sse)
 				responseBytes = sse
 			} else {
-				copyResponseHeaders(w.Header(), resp.Header)
-				w.WriteHeader(resp.StatusCode)
-				if len(resp.Body) > 0 {
-					_, _ = w.Write(resp.Body)
+				var ok bool
+				responseBytes, ok = h.writeBufferedResponseAfterPolicy(r.Context(), w, agentID, agentCtx, "openai", policyMode(agentCtx), false, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, resp.Header, resp.Body, start)
+				if !ok {
+					return
 				}
 			}
 			h.managedTurns.ObserveTerminalAssistant(agentID, assistantMessage, hiddenMessages)
@@ -343,10 +343,10 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				streamKeepalive.writeFinal(sse)
 				responseBytes = sse
 			} else {
-				copyResponseHeaders(w.Header(), resp.Header)
-				w.WriteHeader(resp.StatusCode)
-				if len(resp.Body) > 0 {
-					_, _ = w.Write(resp.Body)
+				var ok bool
+				responseBytes, ok = h.writeBufferedResponseAfterPolicy(r.Context(), w, agentID, agentCtx, "openai", policyMode(agentCtx), false, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, resp.Header, resp.Body, start)
+				if !ok {
+					return
 				}
 			}
 			if len(toolTrace) > 0 || len(hiddenMessages) > 0 {
@@ -588,10 +588,10 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				streamKeepalive.writeFinal(sse)
 				responseBytes = sse
 			} else {
-				copyResponseHeaders(w.Header(), resp.Header)
-				w.WriteHeader(resp.StatusCode)
-				if len(resp.Body) > 0 {
-					_, _ = w.Write(resp.Body)
+				var ok bool
+				responseBytes, ok = h.writeBufferedResponseAfterPolicy(r.Context(), w, agentID, agentCtx, "anthropic", policyMode(agentCtx), false, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, resp.Header, resp.Body, start)
+				if !ok {
+					return
 				}
 			}
 			h.managedAnthropicTurns.ObserveTerminalAssistant(agentID, assistantMessage, hiddenMessages)
@@ -626,10 +626,10 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				streamKeepalive.writeFinal(sse)
 				responseBytes = sse
 			} else {
-				copyResponseHeaders(w.Header(), resp.Header)
-				w.WriteHeader(resp.StatusCode)
-				if len(resp.Body) > 0 {
-					_, _ = w.Write(resp.Body)
+				var ok bool
+				responseBytes, ok = h.writeBufferedResponseAfterPolicy(r.Context(), w, agentID, agentCtx, "anthropic", policyMode(agentCtx), false, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, resp.Header, resp.Body, start)
+				if !ok {
+					return
 				}
 			}
 			if len(toolTrace) > 0 || len(hiddenMessages) > 0 {
@@ -3243,9 +3243,20 @@ func (h *Handler) recordManagedSuccess(agentID string, agentCtx *agentctx.AgentC
 
 	if costInfo := usage.costInfo(); costInfo != nil {
 		h.logger.LogResponseWithCost(agentID, requestedModel, statusCode, latencyMS, costInfo)
+		h.scorePolicyResponse(agentID, agentCtx, policyFormatForPath(requestPath), policyMode(agentCtx), downstreamStream, requestedModel, requestEffective, statusCode, responseHeaderForPolicy(downstreamStream), captured)
 		return
 	}
 	h.logger.LogResponse(agentID, requestedModel, statusCode, latencyMS)
+	h.scorePolicyResponse(agentID, agentCtx, policyFormatForPath(requestPath), policyMode(agentCtx), downstreamStream, requestedModel, requestEffective, statusCode, responseHeaderForPolicy(downstreamStream), captured)
+}
+
+func responseHeaderForPolicy(stream bool) http.Header {
+	if stream {
+		return syntheticSSEHeader()
+	}
+	header := http.Header{}
+	header.Set("Content-Type", "application/json")
+	return header
 }
 
 func (h *Handler) recordManagedFailure(agentID string, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, responseBody []byte, usage managedUsageAggregate, toolTrace []sessionhistory.ToolRoundTrace) {

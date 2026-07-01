@@ -1,6 +1,8 @@
 package agentctx
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -79,6 +81,46 @@ func TestLoadReadsContextBlocksManifest(t *testing.T) {
 	block := ctx.ContextBlocks.Blocks[0]
 	if block.ID != "focus" || block.Kind != "runtime_motivation" || block.Text == "" || block.Cadence != "every_turn" || block.Placement != "after_feeds" || block.MaxChars != 120 {
 		t.Fatalf("unexpected context block: %+v", block)
+	}
+}
+
+func TestLoadReadsRulesManifestAndPolicyExempt(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, "agent")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rulesRaw := []byte(`{"version":1,"rules":[{"id":"include.safety","mode":"enforce","text":"Do not disclose secrets.","source":"include:safety","content_sha256":"abc123"}]}`)
+	for name, content := range map[string][]byte{
+		"AGENTS.md":     []byte("# Contract"),
+		"CLAWDAPUS.md":  []byte("# Infra"),
+		"metadata.json": []byte(`{"token":"agent:secret","policy_exempt":true}`),
+		"rules.json":    rulesRaw,
+	} {
+		if err := os.WriteFile(filepath.Join(agentDir, name), content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, err := Load(dir, "agent")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ctx.Rules == nil || ctx.Rules.Version != 1 || len(ctx.Rules.Rules) != 1 {
+		t.Fatalf("expected one rule, got %+v", ctx.Rules)
+	}
+	if ctx.Rules.Rules[0].ID != "include.safety" || ctx.Rules.Rules[0].Mode != "enforce" || ctx.Rules.Rules[0].Source != "include:safety" {
+		t.Fatalf("unexpected rule: %+v", ctx.Rules.Rules[0])
+	}
+	if ctx.RulesPath() != filepath.Join(agentDir, "rules.json") {
+		t.Fatalf("unexpected rules path: %q", ctx.RulesPath())
+	}
+	sum := sha256.Sum256(rulesRaw)
+	if ctx.RulesDigest() != hex.EncodeToString(sum[:]) {
+		t.Fatalf("unexpected rules digest: %q", ctx.RulesDigest())
+	}
+	if !ctx.PolicyExempt() {
+		t.Fatal("expected policy_exempt metadata to be true")
 	}
 }
 

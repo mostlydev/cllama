@@ -28,10 +28,12 @@ import (
 func TestHandlerForwardsAndSwapsAuth(t *testing.T) {
 	var gotAuth string
 	var gotEpoch string
+	var gotPolicyOrigin string
 	var gotBody []byte
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		gotEpoch = r.Header.Get("X-Claw-Consumer-Session-Epoch")
+		gotPolicyOrigin = r.Header.Get("X-Cllama-Policy-Origin")
 		var err error
 		gotBody, err = io.ReadAll(r.Body)
 		if err != nil {
@@ -53,6 +55,7 @@ func TestHandlerForwardsAndSwapsAuth(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Claw-Consumer-Session-Epoch", "internal-epoch")
+	req.Header.Set("X-Cllama-Policy-Origin", "policy-sidecar")
 	w := httptest.NewRecorder()
 
 	h.ServeHTTP(w, req)
@@ -65,6 +68,9 @@ func TestHandlerForwardsAndSwapsAuth(t *testing.T) {
 	}
 	if gotEpoch != "" {
 		t.Errorf("expected consumer session epoch header to stay internal, got %q", gotEpoch)
+	}
+	if gotPolicyOrigin != "" {
+		t.Errorf("expected policy origin header to stay internal, got %q", gotPolicyOrigin)
 	}
 	if len(gotBody) == 0 {
 		t.Fatal("backend received empty body")

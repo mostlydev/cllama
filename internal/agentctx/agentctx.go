@@ -1,6 +1,8 @@
 package agentctx
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,6 +21,9 @@ type AgentContext struct {
 	ServiceAuth      []ServiceAuthEntry
 	Tools            *ToolManifest
 	Memory           *MemoryManifest
+	Rules            *RulesManifest
+	rulesPath        string
+	rulesDigest      string
 	ContextBlocks    *ContextBlockManifest
 	ModelPolicy      *ModelPolicy
 	Budget           *BudgetPolicy
@@ -100,6 +105,19 @@ type ContextBlockManifest struct {
 	Blocks  []ContextBlock `json:"blocks"`
 }
 
+type RulesManifest struct {
+	Version int    `json:"version"`
+	Rules   []Rule `json:"rules"`
+}
+
+type Rule struct {
+	ID            string `json:"id"`
+	Mode          string `json:"mode"`
+	Text          string `json:"text"`
+	Source        string `json:"source"`
+	ContentSHA256 string `json:"content_sha256"`
+}
+
 type ContextBlock struct {
 	ID        string `json:"id"`
 	Kind      string `json:"kind,omitempty"`
@@ -156,6 +174,10 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load agent context %q: context-blocks.json: %w", agentID, err)
 	}
+	rules, rulesPath, rulesDigest, err := loadRulesManifest(dir)
+	if err != nil {
+		return nil, fmt.Errorf("load agent context %q: rules.json: %w", agentID, err)
+	}
 	channelAllowlist, err := loadChannelAllowlist(dir)
 	if err != nil {
 		return nil, fmt.Errorf("load agent context %q: channels-allowlist.json: %w", agentID, err)
@@ -170,6 +192,9 @@ func Load(contextRoot, agentID string) (*AgentContext, error) {
 		ServiceAuth:      serviceAuth,
 		Tools:            tools,
 		Memory:           memory,
+		Rules:            rules,
+		rulesPath:        rulesPath,
+		rulesDigest:      rulesDigest,
 		ContextBlocks:    contextBlocks,
 		ModelPolicy:      typed.ModelPolicy,
 		Budget:           typed.Budget,
@@ -197,6 +222,24 @@ func (a *AgentContext) MetadataString(key string) string {
 
 func (a *AgentContext) HasPolicy() bool {
 	return a != nil && a.ModelPolicy.HasPolicy()
+}
+
+func (a *AgentContext) PolicyExempt() bool {
+	if a == nil {
+		return false
+	}
+	v, ok := a.Metadata["policy_exempt"]
+	if !ok {
+		return false
+	}
+	switch typed := v.(type) {
+	case bool:
+		return typed
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "true")
+	default:
+		return false
+	}
 }
 
 func (a *AgentContext) DefaultModel() string {
@@ -238,6 +281,20 @@ func (a *AgentContext) FeedsPath() string {
 		return ""
 	}
 	return filepath.Join(a.ContextDir, "feeds.json")
+}
+
+func (a *AgentContext) RulesPath() string {
+	if a == nil {
+		return ""
+	}
+	return a.rulesPath
+}
+
+func (a *AgentContext) RulesDigest() string {
+	if a == nil {
+		return ""
+	}
+	return a.rulesDigest
 }
 
 func loadServiceAuth(dir string) ([]ServiceAuthEntry, error) {
@@ -315,6 +372,23 @@ func loadContextBlockManifest(dir string) (*ContextBlockManifest, error) {
 		return nil, err
 	}
 	return &manifest, nil
+}
+
+func loadRulesManifest(dir string) (*RulesManifest, string, string, error) {
+	path := filepath.Join(dir, "rules.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, "", "", nil
+		}
+		return nil, "", "", err
+	}
+	var manifest RulesManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return nil, "", "", err
+	}
+	sum := sha256.Sum256(raw)
+	return &manifest, path, hex.EncodeToString(sum[:]), nil
 }
 
 func loadChannelAllowlist(dir string) (map[string]struct{}, error) {
