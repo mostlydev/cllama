@@ -51,6 +51,8 @@ type Handler struct {
 	toolSchemaValidation         bool
 	managedDuplicatePolicy       string
 	managedDuplicateStreakCutoff int
+	policyEvaluator              PolicyEvaluator
+	policyFailMode               string
 }
 
 const (
@@ -148,6 +150,14 @@ func WithSnapshotStore(store *ContextSnapshotStore) HandlerOption {
 	}
 }
 
+func WithPolicyEvaluator(evaluator PolicyEvaluator) HandlerOption {
+	return func(h *Handler) {
+		if evaluator != nil {
+			h.policyEvaluator = evaluator
+		}
+	}
+}
+
 type fetchedFeedContext struct {
 	Combined      string
 	Blocks        []string
@@ -179,9 +189,13 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 		toolSchemaValidation:         toolSchemaValidationFromEnv(),
 		managedDuplicatePolicy:       managedToolDuplicatePolicyFromEnv(),
 		managedDuplicateStreakCutoff: managedToolDuplicateStreakCutoffFromEnv(),
+		policyFailMode:               policyFailModeFromEnv(),
 	}
 	for _, opt := range opts {
 		opt(h)
+	}
+	if h.policyEvaluator == nil {
+		h.policyEvaluator = newHTTPPolicyEvaluatorFromEnv(h.client)
 	}
 	h.mcpClient = mcp.NewClient(h.client, maxManagedToolResultBytes)
 	return h
@@ -298,6 +312,289 @@ func boolPtr(value bool, include bool) *bool {
 	return &value
 }
 
+func (h *Handler) policyEnabled(agentCtx *agentctx.AgentContext) bool {
+	return h != nil && h.policyEvaluator != nil && agentCtx != nil && !agentCtx.PolicyExempt()
+}
+
+func (h *Handler) policyFailOpen() bool {
+	return strings.EqualFold(h.policyFailMode, policyFailModeOpen)
+}
+
+func (h *Handler) policyMeta(agentID string, agentCtx *agentctx.AgentContext, format, mode string, stream bool, requestedModel string) PolicyRequestMeta {
+	return PolicyRequestMeta{
+		AgentID: agentID,
+		Format:  format,
+		Mode:    mode,
+		Stream:  stream,
+		Model:   requestedModel,
+		Rules:   policyRulesRef(agentCtx),
+	}
+}
+
+func (h *Handler) applyPolicyDecoration(ctx context.Context, agentID string, agentCtx *agentctx.AgentContext, format, mode string, stream bool, requestedModel string, payload map[string]any) {
+	if !h.policyEnabled(agentCtx) {
+		return
+	}
+	result, err := h.policyEvaluator.Decorate(ctx, PolicyDecorateRequest{
+		PolicyRequestMeta: h.policyMeta(agentID, agentCtx, format, mode, stream, requestedModel),
+		Request:           clonePolicyPayload(payload),
+	})
+	if err != nil {
+		h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("policy decorate: %w", err))
+		return
+	}
+	if result == nil {
+		return
+	}
+	if result.Intervention != "" {
+		h.logger.LogIntervention(agentID, requestedModel, result.Intervention)
+	}
+	decorated := len(result.MessagesPatch) > 0 || strings.TrimSpace(result.SystemPatch) != ""
+	if decorated && result.Intervention == "" {
+		h.logger.LogIntervention(agentID, requestedModel, policyInterventionDecorated)
+	}
+	switch format {
+	case "openai":
+		appendOpenAIPolicyMessages(payload, result.MessagesPatch)
+	case "anthropic":
+		appendAnthropicPolicySystem(payload, result.SystemPatch)
+	}
+}
+
+func (h *Handler) applyPolicyRequestGate(w http.ResponseWriter, ctx context.Context, agentID string, agentCtx *agentctx.AgentContext, format, mode string, stream bool, requestedModel string, payload map[string]any, start time.Time) (*agentctx.AgentContext, bool) {
+	if !h.policyEnabled(agentCtx) {
+		return agentCtx, false
+	}
+	result, err := h.policyEvaluator.GateRequest(ctx, PolicyGateRequest{
+		PolicyRequestMeta: h.policyMeta(agentID, agentCtx, format, mode, stream, requestedModel),
+		Request:           clonePolicyPayload(payload),
+	})
+	if err != nil {
+		return agentCtx, h.handlePolicyError(w, agentID, requestedModel, start, "policy request gate", err)
+	}
+	if result == nil {
+		return agentCtx, false
+	}
+	if result.Intervention != "" {
+		h.logger.LogIntervention(agentID, requestedModel, result.Intervention)
+	}
+	if strings.EqualFold(strings.TrimSpace(result.Verdict), policyVerdictDeny) {
+		h.writePolicyDeny(w, agentID, requestedModel, result.Reason)
+		return agentCtx, true
+	}
+	if result.ToolFilter == nil {
+		return agentCtx, false
+	}
+	filtered, err := applyPolicyToolFilter(agentCtx, result.ToolFilter)
+	if err != nil {
+		return agentCtx, h.handlePolicyError(w, agentID, requestedModel, start, "policy tool filter", err)
+	}
+	return filtered, false
+}
+
+func (h *Handler) handlePolicyError(w http.ResponseWriter, agentID, requestedModel string, start time.Time, stage string, err error) bool {
+	wrapped := fmt.Errorf("%s: %w", stage, err)
+	if h.policyFailOpen() {
+		h.logger.LogError(agentID, requestedModel, 0, time.Since(start).Milliseconds(), wrapped)
+		return false
+	}
+	h.logger.LogIntervention(agentID, requestedModel, policyInterventionUnavailable)
+	h.fail(w, http.StatusForbidden, "policy evaluator unavailable", agentID, requestedModel, start, wrapped)
+	return true
+}
+
+func (h *Handler) writePolicyDeny(w http.ResponseWriter, agentID, requestedModel, reason string) {
+	h.logger.LogIntervention(agentID, requestedModel, policyInterventionDenied)
+	msg := "policy denied request"
+	if strings.TrimSpace(reason) != "" {
+		msg += ": " + strings.TrimSpace(reason)
+	}
+	writeJSONError(w, http.StatusForbidden, msg)
+}
+
+func (h *Handler) applyPolicyResponseGate(ctx context.Context, w http.ResponseWriter, agentID string, agentCtx *agentctx.AgentContext, format, mode string, stream bool, providerName, requestedModel, upstreamModel, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, header http.Header, captured []byte, start time.Time) ([]byte, http.Header, bool) {
+	if !h.policyEnabled(agentCtx) || statusCode < 200 || statusCode >= 300 {
+		return captured, header, false
+	}
+	result, err := h.policyEvaluator.GateResponse(ctx, PolicyGateResponseRequest{
+		PolicyRequestMeta: h.policyMeta(agentID, agentCtx, format, mode, stream, requestedModel),
+		RequestBody:       string(requestEffective),
+		ResponseStatus:    statusCode,
+		ResponseHeader:    header.Clone(),
+		ResponseBody:      string(captured),
+	})
+	if err != nil {
+		return captured, header, h.handlePolicyError(w, agentID, requestedModel, start, "policy response gate", err)
+	}
+	if result == nil {
+		return captured, header, false
+	}
+	if result.Intervention != "" {
+		h.logger.LogIntervention(agentID, requestedModel, result.Intervention)
+	}
+	switch strings.ToLower(strings.TrimSpace(result.Verdict)) {
+	case policyVerdictDeny:
+		h.writePolicyDeny(w, agentID, requestedModel, result.Reason)
+		return nil, header, true
+	case policyVerdictAmend:
+		amended := policyBodyFromRaw(result.AmendedBody)
+		if len(amended) == 0 {
+			return captured, header, false
+		}
+		if result.Intervention == "" {
+			h.logger.LogIntervention(agentID, requestedModel, policyInterventionAmended)
+		}
+		nextHeader := header.Clone()
+		nextHeader.Del("Content-Length")
+		return amended, nextHeader, false
+	default:
+		return captured, header, false
+	}
+}
+
+func (h *Handler) applyPolicyStreamResponseGate(ctx context.Context, w http.ResponseWriter, agentID string, agentCtx *agentctx.AgentContext, format, mode string, providerName, requestedModel, upstreamModel, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, header http.Header, start time.Time) bool {
+	if !h.policyEnabled(agentCtx) || statusCode < 200 || statusCode >= 300 {
+		return false
+	}
+	result, err := h.policyEvaluator.GateResponse(ctx, PolicyGateResponseRequest{
+		PolicyRequestMeta: h.policyMeta(agentID, agentCtx, format, mode, true, requestedModel),
+		RequestBody:       string(requestEffective),
+		ResponseStatus:    statusCode,
+		ResponseHeader:    header.Clone(),
+	})
+	if err != nil {
+		return h.handlePolicyError(w, agentID, requestedModel, start, "policy stream response gate", err)
+	}
+	if result == nil {
+		return false
+	}
+	if result.Intervention != "" {
+		h.logger.LogIntervention(agentID, requestedModel, result.Intervention)
+	}
+	if strings.EqualFold(strings.TrimSpace(result.Verdict), policyVerdictDeny) {
+		h.writePolicyDeny(w, agentID, requestedModel, result.Reason)
+		return true
+	}
+	return false
+}
+
+func (h *Handler) writeBufferedResponseAfterPolicy(ctx context.Context, w http.ResponseWriter, agentID string, agentCtx *agentctx.AgentContext, format, mode string, stream bool, providerName, requestedModel, upstreamModel, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, header http.Header, captured []byte, start time.Time) ([]byte, bool) {
+	responseBytes, responseHeader, denied := h.applyPolicyResponseGate(ctx, w, agentID, agentCtx, format, mode, stream, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, statusCode, header, captured, start)
+	if denied {
+		return nil, false
+	}
+	copyResponseHeaders(w.Header(), responseHeader)
+	w.WriteHeader(statusCode)
+	if len(responseBytes) > 0 {
+		if _, err := w.Write(responseBytes); err != nil {
+			h.logger.LogError(agentID, requestedModel, statusCode, time.Since(start).Milliseconds(), err)
+			return responseBytes, false
+		}
+	}
+	return responseBytes, true
+}
+
+func (h *Handler) scorePolicyResponse(agentID string, agentCtx *agentctx.AgentContext, format, mode string, stream bool, requestedModel string, requestEffective []byte, statusCode int, header http.Header, captured []byte) {
+	if !h.policyEnabled(agentCtx) {
+		return
+	}
+	req := PolicyScoreRequest{
+		PolicyRequestMeta: h.policyMeta(agentID, agentCtx, format, mode, stream, requestedModel),
+		RequestBody:       string(requestEffective),
+		ResponseStatus:    statusCode,
+		ResponseHeader:    header.Clone(),
+		ResponseBody:      string(captured),
+	}
+	go func() {
+		if err := h.policyEvaluator.Score(context.Background(), req); err != nil {
+			h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("policy score: %w", err))
+		}
+	}()
+}
+
+func clonePolicyPayload(payload map[string]any) map[string]any {
+	if payload == nil {
+		return nil
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return payload
+	}
+	var clone map[string]any
+	if err := json.Unmarshal(raw, &clone); err != nil {
+		return payload
+	}
+	return clone
+}
+
+func appendOpenAIPolicyMessages(payload map[string]any, patches []map[string]any) {
+	if len(patches) == 0 {
+		return
+	}
+	messages, _ := payload["messages"].([]any)
+	for _, patch := range patches {
+		if patch == nil {
+			continue
+		}
+		messages = append(messages, patch)
+	}
+	payload["messages"] = messages
+}
+
+func appendAnthropicPolicySystem(payload map[string]any, patch string) {
+	patch = strings.TrimSpace(patch)
+	if patch == "" {
+		return
+	}
+	switch existing := payload["system"].(type) {
+	case string:
+		if strings.TrimSpace(existing) == "" {
+			payload["system"] = patch
+			return
+		}
+		payload["system"] = existing + "\n\n" + patch
+	case []any:
+		payload["system"] = append(existing, map[string]any{"type": "text", "text": patch})
+	default:
+		payload["system"] = patch
+	}
+}
+
+func applyPolicyToolFilter(agentCtx *agentctx.AgentContext, filter *PolicyToolFilter) (*agentctx.AgentContext, error) {
+	if agentCtx == nil || agentCtx.Tools == nil || filter == nil {
+		return agentCtx, nil
+	}
+	names := make(map[string]struct{}, len(filter.Tools))
+	for _, tool := range filter.Tools {
+		tool = strings.TrimSpace(tool)
+		if tool != "" {
+			names[tool] = struct{}{}
+		}
+	}
+	mode := strings.ToLower(strings.TrimSpace(filter.Mode))
+	var filtered []agentctx.ToolManifestEntry
+	for _, tool := range agentCtx.Tools.Tools {
+		_, listed := names[tool.Name]
+		switch mode {
+		case policyToolFilterAllowList:
+			if listed {
+				filtered = append(filtered, tool)
+			}
+		case policyToolFilterDenyList:
+			if !listed {
+				filtered = append(filtered, tool)
+			}
+		default:
+			return agentCtx, fmt.Errorf("unknown policy tool filter mode %q", filter.Mode)
+		}
+	}
+	nextCtx := *agentCtx
+	nextTools := *agentCtx.Tools
+	nextTools.Tools = filtered
+	nextCtx.Tools = &nextTools
+	return &nextCtx, nil
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
@@ -326,6 +623,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := validateSecret(ctx, agentID, secret); err != nil {
 		h.fail(w, http.StatusForbidden, "invalid agent secret", agentID, "", start, err)
 		return
+	}
+	if h.policyEnabled(ctx) {
+		inBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			h.fail(w, http.StatusBadRequest, "failed to read request body", agentID, "", start, err)
+			return
+		}
+		_ = r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewReader(inBody))
+		var payload map[string]any
+		if err := json.Unmarshal(inBody, &payload); err == nil {
+			requestedModel, _ := payload["model"].(string)
+			var denied bool
+			ctx, denied = h.applyPolicyRequestGate(w, r.Context(), agentID, ctx, policyFormatForPath(r.URL.Path), policyMode(ctx), requestedStream(payload), strings.TrimSpace(requestedModel), payload, start)
+			if denied {
+				return
+			}
+		}
 	}
 
 	// Route based on path: /v1/messages → Anthropic flow, everything else → OpenAI flow
@@ -372,6 +687,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	timeContext := currentTimeLine(agentCtx, time.Now())
 	dynamicContext := joinRuntimeContext(memoryRecall, contextBlocks.BeforeFeeds, feedCtx.Combined, contextBlocks.AfterFeeds, timeContext)
 	feeds.AppendLateContext(payload, dynamicContext)
+	h.applyPolicyDecoration(r.Context(), agentID, agentCtx, "openai", policyMode(agentCtx), downstreamStream, requestedModel, payload)
 	if err := injectManagedOpenAITools(payload, agentCtx); err != nil {
 		h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
 		return
@@ -464,6 +780,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	timeContext := currentTimeLine(agentCtx, time.Now())
 	dynamicContext := joinRuntimeContext(memoryRecall, contextBlocks.BeforeFeeds, feedCtx.Combined, contextBlocks.AfterFeeds, timeContext)
 	feeds.AppendAnthropicLateContext(payload, dynamicContext)
+	h.applyPolicyDecoration(r.Context(), agentID, agentCtx, "anthropic", policyMode(agentCtx), downstreamStream, requestedModel, payload)
 	if managedTool {
 		if err := injectManagedAnthropicTools(payload, agentCtx); err != nil {
 			h.fail(w, http.StatusNotImplemented, err.Error(), agentID, requestedModel, start, err)
@@ -863,16 +1180,14 @@ func (h *Handler) forwardManagedToolAwareResponse(w http.ResponseWriter, resp *h
 		return
 	}
 
-	copyResponseHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	if len(captured) > 0 {
-		if _, err := w.Write(captured); err != nil {
-			h.logger.LogError(agentID, requestedModel, resp.StatusCode, time.Since(start).Milliseconds(), err)
-			return
-		}
+	format := policyFormatForPath(requestPath)
+	mode := policyMode(agentCtx)
+	responseBytes, ok := h.writeBufferedResponseAfterPolicy(context.Background(), w, agentID, agentCtx, format, mode, false, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, captured, start)
+	if !ok {
+		return
 	}
 
-	h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, captured, start, pendingCursor)
+	h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, responseBytes, start, pendingCursor)
 }
 
 // streamResponse forwards the upstream response to the client and logs it.
@@ -880,6 +1195,25 @@ func (h *Handler) forwardManagedToolAwareResponse(w http.ResponseWriter, resp *h
 // committed, making it safe for the caller to retry the next model candidate.
 func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) string {
 	defer resp.Body.Close()
+
+	format := policyFormatForPath(requestPath)
+	mode := policyMode(agentCtx)
+	if h.policyEnabled(agentCtx) && !isSSE(resp.Header) {
+		captured, err := io.ReadAll(resp.Body)
+		if err != nil {
+			h.logger.LogError(agentID, requestedModel, resp.StatusCode, time.Since(start).Milliseconds(), err)
+			return "stream_read_error"
+		}
+		responseBytes, ok := h.writeBufferedResponseAfterPolicy(context.Background(), w, agentID, agentCtx, format, mode, false, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, captured, start)
+		if !ok {
+			return ""
+		}
+		h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, responseBytes, start, pendingCursor)
+		return ""
+	}
+	if h.applyPolicyStreamResponseGate(context.Background(), w, agentID, agentCtx, format, mode, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, start) {
+		return ""
+	}
 
 	var responseBuf bytes.Buffer
 	headersWritten := false
@@ -994,6 +1328,7 @@ func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext
 	} else {
 		h.logger.LogResponse(agentID, requestedModel, statusCode, latency)
 	}
+	h.scorePolicyResponse(agentID, agentCtx, policyFormatForPath(requestPath), policyMode(agentCtx), isSSE(responseHeader), requestedModel, requestEffective, statusCode, responseHeader, captured)
 }
 
 func sessionHistoryCostUSD(usage cost.Usage, costUSD float64, costKnown bool) *float64 {
@@ -1002,6 +1337,13 @@ func sessionHistoryCostUSD(usage cost.Usage, costUSD float64, costKnown bool) *f
 		return &v
 	}
 	return usage.ReportedCostUSD
+}
+
+func policyFormatForPath(path string) string {
+	if strings.HasPrefix(path, "/v1/messages") {
+		return "anthropic"
+	}
+	return "openai"
 }
 
 func (h *Handler) fail(w http.ResponseWriter, status int, msg, clawID, model string, start time.Time, err error) {
@@ -1112,7 +1454,8 @@ func copyRequestHeaders(dst, src http.Header) {
 		if isHopByHopHeader(k) ||
 			strings.EqualFold(k, "Authorization") ||
 			strings.EqualFold(k, "Accept-Encoding") ||
-			strings.EqualFold(k, "X-Claw-Consumer-Session-Epoch") {
+			strings.EqualFold(k, "X-Claw-Consumer-Session-Epoch") ||
+			strings.EqualFold(k, "X-Cllama-Policy-Origin") {
 			continue
 		}
 		for _, v := range vals {
