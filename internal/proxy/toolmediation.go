@@ -28,6 +28,7 @@ const (
 	defaultManagedToolMaxRounds         = 8
 	defaultManagedToolTimeoutMS         = 30000
 	defaultManagedToolTotalTimeout      = 120000
+	defaultManagedToolSoftDeadlineRatio = 0.9
 	defaultManagedDuplicatePolicy       = managedDuplicatePolicyReplay
 	defaultManagedDuplicateStreakCutoff = 3
 	managedKeepaliveInterval            = 250 * time.Millisecond
@@ -38,6 +39,7 @@ const (
 const (
 	EnvManagedDuplicatePolicy       = "CLLAMA_MANAGED_DUPLICATE_POLICY"
 	EnvManagedDuplicateStreakCutoff = "CLLAMA_MANAGED_DUPLICATE_STREAK_CUTOFF"
+	EnvManagedSoftDeadlineRatio     = "CLLAMA_MANAGED_SOFT_DEADLINE_RATIO"
 )
 
 const (
@@ -60,9 +62,11 @@ const mixedToolOrderInternalRetryIntervention = "mixed_tool_order_internal_retry
 const duplicateManagedToolCallIntervention = "duplicate_managed_tool_call"
 const duplicateManagedToolCallFinalizationIntervention = "duplicate_managed_tool_call_finalization"
 const managedToolBudgetFinalizationIntervention = "managed_tool_budget_finalization"
+const managedToolSoftDeadlineFinalizationIntervention = "managed_tool_soft_deadline_finalization"
 const managedToolSchemaRejectedIntervention = "managed_tool_schema_rejected"
 
 const managedToolBudgetFinalizationMessage = "Managed tool budget exhausted. Do not call tools again. Produce the best final answer now using the tool results already in this conversation. If the evidence is insufficient, say exactly what was checked and give the explicit no-go or defer decision."
+const managedToolSoftDeadlineFinalizationMessage = managedToolBudgetFinalizationMessage + " Note: data may be stale because the managed tool soft deadline was reached."
 const managedToolDuplicateFinalizationMessage = "This managed tool call was repeated with identical arguments. Do not call tools again. Produce your final answer now from the earlier tool result; if evidence is insufficient, give an explicit no-go/defer."
 
 type capturedResponse struct {
@@ -108,6 +112,7 @@ type managedToolPolicy struct {
 	MaxRounds      int
 	PerToolTimeout time.Duration
 	TotalTimeout   time.Duration
+	SoftDeadline   time.Duration
 }
 
 type managedToolDuplicateTracker struct {
@@ -201,6 +206,7 @@ type limitedReadResult struct {
 
 func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, downstreamStream bool, downstreamIncludeUsage bool, start time.Time, pendingCursor *pendingChannelCursorCommit, requestInfo *logging.RequestInfo) {
 	policy := resolveManagedToolPolicy(agentCtx)
+	loopStart := time.Now()
 	loopCtx, cancel := context.WithTimeout(r.Context(), policy.TotalTimeout)
 	defer cancel()
 	streamKeepalive := newManagedStreamKeepalive(w, downstreamStream)
@@ -221,6 +227,13 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 	finalizingAfterDuplicate := false
 
 	for {
+		if len(toolTrace) > 0 && !finalizingAfterBudget && !finalizingAfterDuplicate && managedToolSoftDeadlineReached(loopStart, policy) {
+			h.logger.LogIntervention(agentID, requestedModel, managedToolSoftDeadlineFinalizationIntervention)
+			appendOpenAISoftDeadlineFinalizationInstruction(payload)
+			disableOpenAITools(payload)
+			finalizingAfterBudget = true
+		}
+		roundStarted := time.Now()
 		dispatchResult := waitWithManagedKeepalive(streamKeepalive, managedModelWaitComment(len(toolTrace)+1), func() managedDispatchResult {
 			resp, status, msg, err := h.dispatchCandidatesJSON(loopCtx, r, agentID, requestedModel, payload, candidates, requestInfo)
 			return managedDispatchResult{
@@ -352,10 +365,23 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 		if len(toolTrace) >= policy.MaxRounds {
 			h.logger.LogIntervention(agentID, requestedModel, managedToolBudgetFinalizationIntervention)
 			toolMessages, roundTrace := buildOpenAIBudgetFinalizationRound(agentCtx, toolCalls, usage, len(toolTrace)+1, policy.MaxRounds)
-			roundTrace.Round = len(toolTrace) + 1
+			finishToolRoundTrace(&roundTrace, roundStarted)
 			toolTrace = append(toolTrace, roundTrace)
 			appendOpenAIAssistantAndToolMessages(payload, assistantMessage, toolMessages)
 			appendOpenAIFinalizationInstruction(payload)
+			disableOpenAITools(payload)
+			hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, assistantMessage, toolMessages)
+			finalizingAfterBudget = true
+			continue
+		}
+
+		if managedToolSoftDeadlineReached(loopStart, policy) {
+			h.logger.LogIntervention(agentID, requestedModel, managedToolSoftDeadlineFinalizationIntervention)
+			toolMessages, roundTrace := buildOpenAISoftDeadlineFinalizationRound(agentCtx, toolCalls, usage, len(toolTrace)+1)
+			finishToolRoundTrace(&roundTrace, roundStarted)
+			toolTrace = append(toolTrace, roundTrace)
+			appendOpenAIAssistantAndToolMessages(payload, assistantMessage, toolMessages)
+			appendOpenAISoftDeadlineFinalizationInstruction(payload)
 			disableOpenAITools(payload)
 			hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, assistantMessage, toolMessages)
 			finalizingAfterBudget = true
@@ -366,6 +392,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			h.logger.LogIntervention(agentID, requestedModel, mixedToolOrderInternalRetryIntervention)
 			toolMessages, roundTrace := buildOpenAIUnsafeMixedRetryRound(agentCtx, toolCalls, usage)
 			roundTrace.Round = len(toolTrace) + 1
+			finishToolRoundTrace(&roundTrace, roundStarted)
 			toolTrace = append(toolTrace, roundTrace)
 			appendOpenAIAssistantAndToolMessages(payload, assistantMessage, toolMessages)
 			hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, assistantMessage, toolMessages)
@@ -376,16 +403,16 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 		}
 
 		toolMessages := make([]any, 0, len(toolCalls))
-		roundTrace := sessionhistory.ToolRoundTrace{
-			Round: len(toolTrace) + 1,
-			RoundUsage: sessionhistory.Usage{
-				PromptTokens:     usage.PromptTokens,
-				CompletionTokens: usage.CompletionTokens,
-				ReportedCostUSD:  usage.ReportedCostUSD,
-			},
-		}
+		roundTrace := newToolRoundTrace(len(toolTrace)+1, usage)
 		finalizeAfterDuplicate := false
-		for _, call := range managedCalls {
+		finalizeAfterSoftDeadline := false
+		for i, call := range managedCalls {
+			if managedToolSoftDeadlineReached(loopStart, policy) {
+				h.logger.LogIntervention(agentID, requestedModel, managedToolSoftDeadlineFinalizationIntervention)
+				appendOpenAISoftDeadlineToolResults(agentCtx, managedCalls[i:], &toolMessages, &roundTrace)
+				finalizeAfterSoftDeadline = true
+				break
+			}
 			if duplicate := duplicates.ObserveOpenAI(agentCtx, call, len(toolTrace)+1); duplicate != nil {
 				outcome := duplicateManagedToolOutcome(duplicate, h.managedDuplicatePolicy)
 				h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallIntervention+":"+duplicate.CanonicalName)
@@ -401,13 +428,22 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				})
 				continue
 			}
+			toolCtx, toolCancel := managedToolExecutionContext(loopCtx, loopStart, policy)
 			execResult := waitWithManagedKeepalive(streamKeepalive, managedToolWaitComment(len(toolTrace)+1, managedToolDisplayName(agentCtx, call.Name)), func() managedOpenAIToolExecResult {
-				outcome, execErr := h.executeManagedOpenAITool(loopCtx, agentID, requestedModel, agentCtx, call, policy)
+				outcome, execErr := h.executeManagedOpenAITool(toolCtx, agentID, requestedModel, agentCtx, call, policy)
 				return managedOpenAIToolExecResult{Outcome: outcome, Err: execErr}
 			})
+			toolCancel()
 			outcome, execErr := execResult.Outcome, execResult.Err
 			if execErr != nil {
+				if managedToolSoftDeadlineErr(execErr, loopCtx, loopStart, policy) {
+					h.logger.LogIntervention(agentID, requestedModel, managedToolSoftDeadlineFinalizationIntervention)
+					appendOpenAISoftDeadlineToolResults(agentCtx, managedCalls[i:], &toolMessages, &roundTrace)
+					finalizeAfterSoftDeadline = true
+					break
+				}
 				msg := "managed tool mediation timed out"
+				finishToolRoundTrace(&roundTrace, roundStarted)
 				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, append(toolTrace, roundTrace))
 				if streamKeepalive != nil && streamKeepalive.started {
 					streamKeepalive.writeOpenAIError(jsonErrorPayload(msg))
@@ -425,12 +461,20 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				"content":      string(outcome.RawJSON),
 			})
 		}
+		finishToolRoundTrace(&roundTrace, roundStarted)
 		toolTrace = append(toolTrace, roundTrace)
 		managedAssistant := assistantMessage
 		if ownership == openAIToolsManagedThenNative {
 			managedAssistant = buildOpenAIAssistantMessage(assistantMessage, managedCalls, true)
 		}
 		appendOpenAIAssistantAndToolMessages(payload, managedAssistant, toolMessages)
+		if finalizeAfterSoftDeadline {
+			appendOpenAISoftDeadlineFinalizationInstruction(payload)
+			disableOpenAITools(payload)
+			finalizingAfterBudget = true
+			hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, managedAssistant, toolMessages)
+			continue
+		}
 		if finalizeAfterDuplicate {
 			appendOpenAIDuplicateFinalizationInstruction(payload)
 			disableOpenAITools(payload)
@@ -445,6 +489,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 
 func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, downstreamStream bool, start time.Time, pendingCursor *pendingChannelCursorCommit, requestInfo *logging.RequestInfo) {
 	policy := resolveManagedToolPolicy(agentCtx)
+	loopStart := time.Now()
 	loopCtx, cancel := context.WithTimeout(r.Context(), policy.TotalTimeout)
 	defer cancel()
 	streamKeepalive := newManagedStreamKeepalive(w, downstreamStream)
@@ -465,6 +510,13 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 	finalizingAfterDuplicate := false
 
 	for {
+		if len(toolTrace) > 0 && !finalizingAfterBudget && !finalizingAfterDuplicate && managedToolSoftDeadlineReached(loopStart, policy) {
+			h.logger.LogIntervention(agentID, requestedModel, managedToolSoftDeadlineFinalizationIntervention)
+			appendAnthropicSoftDeadlineFinalizationInstructionToPayload(payload)
+			disableAnthropicTools(payload)
+			finalizingAfterBudget = true
+		}
+		roundStarted := time.Now()
 		dispatchResult := waitWithManagedKeepalive(streamKeepalive, managedModelWaitComment(len(toolTrace)+1), func() managedDispatchResult {
 			resp, status, msg, err := h.dispatchCandidatesJSON(loopCtx, r, agentID, requestedModel, payload, candidates, requestInfo)
 			return managedDispatchResult{
@@ -596,10 +648,23 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 		if len(toolTrace) >= policy.MaxRounds {
 			h.logger.LogIntervention(agentID, requestedModel, managedToolBudgetFinalizationIntervention)
 			toolResults, roundTrace := buildAnthropicBudgetFinalizationRound(agentCtx, toolUses, usage, len(toolTrace)+1, policy.MaxRounds)
-			roundTrace.Round = len(toolTrace) + 1
+			finishToolRoundTrace(&roundTrace, roundStarted)
 			toolTrace = append(toolTrace, roundTrace)
 			toolResultMessage := appendAnthropicAssistantAndToolResultMessages(payload, assistantMessage, toolResults)
 			appendAnthropicFinalizationInstruction(toolResultMessage)
+			disableAnthropicTools(payload)
+			hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, assistantMessage, toolResultMessage)
+			finalizingAfterBudget = true
+			continue
+		}
+
+		if managedToolSoftDeadlineReached(loopStart, policy) {
+			h.logger.LogIntervention(agentID, requestedModel, managedToolSoftDeadlineFinalizationIntervention)
+			toolResults, roundTrace := buildAnthropicSoftDeadlineFinalizationRound(agentCtx, toolUses, usage, len(toolTrace)+1)
+			finishToolRoundTrace(&roundTrace, roundStarted)
+			toolTrace = append(toolTrace, roundTrace)
+			toolResultMessage := appendAnthropicAssistantAndToolResultMessages(payload, assistantMessage, toolResults)
+			appendAnthropicSoftDeadlineFinalizationInstruction(toolResultMessage)
 			disableAnthropicTools(payload)
 			hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, assistantMessage, toolResultMessage)
 			finalizingAfterBudget = true
@@ -610,6 +675,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			h.logger.LogIntervention(agentID, requestedModel, mixedToolOrderInternalRetryIntervention)
 			toolResults, roundTrace := buildAnthropicUnsafeMixedRetryRound(agentCtx, toolUses, usage)
 			roundTrace.Round = len(toolTrace) + 1
+			finishToolRoundTrace(&roundTrace, roundStarted)
 			toolTrace = append(toolTrace, roundTrace)
 			toolResultMessage := appendAnthropicAssistantAndToolResultMessages(payload, assistantMessage, toolResults)
 			hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, assistantMessage, toolResultMessage)
@@ -620,16 +686,16 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 		}
 
 		toolResults := make([]map[string]any, 0, len(toolUses))
-		roundTrace := sessionhistory.ToolRoundTrace{
-			Round: len(toolTrace) + 1,
-			RoundUsage: sessionhistory.Usage{
-				PromptTokens:     usage.PromptTokens,
-				CompletionTokens: usage.CompletionTokens,
-				ReportedCostUSD:  usage.ReportedCostUSD,
-			},
-		}
+		roundTrace := newToolRoundTrace(len(toolTrace)+1, usage)
 		finalizeAfterDuplicate := false
-		for _, call := range managedToolUses {
+		finalizeAfterSoftDeadline := false
+		for i, call := range managedToolUses {
+			if managedToolSoftDeadlineReached(loopStart, policy) {
+				h.logger.LogIntervention(agentID, requestedModel, managedToolSoftDeadlineFinalizationIntervention)
+				appendAnthropicSoftDeadlineToolResults(agentCtx, managedToolUses[i:], &toolResults, &roundTrace)
+				finalizeAfterSoftDeadline = true
+				break
+			}
 			if duplicate := duplicates.ObserveAnthropic(agentCtx, call, len(toolTrace)+1); duplicate != nil {
 				outcome := duplicateManagedToolOutcome(duplicate, h.managedDuplicatePolicy)
 				h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallIntervention+":"+duplicate.CanonicalName)
@@ -641,13 +707,22 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				toolResults = append(toolResults, anthropicToolResultBlock(call.ID, outcome.RawJSON))
 				continue
 			}
+			toolCtx, toolCancel := managedToolExecutionContext(loopCtx, loopStart, policy)
 			execResult := waitWithManagedKeepalive(streamKeepalive, managedToolWaitComment(len(toolTrace)+1, managedToolDisplayName(agentCtx, call.Name)), func() managedAnthropicToolExecResult {
-				outcome, execErr := h.executeManagedAnthropicTool(loopCtx, agentID, requestedModel, agentCtx, call, policy)
+				outcome, execErr := h.executeManagedAnthropicTool(toolCtx, agentID, requestedModel, agentCtx, call, policy)
 				return managedAnthropicToolExecResult{Outcome: outcome, Err: execErr}
 			})
+			toolCancel()
 			outcome, execErr := execResult.Outcome, execResult.Err
 			if execErr != nil {
+				if managedToolSoftDeadlineErr(execErr, loopCtx, loopStart, policy) {
+					h.logger.LogIntervention(agentID, requestedModel, managedToolSoftDeadlineFinalizationIntervention)
+					appendAnthropicSoftDeadlineToolResults(agentCtx, managedToolUses[i:], &toolResults, &roundTrace)
+					finalizeAfterSoftDeadline = true
+					break
+				}
 				msg := "managed tool mediation timed out"
+				finishToolRoundTrace(&roundTrace, roundStarted)
 				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, append(toolTrace, roundTrace))
 				if streamKeepalive != nil && streamKeepalive.started {
 					streamKeepalive.writeAnthropicError(msg)
@@ -661,12 +736,20 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			roundTrace.ToolCalls = append(roundTrace.ToolCalls, outcome.Trace)
 			toolResults = append(toolResults, anthropicToolResultBlock(call.ID, outcome.RawJSON))
 		}
+		finishToolRoundTrace(&roundTrace, roundStarted)
 		toolTrace = append(toolTrace, roundTrace)
 		managedAssistant := assistantMessage
 		if ownership == anthropicToolsManagedThenNative {
 			managedAssistant = buildAnthropicAssistantMessage(assistantMessage, managedToolUses, true)
 		}
 		toolResultMessage := appendAnthropicAssistantAndToolResultMessages(payload, managedAssistant, toolResults)
+		if finalizeAfterSoftDeadline {
+			appendAnthropicSoftDeadlineFinalizationInstruction(toolResultMessage)
+			disableAnthropicTools(payload)
+			finalizingAfterBudget = true
+			hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, managedAssistant, toolResultMessage)
+			continue
+		}
 		if finalizeAfterDuplicate {
 			appendAnthropicDuplicateFinalizationInstruction(toolResultMessage)
 			disableAnthropicTools(payload)
@@ -875,6 +958,52 @@ func resolveManagedToolPolicy(agentCtx *agentctx.AgentContext) managedToolPolicy
 		MaxRounds:      maxRounds,
 		PerToolTimeout: perTool,
 		TotalTimeout:   total,
+		SoftDeadline:   time.Duration(float64(total) * managedToolSoftDeadlineRatioFromEnv()),
+	}
+}
+
+func managedToolSoftDeadlineRatioFromEnv() float64 {
+	raw := strings.TrimSpace(os.Getenv(EnvManagedSoftDeadlineRatio))
+	if raw == "" {
+		return defaultManagedToolSoftDeadlineRatio
+	}
+	ratio, err := strconv.ParseFloat(raw, 64)
+	if err != nil || ratio <= 0 || ratio >= 1 {
+		return defaultManagedToolSoftDeadlineRatio
+	}
+	return ratio
+}
+
+func managedToolSoftDeadlineReached(loopStart time.Time, policy managedToolPolicy) bool {
+	if policy.SoftDeadline <= 0 {
+		return false
+	}
+	return !time.Now().Before(loopStart.Add(policy.SoftDeadline))
+}
+
+func managedToolExecutionContext(parent context.Context, loopStart time.Time, policy managedToolPolicy) (context.Context, context.CancelFunc) {
+	if policy.SoftDeadline <= 0 {
+		return parent, func() {}
+	}
+	softDeadline := loopStart.Add(policy.SoftDeadline)
+	if hardDeadline, ok := parent.Deadline(); ok && !softDeadline.Before(hardDeadline) {
+		return parent, func() {}
+	}
+	return context.WithDeadline(parent, softDeadline)
+}
+
+func managedToolSoftDeadlineErr(err error, hardCtx context.Context, loopStart time.Time, policy managedToolPolicy) bool {
+	return errors.Is(err, errManagedToolBudget) && hardCtx.Err() == nil && managedToolSoftDeadlineReached(loopStart, policy)
+}
+
+func finishToolRoundTrace(trace *sessionhistory.ToolRoundTrace, started time.Time) {
+	if trace == nil || started.IsZero() {
+		return
+	}
+	elapsed := time.Since(started)
+	trace.WallTimeMS = elapsed.Milliseconds()
+	if trace.WallTimeMS == 0 && elapsed > 0 {
+		trace.WallTimeMS = 1
 	}
 }
 
@@ -1828,16 +1957,22 @@ func buildAnthropicAssistantMessage(base map[string]any, calls []anthropicToolUs
 	return msg
 }
 
-func buildOpenAIUnsafeMixedRetryRound(agentCtx *agentctx.AgentContext, calls []openAIToolCall, usage cost.Usage) ([]any, sessionhistory.ToolRoundTrace) {
-	raw := mixedToolOrderRetryPayload()
-	toolMessages := make([]any, 0, len(calls))
-	roundTrace := sessionhistory.ToolRoundTrace{
+func newToolRoundTrace(round int, usage cost.Usage) sessionhistory.ToolRoundTrace {
+	return sessionhistory.ToolRoundTrace{
+		Round:        round,
+		PromptTokens: usage.PromptTokens,
 		RoundUsage: sessionhistory.Usage{
 			PromptTokens:     usage.PromptTokens,
 			CompletionTokens: usage.CompletionTokens,
 			ReportedCostUSD:  usage.ReportedCostUSD,
 		},
 	}
+}
+
+func buildOpenAIUnsafeMixedRetryRound(agentCtx *agentctx.AgentContext, calls []openAIToolCall, usage cost.Usage) ([]any, sessionhistory.ToolRoundTrace) {
+	raw := mixedToolOrderRetryPayload()
+	toolMessages := make([]any, 0, len(calls))
+	roundTrace := newToolRoundTrace(0, usage)
 	for _, call := range calls {
 		toolMessages = append(toolMessages, map[string]any{
 			"role":         "tool",
@@ -1852,13 +1987,7 @@ func buildOpenAIUnsafeMixedRetryRound(agentCtx *agentctx.AgentContext, calls []o
 func buildAnthropicUnsafeMixedRetryRound(agentCtx *agentctx.AgentContext, calls []anthropicToolUse, usage cost.Usage) ([]map[string]any, sessionhistory.ToolRoundTrace) {
 	raw := mixedToolOrderRetryPayload()
 	toolResults := make([]map[string]any, 0, len(calls))
-	roundTrace := sessionhistory.ToolRoundTrace{
-		RoundUsage: sessionhistory.Usage{
-			PromptTokens:     usage.PromptTokens,
-			CompletionTokens: usage.CompletionTokens,
-			ReportedCostUSD:  usage.ReportedCostUSD,
-		},
-	}
+	roundTrace := newToolRoundTrace(0, usage)
 	for _, call := range calls {
 		toolResults = append(toolResults, anthropicToolResultBlock(call.ID, raw))
 		roundTrace.ToolCalls = append(roundTrace.ToolCalls, buildRejectedToolTrace(agentCtx, call.Name, call.ArgumentsRaw, raw))
@@ -1868,15 +1997,17 @@ func buildAnthropicUnsafeMixedRetryRound(agentCtx *agentctx.AgentContext, calls 
 
 func buildOpenAIBudgetFinalizationRound(agentCtx *agentctx.AgentContext, calls []openAIToolCall, usage cost.Usage, round int, maxRounds int) ([]any, sessionhistory.ToolRoundTrace) {
 	raw := managedToolBudgetFinalizationPayload(maxRounds)
+	return buildOpenAIFinalizationRound(agentCtx, calls, usage, round, raw)
+}
+
+func buildOpenAISoftDeadlineFinalizationRound(agentCtx *agentctx.AgentContext, calls []openAIToolCall, usage cost.Usage, round int) ([]any, sessionhistory.ToolRoundTrace) {
+	raw := managedToolSoftDeadlineFinalizationPayload()
+	return buildOpenAIFinalizationRound(agentCtx, calls, usage, round, raw)
+}
+
+func buildOpenAIFinalizationRound(agentCtx *agentctx.AgentContext, calls []openAIToolCall, usage cost.Usage, round int, raw []byte) ([]any, sessionhistory.ToolRoundTrace) {
 	toolMessages := make([]any, 0, len(calls))
-	roundTrace := sessionhistory.ToolRoundTrace{
-		Round: round,
-		RoundUsage: sessionhistory.Usage{
-			PromptTokens:     usage.PromptTokens,
-			CompletionTokens: usage.CompletionTokens,
-			ReportedCostUSD:  usage.ReportedCostUSD,
-		},
-	}
+	roundTrace := newToolRoundTrace(round, usage)
 	for _, call := range calls {
 		toolMessages = append(toolMessages, map[string]any{
 			"role":         "tool",
@@ -1890,20 +2021,42 @@ func buildOpenAIBudgetFinalizationRound(agentCtx *agentctx.AgentContext, calls [
 
 func buildAnthropicBudgetFinalizationRound(agentCtx *agentctx.AgentContext, calls []anthropicToolUse, usage cost.Usage, round int, maxRounds int) ([]map[string]any, sessionhistory.ToolRoundTrace) {
 	raw := managedToolBudgetFinalizationPayload(maxRounds)
+	return buildAnthropicFinalizationRound(agentCtx, calls, usage, round, raw)
+}
+
+func buildAnthropicSoftDeadlineFinalizationRound(agentCtx *agentctx.AgentContext, calls []anthropicToolUse, usage cost.Usage, round int) ([]map[string]any, sessionhistory.ToolRoundTrace) {
+	raw := managedToolSoftDeadlineFinalizationPayload()
+	return buildAnthropicFinalizationRound(agentCtx, calls, usage, round, raw)
+}
+
+func buildAnthropicFinalizationRound(agentCtx *agentctx.AgentContext, calls []anthropicToolUse, usage cost.Usage, round int, raw []byte) ([]map[string]any, sessionhistory.ToolRoundTrace) {
 	toolResults := make([]map[string]any, 0, len(calls))
-	roundTrace := sessionhistory.ToolRoundTrace{
-		Round: round,
-		RoundUsage: sessionhistory.Usage{
-			PromptTokens:     usage.PromptTokens,
-			CompletionTokens: usage.CompletionTokens,
-			ReportedCostUSD:  usage.ReportedCostUSD,
-		},
-	}
+	roundTrace := newToolRoundTrace(round, usage)
 	for _, call := range calls {
 		toolResults = append(toolResults, anthropicToolResultBlock(call.ID, raw))
 		roundTrace.ToolCalls = append(roundTrace.ToolCalls, buildSyntheticToolTrace(agentCtx, call.Name, call.ArgumentsRaw, raw, http.StatusTooManyRequests))
 	}
 	return toolResults, roundTrace
+}
+
+func appendOpenAISoftDeadlineToolResults(agentCtx *agentctx.AgentContext, calls []openAIToolCall, toolMessages *[]any, roundTrace *sessionhistory.ToolRoundTrace) {
+	raw := managedToolSoftDeadlineFinalizationPayload()
+	for _, call := range calls {
+		*toolMessages = append(*toolMessages, map[string]any{
+			"role":         "tool",
+			"tool_call_id": call.ID,
+			"content":      string(raw),
+		})
+		roundTrace.ToolCalls = append(roundTrace.ToolCalls, buildSyntheticToolTrace(agentCtx, call.Name, call.ArgumentsRaw, raw, http.StatusTooManyRequests))
+	}
+}
+
+func appendAnthropicSoftDeadlineToolResults(agentCtx *agentctx.AgentContext, calls []anthropicToolUse, toolResults *[]map[string]any, roundTrace *sessionhistory.ToolRoundTrace) {
+	raw := managedToolSoftDeadlineFinalizationPayload()
+	for _, call := range calls {
+		*toolResults = append(*toolResults, anthropicToolResultBlock(call.ID, raw))
+		roundTrace.ToolCalls = append(roundTrace.ToolCalls, buildSyntheticToolTrace(agentCtx, call.Name, call.ArgumentsRaw, raw, http.StatusTooManyRequests))
+	}
 }
 
 func buildRejectedToolTrace(agentCtx *agentctx.AgentContext, name string, args json.RawMessage, raw []byte) sessionhistory.ToolCallTrace {
@@ -1936,6 +2089,15 @@ func managedToolBudgetFinalizationPayload(maxRounds int) []byte {
 		"max_rounds":     maxRounds,
 		"finalize_now":   true,
 		"tools_disabled": true,
+	})
+}
+
+func managedToolSoftDeadlineFinalizationPayload() []byte {
+	return toolErrorPayload("tool_budget_exhausted", managedToolSoftDeadlineFinalizationMessage, http.StatusTooManyRequests, map[string]any{
+		"soft_deadline":     true,
+		"data_may_be_stale": true,
+		"finalize_now":      true,
+		"tools_disabled":    true,
 	})
 }
 
@@ -2028,6 +2190,10 @@ func appendOpenAIFinalizationInstruction(payload map[string]any) {
 	appendOpenAIFinalizationInstructionMessage(payload, managedToolBudgetFinalizationMessage)
 }
 
+func appendOpenAISoftDeadlineFinalizationInstruction(payload map[string]any) {
+	appendOpenAIFinalizationInstructionMessage(payload, managedToolSoftDeadlineFinalizationMessage)
+}
+
 func appendOpenAIDuplicateFinalizationInstruction(payload map[string]any) {
 	appendOpenAIFinalizationInstructionMessage(payload, managedToolDuplicateFinalizationMessage)
 }
@@ -2063,17 +2229,61 @@ func appendAnthropicFinalizationInstruction(toolResultMessage map[string]any) {
 	appendAnthropicFinalizationInstructionMessage(toolResultMessage, managedToolBudgetFinalizationMessage)
 }
 
+func appendAnthropicSoftDeadlineFinalizationInstruction(toolResultMessage map[string]any) {
+	appendAnthropicFinalizationInstructionMessage(toolResultMessage, managedToolSoftDeadlineFinalizationMessage)
+}
+
+func appendAnthropicSoftDeadlineFinalizationInstructionToPayload(payload map[string]any) {
+	appendAnthropicFinalizationInstructionToPayload(payload, managedToolSoftDeadlineFinalizationMessage)
+}
+
 func appendAnthropicDuplicateFinalizationInstruction(toolResultMessage map[string]any) {
 	appendAnthropicFinalizationInstructionMessage(toolResultMessage, managedToolDuplicateFinalizationMessage)
 }
 
 func appendAnthropicFinalizationInstructionMessage(toolResultMessage map[string]any, message string) {
-	content, _ := toolResultMessage["content"].([]map[string]any)
-	content = append(content, map[string]any{
-		"type": "text",
-		"text": message,
+	appendAnthropicTextBlock(toolResultMessage, message)
+}
+
+func appendAnthropicFinalizationInstructionToPayload(payload map[string]any, message string) {
+	messages, _ := payload["messages"].([]any)
+	if len(messages) > 0 {
+		if last, _ := messages[len(messages)-1].(map[string]any); last != nil && last["role"] == "user" {
+			appendAnthropicTextBlock(last, message)
+			payload["messages"] = messages
+			return
+		}
+	}
+	messages = append(messages, map[string]any{
+		"role": "user",
+		"content": []map[string]any{{
+			"type": "text",
+			"text": message,
+		}},
 	})
-	toolResultMessage["content"] = content
+	payload["messages"] = messages
+}
+
+func appendAnthropicTextBlock(message map[string]any, text string) {
+	switch content := message["content"].(type) {
+	case []map[string]any:
+		content = append(content, map[string]any{
+			"type": "text",
+			"text": text,
+		})
+		message["content"] = content
+	case []any:
+		content = append(content, map[string]any{
+			"type": "text",
+			"text": text,
+		})
+		message["content"] = content
+	default:
+		message["content"] = []map[string]any{{
+			"type": "text",
+			"text": text,
+		}}
+	}
 }
 
 func disableAnthropicTools(payload map[string]any) {

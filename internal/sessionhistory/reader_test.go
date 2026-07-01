@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -73,6 +74,41 @@ func TestReadEntriesMissingFileReturnsEmpty(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("expected no entries, got %+v", entries)
+	}
+}
+
+func TestReadEntriesSpansRotationBoundary(t *testing.T) {
+	dir := t.TempDir()
+	first := rotationTestEntry("agent-span", "2026-04-01T00:00:00Z", "model-1")
+	second := rotationTestEntry("agent-span", "2026-04-01T00:01:00Z", "model-2")
+	t.Setenv(EnvSessionHistoryMaxBytes, strconv.Itoa(encodedEntryLineLen(t, first)))
+
+	r := New(dir)
+	if err := r.Record("agent-span", first); err != nil {
+		t.Fatalf("record first: %v", err)
+	}
+	if err := r.Record("agent-span", second); err != nil {
+		t.Fatalf("record second: %v", err)
+	}
+
+	entries, err := ReadEntries(dir, "agent-span", nil, 10)
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries across rotation, got %d", len(entries))
+	}
+	if entries[0].RequestedModel != "model-1" || entries[1].RequestedModel != "model-2" {
+		t.Fatalf("unexpected entries across rotation: %+v", entries)
+	}
+
+	after := time.Date(2026, 4, 1, 0, 0, 30, 0, time.UTC)
+	entries, err = ReadEntries(dir, "agent-span", &after, 10)
+	if err != nil {
+		t.Fatalf("ReadEntries after: %v", err)
+	}
+	if len(entries) != 1 || entries[0].RequestedModel != "model-2" {
+		t.Fatalf("expected only current entry after boundary filter, got %+v", entries)
 	}
 }
 

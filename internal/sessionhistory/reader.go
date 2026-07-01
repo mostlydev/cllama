@@ -37,7 +37,33 @@ func ReadEntries(baseDir, agentID string, after *time.Time, limit int) ([]Entry,
 		limit = MaxReadLimit
 	}
 
-	histPath := filepath.Join(baseDir, agentID, "history.jsonl")
+	paths, err := historyReadPaths(baseDir, agentID)
+	if err != nil {
+		return nil, err
+	}
+	if len(paths) == 0 {
+		return nil, nil
+	}
+
+	currentPath := filepath.Join(baseDir, agentID, "history.jsonl")
+	entries := make([]Entry, 0, limit)
+	for _, path := range paths {
+		more, err := readEntriesFromPath(path, after, limit-len(entries), path == currentPath)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, more...)
+		if len(entries) >= limit {
+			break
+		}
+	}
+	return entries, nil
+}
+
+func readEntriesFromPath(histPath string, after *time.Time, limit int, useIndex bool) ([]Entry, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
 	f, err := os.Open(histPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -47,13 +73,15 @@ func ReadEntries(baseDir, agentID string, after *time.Time, limit int) ([]Entry,
 	}
 	defer f.Close()
 
-	startOffset, err := readStartOffset(histPath, after)
-	if err != nil {
-		return nil, err
-	}
-	if startOffset > 0 {
-		if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+	if useIndex {
+		startOffset, err := readStartOffset(histPath, after)
+		if err != nil {
 			return nil, err
+		}
+		if startOffset > 0 {
+			if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -96,6 +124,25 @@ func ReadEntries(baseDir, agentID string, after *time.Time, limit int) ([]Entry,
 	return entries, nil
 }
 
+func historyReadPaths(baseDir, agentID string) ([]string, error) {
+	agentDir := filepath.Join(baseDir, agentID)
+	paths := []string{
+		filepath.Join(agentDir, "history.jsonl.1"),
+		filepath.Join(agentDir, "history.jsonl"),
+	}
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		out = append(out, path)
+	}
+	return out, nil
+}
+
 // SummarizeWindow scans all session-history entries for agentID strictly after
 // since. Missing history files return an empty summary.
 func SummarizeWindow(baseDir, agentID string, since time.Time) (WindowSummary, error) {
@@ -104,23 +151,38 @@ func SummarizeWindow(baseDir, agentID string, since time.Time) (WindowSummary, e
 		return summary, nil
 	}
 
-	histPath := filepath.Join(baseDir, agentID, "history.jsonl")
+	paths, err := historyReadPaths(baseDir, agentID)
+	if err != nil {
+		return summary, err
+	}
+	currentPath := filepath.Join(baseDir, agentID, "history.jsonl")
+	for _, path := range paths {
+		if err := summarizeWindowFromPath(path, since, path == currentPath, &summary); err != nil {
+			return summary, err
+		}
+	}
+	return summary, nil
+}
+
+func summarizeWindowFromPath(histPath string, since time.Time, useIndex bool, summary *WindowSummary) error {
 	f, err := os.Open(histPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return summary, nil
+			return nil
 		}
-		return summary, err
+		return err
 	}
 	defer f.Close()
 
-	startOffset, err := readStartOffset(histPath, &since)
-	if err != nil {
-		return summary, err
-	}
-	if startOffset > 0 {
-		if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
-			return summary, err
+	if useIndex {
+		startOffset, err := readStartOffset(histPath, &since)
+		if err != nil {
+			return err
+		}
+		if startOffset > 0 {
+			if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -132,11 +194,11 @@ func SummarizeWindow(baseDir, agentID string, since time.Time) (WindowSummary, e
 			if len(line) > 0 {
 				var entry Entry
 				if perr := json.Unmarshal(line, &entry); perr != nil {
-					return summary, fmt.Errorf("parse history entry: %w", perr)
+					return fmt.Errorf("parse history entry: %w", perr)
 				}
 				ts, perr := time.Parse(time.RFC3339, entry.TS)
 				if perr != nil {
-					return summary, fmt.Errorf("parse history timestamp %q: %w", entry.TS, perr)
+					return fmt.Errorf("parse history timestamp %q: %w", entry.TS, perr)
 				}
 				if ts.After(since) {
 					summary.Requests++
@@ -152,8 +214,8 @@ func SummarizeWindow(baseDir, agentID string, since time.Time) (WindowSummary, e
 			if err == io.EOF {
 				break
 			}
-			return summary, err
+			return err
 		}
 	}
-	return summary, nil
+	return nil
 }

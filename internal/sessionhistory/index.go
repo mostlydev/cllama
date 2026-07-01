@@ -158,3 +158,9 @@ func writeHistoryIndex(path string, index *historyIndexFile) error {
 	}
 	return os.WriteFile(path, append(raw, '\n'), 0o644)
 }
+
+func resetHistoryIndex(historyPath string) error {
+	return writeHistoryIndex(historyIndexPath(historyPath), &historyIndexFile{
+		Version: historyIndexVersion,
+	})
+}
