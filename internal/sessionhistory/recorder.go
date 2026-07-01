@@ -8,7 +8,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
+)
+
+const (
+	EnvSessionHistoryMaxBytes     = "CLLAMA_SESSION_HISTORY_MAX_BYTES"
+	DefaultSessionHistoryMaxBytes = int64(268435456)
 )
 
 // Payload holds either a structured JSON response or a raw SSE text stream.
@@ -42,9 +49,11 @@ type ToolCallTrace struct {
 }
 
 type ToolRoundTrace struct {
-	Round      int             `json:"round"`
-	ToolCalls  []ToolCallTrace `json:"tool_calls,omitempty"`
-	RoundUsage Usage           `json:"round_usage,omitempty"`
+	Round        int             `json:"round"`
+	WallTimeMS   int64           `json:"wall_time_ms,omitempty"`
+	PromptTokens int             `json:"prompt_tokens,omitempty"`
+	ToolCalls    []ToolCallTrace `json:"tool_calls,omitempty"`
+	RoundUsage   Usage           `json:"round_usage,omitempty"`
 }
 
 // Entry is the normalized envelope written as one JSONL line per LLM turn.
@@ -70,7 +79,8 @@ type Entry struct {
 // Recorder appends Entry values to per-agent JSONL files. It is safe for
 // concurrent use. When baseDir is empty every call to Record is a no-op.
 type Recorder struct {
-	baseDir string
+	baseDir  string
+	maxBytes int64
 
 	mu    sync.Mutex
 	files map[string]*openFile // keyed by agent ID
@@ -80,16 +90,18 @@ type Recorder struct {
 // goroutines writing for the same agent are serialised without blocking writes
 // for other agents.
 type openFile struct {
-	mu sync.Mutex
-	f  *os.File
+	mu   sync.Mutex
+	f    *os.File
+	path string
 }
 
 // New creates a Recorder that writes under baseDir. Pass an empty string to
 // obtain a no-op recorder.
 func New(baseDir string) *Recorder {
 	return &Recorder{
-		baseDir: baseDir,
-		files:   make(map[string]*openFile),
+		baseDir:  baseDir,
+		maxBytes: sessionHistoryMaxBytesFromEnv(),
+		files:    make(map[string]*openFile),
 	}
 }
 
@@ -112,19 +124,25 @@ func (r *Recorder) Record(agentID string, e Entry) error {
 		return err
 	}
 
-	of, err := r.openFor(agentID)
-	if err != nil {
-		return err
-	}
-
 	line, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
 	line = append(line, '\n')
 
+	of, err := r.openFor(agentID)
+	if err != nil {
+		return err
+	}
+
 	of.mu.Lock()
 	defer of.mu.Unlock()
+	if err := r.ensureOpenLocked(of); err != nil {
+		return err
+	}
+	if err := r.rotateIfNeeded(of, int64(len(line))); err != nil {
+		return err
+	}
 	_, err = of.f.Write(line)
 	return err
 }
@@ -141,13 +159,76 @@ func (r *Recorder) Close() error {
 	var firstErr error
 	for _, of := range r.files {
 		of.mu.Lock()
-		if err := of.f.Close(); err != nil && firstErr == nil {
-			firstErr = err
+		if of.f != nil {
+			if err := of.f.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			of.f = nil
 		}
 		of.mu.Unlock()
 	}
 	r.files = nil
 	return firstErr
+}
+
+func sessionHistoryMaxBytesFromEnv() int64 {
+	raw := strings.TrimSpace(os.Getenv(EnvSessionHistoryMaxBytes))
+	if raw == "" {
+		return DefaultSessionHistoryMaxBytes
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return DefaultSessionHistoryMaxBytes
+	}
+	return value
+}
+
+func (r *Recorder) ensureOpenLocked(of *openFile) error {
+	if of == nil || of.f != nil {
+		return nil
+	}
+	f, err := os.OpenFile(of.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o666)
+	if err != nil {
+		return err
+	}
+	of.f = f
+	return nil
+}
+
+func (r *Recorder) rotateIfNeeded(of *openFile, nextBytes int64) error {
+	if of == nil || of.f == nil || r.maxBytes <= 0 || nextBytes <= 0 {
+		return nil
+	}
+	info, err := of.f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() == 0 || info.Size()+nextBytes <= r.maxBytes {
+		return nil
+	}
+
+	if err := of.f.Close(); err != nil {
+		return err
+	}
+	of.f = nil
+
+	rotatedPath := of.path + ".1"
+	if err := os.Remove(rotatedPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Rename(of.path, rotatedPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := resetHistoryIndex(of.path); err != nil {
+		return err
+	}
+
+	f, err := os.OpenFile(of.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o666)
+	if err != nil {
+		return err
+	}
+	of.f = f
+	return nil
 }
 
 // openFor returns (creating if necessary) the openFile handle for agentID.
@@ -156,6 +237,9 @@ func (r *Recorder) Close() error {
 func (r *Recorder) openFor(agentID string) (*openFile, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.files == nil {
+		r.files = make(map[string]*openFile)
+	}
 
 	if of, ok := r.files[agentID]; ok {
 		return of, nil
@@ -172,7 +256,7 @@ func (r *Recorder) openFor(agentID string) (*openFile, error) {
 		return nil, err
 	}
 
-	of := &openFile{f: f}
+	of := &openFile{f: f, path: histPath}
 	r.files[agentID] = of
 	return of, nil
 }

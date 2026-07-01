@@ -1337,6 +1337,126 @@ func TestHandlerManagedToolMaxRoundsFinalizesWithExistingResults(t *testing.T) {
 	assertInterventionLogged(t, logs.Bytes(), managedToolBudgetFinalizationIntervention)
 }
 
+func TestHandlerManagedToolSoftDeadlineFinalizesWithStaleNote(t *testing.T) {
+	t.Setenv(EnvManagedSoftDeadlineRatio, "0.2")
+
+	var logs bytes.Buffer
+	var xaiBodies [][]byte
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		select {
+		case <-time.After(300 * time.Millisecond):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"balance":5000}`))
+		case <-r.Context().Done():
+			return
+		}
+	}))
+	defer toolSrv.Close()
+
+	xaiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read xai body: %v", err)
+		}
+		xaiBodies = append(xaiBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(xaiBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-soft",
+				"choices":[{
+					"finish_reason":"tool_calls",
+					"message":{
+						"role":"assistant",
+						"tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]
+					}
+				}],
+				"usage":{"prompt_tokens":17,"completion_tokens":3}
+			}`))
+		case 2:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal soft finalization request: %v", err)
+			}
+			if _, ok := payload["tools"]; ok {
+				t.Fatalf("expected tools disabled during soft finalization, got %+v", payload["tools"])
+			}
+			messages := payload["messages"].([]any)
+			last := messages[len(messages)-1].(map[string]any)
+			if last["role"] != "user" || !strings.Contains(last["content"].(string), "data may be stale") {
+				t.Fatalf("expected stale-data finalization instruction, got %+v", last)
+			}
+			prior := messages[len(messages)-2].(map[string]any)
+			if prior["role"] != "tool" {
+				t.Fatalf("expected synthetic soft-deadline tool result, got %+v", prior)
+			}
+			var toolResult map[string]any
+			if err := json.Unmarshal([]byte(prior["content"].(string)), &toolResult); err != nil {
+				t.Fatalf("unmarshal soft tool result: %v", err)
+			}
+			errPayload := toolResult["error"].(map[string]any)
+			details := errPayload["details"].(map[string]any)
+			if details["soft_deadline"] != true || details["data_may_be_stale"] != true {
+				t.Fatalf("expected soft-deadline details, got %+v", toolResult)
+			}
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-final","choices":[{"message":{"role":"assistant","content":"soft finalized"}}]}`))
+		default:
+			t.Fatalf("unexpected xai round %d", len(xaiBodies))
+		}
+	}))
+	defer xaiBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("xai", &provider.Provider{
+		Name: "xai", BaseURL: xaiBackend.URL + "/v1", APIKey: "xai-real", Auth: "bearer",
+	})
+
+	tools := managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")
+	tools.Policy.TotalTimeoutMS = 800
+	tools.Policy.TimeoutPerToolMS = 1000
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123", tools), logging.New(&logs), WithSessionHistory(histDir))
+
+	body := `{"model":"xai/grok-4.1-fast","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "soft finalized") {
+		t.Fatalf("expected final text after soft finalization, got %s", w.Body.String())
+	}
+	if len(xaiBodies) != 2 {
+		t.Fatalf("expected 2 xai calls including soft finalization turn, got %d", len(xaiBodies))
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected 1 attempted tool execution before soft finalization, got %d", toolCalls)
+	}
+	assertInterventionLogged(t, logs.Bytes(), managedToolSoftDeadlineFinalizationIntervention)
+
+	entries, err := sessionhistory.ReadEntries(histDir, "tiverton", nil, 10)
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if len(entries) != 1 || len(entries[0].ToolTrace) != 1 {
+		t.Fatalf("expected one recorded tool round, got %+v", entries)
+	}
+	round := entries[0].ToolTrace[0]
+	if round.PromptTokens != 17 || round.RoundUsage.PromptTokens != 17 {
+		t.Fatalf("expected prompt tokens on tool round, got %+v", round)
+	}
+	if round.WallTimeMS <= 0 {
+		t.Fatalf("expected positive wall_time_ms on tool round, got %+v", round)
+	}
+}
+
 func TestHandlerManagedToolFinalizationFailsIfModelRequestsToolsAgain(t *testing.T) {
 	xaiCalls := 0
 	toolCalls := 0
@@ -1515,6 +1635,134 @@ func TestHandlerManagedAnthropicToolMaxRoundsFinalizesWithExistingResults(t *tes
 		t.Fatalf("expected 1 real tool execution before budget finalization, got %d", toolCalls)
 	}
 	assertInterventionLogged(t, logs.Bytes(), managedToolBudgetFinalizationIntervention)
+}
+
+func TestHandlerManagedAnthropicToolSoftDeadlineFinalizesWithStaleNote(t *testing.T) {
+	t.Setenv(EnvManagedSoftDeadlineRatio, "0.2")
+
+	var logs bytes.Buffer
+	var anthropicBodies [][]byte
+	toolCalls := 0
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		toolCalls++
+		select {
+		case <-time.After(300 * time.Millisecond):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"balance":5000}`))
+		case <-r.Context().Done():
+			return
+		}
+	}))
+	defer toolSrv.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read anthropic body: %v", err)
+		}
+		anthropicBodies = append(anthropicBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(anthropicBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"msg_soft",
+				"type":"message",
+				"content":[{"type":"tool_use","id":"toolu_1","name":"trading-api.get_market_context","input":{}}],
+				"stop_reason":"tool_use",
+				"usage":{"input_tokens":13,"output_tokens":3}
+			}`))
+		case 2:
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("unmarshal anthropic soft finalization request: %v", err)
+			}
+			if _, ok := payload["tools"]; ok {
+				t.Fatalf("expected anthropic tools disabled during soft finalization, got %+v", payload["tools"])
+			}
+			messages := payload["messages"].([]any)
+			last := messages[len(messages)-1].(map[string]any)
+			if last["role"] != "user" {
+				t.Fatalf("expected final user tool_result message, got %+v", last)
+			}
+			blocks := last["content"].([]any)
+			var sawSoftResult bool
+			var sawFinalInstruction bool
+			for _, raw := range blocks {
+				block, _ := raw.(map[string]any)
+				if block == nil {
+					continue
+				}
+				switch block["type"] {
+				case "tool_result":
+					var toolResult map[string]any
+					if err := json.Unmarshal([]byte(block["content"].(string)), &toolResult); err != nil {
+						t.Fatalf("unmarshal anthropic soft tool result: %v", err)
+					}
+					errPayload := toolResult["error"].(map[string]any)
+					details := errPayload["details"].(map[string]any)
+					if details["soft_deadline"] == true && details["data_may_be_stale"] == true {
+						sawSoftResult = true
+					}
+					if block["is_error"] != true {
+						t.Fatalf("expected soft tool_result to be marked is_error, got %+v", block)
+					}
+				case "text":
+					text, _ := block["text"].(string)
+					if strings.Contains(text, "data may be stale") {
+						sawFinalInstruction = true
+					}
+				}
+			}
+			if !sawSoftResult || !sawFinalInstruction {
+				t.Fatalf("expected soft tool result and final instruction, got %+v", blocks)
+			}
+			_, _ = w.Write([]byte(`{
+				"id":"msg_final",
+				"type":"message",
+				"content":[{"type":"text","text":"soft finalized"}],
+				"stop_reason":"end_turn",
+				"usage":{"input_tokens":8,"output_tokens":4}
+			}`))
+		default:
+			t.Fatalf("unexpected anthropic round %d", len(anthropicBodies))
+		}
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("anthropic", &provider.Provider{
+		Name: "anthropic", BaseURL: backend.URL + "/v1", APIKey: "sk-ant-real", Auth: "x-api-key", APIFormat: "anthropic",
+	})
+
+	tools := managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")
+	tools.Policy.TotalTimeoutMS = 800
+	tools.Policy.TimeoutPerToolMS = 1000
+	h := NewHandler(reg, stubContextLoaderWithTools("nano-bot", "nano-bot:dummy456", tools), logging.New(&logs))
+	body := `{
+		"model":"claude-sonnet-4-20250514",
+		"messages":[{"role":"user","content":"hi"}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer nano-bot:dummy456")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "soft finalized") {
+		t.Fatalf("expected final anthropic text after soft finalization, got %s", w.Body.String())
+	}
+	if len(anthropicBodies) != 2 {
+		t.Fatalf("expected 2 anthropic calls including soft finalization turn, got %d", len(anthropicBodies))
+	}
+	if toolCalls != 1 {
+		t.Fatalf("expected 1 attempted tool execution before soft finalization, got %d", toolCalls)
+	}
+	assertInterventionLogged(t, logs.Bytes(), managedToolSoftDeadlineFinalizationIntervention)
 }
 
 func TestHandlerManagedAnthropicToolFinalizationFailsIfModelRequestsToolsAgain(t *testing.T) {
