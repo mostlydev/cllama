@@ -82,6 +82,7 @@ type dispatchJSONAttemptResult struct {
 	Response               *capturedResponse
 	AdvanceToNextCandidate bool
 	CandidateSawCooldown   bool
+	FallbackReason         string
 	ClientStatus           int
 	ClientMessage          string
 	Err                    error
@@ -764,6 +765,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 
 func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, agentID string, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestInfo *logging.RequestInfo) (*capturedResponse, int, string, error) {
 	sawCooldown := false
+	start := time.Now()
 	for i, candidate := range candidates {
 		canFallback := i+1 < len(candidates)
 		payload["model"] = candidate.UpstreamModel
@@ -780,6 +782,7 @@ func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, a
 		}
 		sawCooldown = sawCooldown || result.CandidateSawCooldown
 		if i+1 < len(candidates) {
+			h.logCandidateFailover(agentID, requestedModel, candidate, candidates[i+1], result.FallbackReason, i+1, start)
 			h.logger.LogIntervention(agentID, requestedModel, "provider_exhausted_failover")
 		}
 	}
@@ -803,10 +806,12 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 				return dispatchJSONAttemptResult{
 					AdvanceToNextCandidate: true,
 					CandidateSawCooldown:   true,
+					FallbackReason:         "provider_cooldown",
 				}
 			}
 			return dispatchJSONAttemptResult{
 				AdvanceToNextCandidate: true,
+				FallbackReason:         "provider_key_unavailable",
 			}
 		}
 
@@ -854,6 +859,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			h.logCandidateFallback(agentID, requestedModel, "transport_error")
 			return dispatchJSONAttemptResult{
 				AdvanceToNextCandidate: true,
+				FallbackReason:         "transport_error",
 				Err:                    err,
 			}
 		}
@@ -899,6 +905,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 				h.logCandidateFallback(agentID, requestedModel, reason)
 				return dispatchJSONAttemptResult{
 					AdvanceToNextCandidate: true,
+					FallbackReason:         reason,
 				}
 			}
 			limited, readErr := readBodyLimited(resp.Body, maxManagedLLMResponseBytes)
@@ -936,6 +943,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 	return dispatchJSONAttemptResult{
 		AdvanceToNextCandidate: true,
 		CandidateSawCooldown:   sawCooldown,
+		FallbackReason:         "provider_keys_exhausted",
 	}
 }
 

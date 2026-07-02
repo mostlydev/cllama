@@ -2835,6 +2835,15 @@ func TestHandlerFallsBackToDeclaredCandidateOnUpstream500(t *testing.T) {
 	}
 	assertInterventionLogged(t, logs.Bytes(), "provider_candidate_fallback:http_500")
 	assertInterventionLogged(t, logs.Bytes(), "provider_exhausted_failover")
+	assertFailoverLogged(t, logs.Bytes(), map[string]string{
+		"claw_id":       "weston",
+		"model":         "openai/gpt-4o",
+		"from_provider": "openai",
+		"from_model":    "gpt-4o",
+		"to_provider":   "openrouter",
+		"to_model":      "anthropic/claude-haiku-4-5",
+		"reason":        "http_500",
+	})
 }
 
 func TestHandlerForwardsTerminalUpstream500(t *testing.T) {
@@ -6843,6 +6852,30 @@ func assertInterventionLogged(t *testing.T, raw []byte, reason string) {
 		}
 	}
 	t.Fatalf("expected intervention %q in logs, got %v", reason, entries)
+}
+
+func assertFailoverLogged(t *testing.T, raw []byte, want map[string]string) {
+	t.Helper()
+	entries := parseLogEntries(t, raw)
+	for _, entry := range entries {
+		if entry["type"] != "failover" {
+			continue
+		}
+		matched := true
+		for key, expected := range want {
+			if entry[key] != expected {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			if entry["slot_index"].(float64) != 1 {
+				t.Fatalf("expected slot_index=1 in failover log, got %+v", entry)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected failover log %+v, got %v", want, entries)
 }
 
 func anthropicToolResultContent(messages []any, toolUseID string) (string, bool) {

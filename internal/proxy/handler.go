@@ -820,12 +820,13 @@ func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, age
 			h.fail(w, http.StatusInternalServerError, "failed to encode upstream body", agentID, requestedModel, start, err)
 			return
 		}
-		tryNextCandidate, candidateCooldown := h.dispatchWithRetry(w, r, agentID, agentCtx, requestedModel, candidate, outBody, requestOriginal, start, requestInfo, pendingCursor, downstreamStream, canFallback)
+		tryNextCandidate, candidateCooldown, fallbackReason := h.dispatchWithRetry(w, r, agentID, agentCtx, requestedModel, candidate, outBody, requestOriginal, start, requestInfo, pendingCursor, downstreamStream, canFallback)
 		if !tryNextCandidate {
 			return
 		}
 		sawCooldown = sawCooldown || candidateCooldown
 		if i+1 < len(candidates) {
+			h.logCandidateFailover(agentID, requestedModel, candidate, candidates[i+1], fallbackReason, i+1, start)
 			h.logger.LogIntervention(agentID, requestedModel, "provider_exhausted_failover")
 		}
 	}
@@ -849,8 +850,8 @@ func payloadRequestsStream(payload map[string]any) bool {
 // failures (401/403/402/quota-429 → dead, rate-limit-429 → cooldown).
 // 5xx and transport errors do NOT cause key state changes, but can advance to
 // the next declared model candidate before any downstream response is written.
-// It returns (advanceToNextCandidate, candidateSawCooldown).
-func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, candidate dispatchCandidate, outBody []byte, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit, downstreamStream bool, canFallback bool) (bool, bool) {
+// It returns (advanceToNextCandidate, candidateSawCooldown, fallbackReason).
+func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, candidate dispatchCandidate, outBody []byte, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit, downstreamStream bool, canFallback bool) (bool, bool, string) {
 	const maxKeyAttempts = 5
 	sawCooldown := false
 
@@ -858,15 +859,15 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		prov, lease, err := h.registry.SelectKey(candidate.ProviderName)
 		if err != nil {
 			if _, ok := err.(*provider.CooldownError); ok {
-				return true, true
+				return true, true, "provider_cooldown"
 			}
-			return true, sawCooldown
+			return true, sawCooldown, "provider_key_unavailable"
 		}
 
 		targetURL, err := buildUpstreamURL(prov.BaseURL, r.URL.Path, r.URL.RawQuery)
 		if err != nil {
 			h.fail(w, http.StatusBadGateway, "invalid provider URL", agentID, requestedModel, start, err)
-			return false, sawCooldown
+			return false, sawCooldown, ""
 		}
 
 		reqCtx, cancel := dispatchAttemptContext(r.Context(), downstreamStream)
@@ -874,7 +875,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		if err != nil {
 			cancel()
 			h.fail(w, http.StatusBadGateway, "failed to create upstream request", agentID, requestedModel, start, err)
-			return false, sawCooldown
+			return false, sawCooldown, ""
 		}
 		copyRequestHeaders(outReq.Header, r.Header)
 		outReq.Header.Set("Content-Type", "application/json")
@@ -891,7 +892,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		if err := applyProviderAuth(outReq, prov); err != nil {
 			cancel()
 			h.fail(w, http.StatusBadGateway, "provider auth not configured", agentID, requestedModel, start, err)
-			return false, sawCooldown
+			return false, sawCooldown, ""
 		}
 
 		h.logger.LogRequestWithInfo(agentID, requestedModel, requestInfo)
@@ -901,10 +902,11 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			if !canFallback {
 				status, msg := upstreamDispatchFailure(err)
 				h.fail(w, status, msg, agentID, requestedModel, start, err)
-				return false, sawCooldown
+				return false, sawCooldown, ""
 			}
-			h.logCandidateFallback(agentID, requestedModel, candidateFallbackReason(err))
-			return true, sawCooldown
+			reason := candidateFallbackReason(err)
+			h.logCandidateFallback(agentID, requestedModel, reason)
+			return true, sawCooldown, reason
 		}
 
 		classification := classifyResponse(resp)
@@ -951,7 +953,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 				resp.Body.Close()
 				cancel()
 				h.logCandidateFallback(agentID, requestedModel, reason)
-				return true, sawCooldown
+				return true, sawCooldown, reason
 			}
 			// Success or non-retryable status: forward response back, no key state change.
 			fallbackReason := h.forwardResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start, pendingCursor)
@@ -959,16 +961,16 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			if fallbackReason != "" {
 				if canFallback {
 					h.logCandidateFallback(agentID, requestedModel, fallbackReason)
-					return true, sawCooldown
+					return true, sawCooldown, fallbackReason
 				}
 				status, msg := streamFallbackFailure(fallbackReason)
 				h.fail(w, status, msg, agentID, requestedModel, start, fmt.Errorf("%s", fallbackReason))
 			}
-			return false, sawCooldown
+			return false, sawCooldown, ""
 		}
 	}
 
-	return true, sawCooldown
+	return true, sawCooldown, "provider_keys_exhausted"
 }
 
 func dispatchAttemptContext(parent context.Context, downstreamStream bool) (context.Context, context.CancelFunc) {
@@ -1070,7 +1072,17 @@ func isCandidateFallbackStatus(status int) bool {
 }
 
 func (h *Handler) logCandidateFallback(agentID, requestedModel, reason string) {
+	if reason == "" {
+		reason = "unknown"
+	}
 	h.logger.LogIntervention(agentID, requestedModel, "provider_candidate_fallback:"+reason)
+}
+
+func (h *Handler) logCandidateFailover(agentID, requestedModel string, from dispatchCandidate, to dispatchCandidate, reason string, slotIndex int, start time.Time) {
+	if reason == "" {
+		reason = "unknown"
+	}
+	h.logger.LogFailover(agentID, requestedModel, from.ProviderName, from.UpstreamModel, to.ProviderName, to.UpstreamModel, reason, slotIndex, time.Since(start).Milliseconds())
 }
 
 type responseClass int

@@ -167,6 +167,26 @@ func TestLogResponseWithUsageButUnknownCost(t *testing.T) {
 	}
 }
 
+func TestLogFailoverIncludesStructuredFields(t *testing.T) {
+	var buf bytes.Buffer
+	l := New(&buf)
+	l.LogFailover("weston", "openai/gpt-4o", "openai", "gpt-4o", "openrouter", "anthropic/claude-haiku-4-5", "http_500", 1, 42)
+
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v\nraw: %s", err, buf.String())
+	}
+	if entry["type"] != "failover" || entry["claw_id"] != "weston" || entry["model"] != "openai/gpt-4o" {
+		t.Fatalf("unexpected failover identity fields: %+v", entry)
+	}
+	if entry["from_provider"] != "openai" || entry["from_model"] != "gpt-4o" || entry["to_provider"] != "openrouter" || entry["to_model"] != "anthropic/claude-haiku-4-5" {
+		t.Fatalf("unexpected failover route fields: %+v", entry)
+	}
+	if entry["reason"] != "http_500" || entry["slot_index"].(float64) != 1 || entry["latency_ms"].(float64) != 42 {
+		t.Fatalf("unexpected failover reason/timing fields: %+v", entry)
+	}
+}
+
 func TestLogFeedFetchIncludesFeedFields(t *testing.T) {
 	var buf bytes.Buffer
 	l := New(&buf)
