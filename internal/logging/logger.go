@@ -84,6 +84,12 @@ type entry struct {
 	Action        string `json:"action,omitempty"`
 	Reason        string `json:"reason,omitempty"`
 	CooldownUntil string `json:"cooldown_until,omitempty"`
+	// failover event fields
+	FromProvider string `json:"from_provider,omitempty"`
+	ToProvider   string `json:"to_provider,omitempty"`
+	FromModel    string `json:"from_model,omitempty"`
+	ToModel      string `json:"to_model,omitempty"`
+	SlotIndex    *int   `json:"slot_index,omitempty"`
 }
 
 // CostInfo holds token counts and estimated cost for a single LLM request.
@@ -256,6 +262,26 @@ func (l *Logger) LogIntervention(clawID, model, reason string) {
 		Model:        model,
 		Intervention: &reasonCopy,
 	})
+}
+
+func (l *Logger) LogFailover(clawID, model, fromProvider, fromModel, toProvider, toModel, reason string, slotIndex int, latencyMS int64) {
+	e := entry{
+		TS:           time.Now().UTC().Format(time.RFC3339),
+		ClawID:       clawID,
+		Type:         "failover",
+		Model:        model,
+		FromProvider: fromProvider,
+		FromModel:    fromModel,
+		ToProvider:   toProvider,
+		ToModel:      toModel,
+		Reason:       reason,
+		SlotIndex:    ptrInt(slotIndex),
+		Intervention: nil,
+	}
+	if latencyMS > 0 {
+		e.LatencyMS = ptrI64(latencyMS)
+	}
+	l.log(e)
 }
 
 func (l *Logger) LogFeedFetch(clawID, feedName, feedURL string, statusCode int, latencyMS int64, err error) {
