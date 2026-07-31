@@ -912,6 +912,14 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			resp.Body.Close()
 			if readErr != nil {
 				cancel()
+				if canFallback {
+					h.logCandidateFallback(agentID, requestedModel, "response_read_error")
+					return dispatchJSONAttemptResult{
+						AdvanceToNextCandidate: true,
+						FallbackReason:         "response_read_error",
+						Err:                    readErr,
+					}
+				}
 				return dispatchJSONAttemptResult{
 					ClientStatus:  http.StatusBadGateway,
 					ClientMessage: "failed to read upstream response",
