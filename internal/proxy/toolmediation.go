@@ -773,7 +773,14 @@ func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, a
 		if err != nil {
 			return nil, http.StatusInternalServerError, "failed to encode upstream body", err
 		}
-		result := h.dispatchJSONWithRetry(ctx, r, agentID, requestedModel, candidate, outBody, requestInfo, canFallback)
+		upstream, err := encodeUpstreamRequest(candidate, r.URL.Path, payload, outBody)
+		if err != nil {
+			return nil, http.StatusInternalServerError, "failed to encode upstream body", err
+		}
+		if upstream.Adapter {
+			h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter")
+		}
+		result := h.dispatchJSONWithRetry(ctx, r, agentID, requestedModel, candidate, upstream, outBody, requestInfo, canFallback)
 		if result.Response != nil {
 			return result.Response, 0, "", nil
 		}
@@ -795,7 +802,9 @@ func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, a
 	return nil, http.StatusBadGateway, "no usable declared provider key after retries", err
 }
 
-func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, agentID string, requestedModel string, candidate dispatchCandidate, outBody []byte, requestInfo *logging.RequestInfo, canFallback bool) dispatchJSONAttemptResult {
+// outBody is the agent-facing chat/completions body, retained as the captured
+// request even when upstream carries the translated Responses shape.
+func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, agentID string, requestedModel string, candidate dispatchCandidate, upstream upstreamEncoding, outBody []byte, requestInfo *logging.RequestInfo, canFallback bool) dispatchJSONAttemptResult {
 	const maxKeyAttempts = 5
 	sawCooldown := false
 
@@ -815,7 +824,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			}
 		}
 
-		targetURL, err := buildUpstreamURL(prov.BaseURL, r.URL.Path, r.URL.RawQuery)
+		targetURL, err := buildUpstreamURL(prov.BaseURL, upstream.Path, r.URL.RawQuery)
 		if err != nil {
 			return dispatchJSONAttemptResult{
 				ClientStatus:  http.StatusBadGateway,
@@ -825,7 +834,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 		}
 
 		attemptCtx, cancel := context.WithTimeout(ctx, dispatchCandidateTimeoutDuration())
-		outReq, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, targetURL, bytes.NewReader(outBody))
+		outReq, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, targetURL, bytes.NewReader(upstream.Body))
 		if err != nil {
 			cancel()
 			return dispatchJSONAttemptResult{
@@ -836,6 +845,10 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 		}
 		copyRequestHeaders(outReq.Header, r.Header)
 		outReq.Header.Set("Content-Type", "application/json")
+		if upstream.Adapter {
+			// The adapter rewrites the reply, so it must arrive uncompressed.
+			outReq.Header.Set("Accept-Encoding", "identity")
+		}
 		if err := applyProviderAuth(outReq, prov); err != nil {
 			cancel()
 			return dispatchJSONAttemptResult{
@@ -898,6 +911,17 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			_ = h.registry.SaveToFile()
 			continue
 		default:
+			// Same recovery as the direct dispatch path: upstream may declare a
+			// model responses-only that the built-in list does not know yet.
+			if !upstream.Adapter && responsesAdapterEligible(r.URL.Path) && responsesOnlyUpstreamSignal(resp) {
+				if adapted, adaptErr := adaptChatBodyToResponses(outBody); adaptErr == nil {
+					resp.Body.Close()
+					cancel()
+					h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter_retry")
+					upstream = adapted
+					continue
+				}
+			}
 			if canFallback && isCandidateFallbackStatus(resp.StatusCode) {
 				reason := fmt.Sprintf("http_%d", resp.StatusCode)
 				resp.Body.Close()
@@ -927,11 +951,25 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 				}
 			}
 			cancel()
+			capturedBody := limited.Body
+			if upstream.Adapter {
+				// Translate before the mediation loop sees it: every round of
+				// the loop parses the chat/completions shape.
+				converted, convErr := responsesToChatCompletion(capturedBody)
+				if convErr != nil {
+					return dispatchJSONAttemptResult{
+						ClientStatus:  http.StatusBadGateway,
+						ClientMessage: "failed to translate responses API reply",
+						Err:           convErr,
+					}
+				}
+				capturedBody = converted
+			}
 			return dispatchJSONAttemptResult{
 				Response: &capturedResponse{
 					StatusCode:    resp.StatusCode,
 					Header:        resp.Header.Clone(),
-					Body:          limited.Body,
+					Body:          capturedBody,
 					ProviderName:  candidate.ProviderName,
 					UpstreamModel: candidate.UpstreamModel,
 					RequestBody:   append([]byte(nil), outBody...),

@@ -107,6 +107,8 @@ docker run -p 8080:8080 -p 8081:8081 \
 | `CLLAMA_FEED_MAX_TOTAL_BYTES` | `65536` | Maximum aggregate bytes of formatted feed blocks injected into one request. |
 | `CLLAMA_FEED_FETCH_TIMEOUT_MS` | `3000` | Per-fetch HTTP timeout for feed providers (sanity range 100–120000; invalid values fall back to default). Raise it when a feed provider computes synchronously under load. |
 | `CLLAMA_TOOL_SCHEMA_VALIDATION` | `on` | Set to `off` to disable pre-dispatch validation of managed tool arguments against the manifest `inputSchema`. Emergency rollback knob; validation fails open on schema constructs it does not understand. |
+| `CLLAMA_RESPONSES_API_MODELS` | | Extra provider-scoped model prefixes to dispatch through the Responses API, comma-separated as `<provider>/<model-prefix>` (e.g. `openai/gpt-6`). Adds to the built-in set; see [Responses API adapter](#responses-api-adapter). |
+| `CLLAMA_RESPONSES_API_DISABLED` | `off` | Set to `1` to disable the Responses API adapter entirely. Escape hatch for when a model no longer needs it. |
 | `OPENAI_API_KEY` | | Provider key override |
 | `ANTHROPIC_API_KEY` | | Provider key override |
 | `OPENROUTER_API_KEY` | | Provider key override |
@@ -222,6 +224,42 @@ Cost state is in-memory — resets on restart. Structured logs on stdout are the
 | `GET` | `/health` | `{"ok": true}` |
 
 Both endpoints support streaming. The Anthropic endpoint forwards `Anthropic-Version` and `Anthropic-Beta` headers and uses `X-Api-Key` authentication automatically.
+
+### Responses API adapter
+
+OpenAI's newest models reject function tools on `/v1/chat/completions` and are
+reachable only through `POST /v1/responses`. Rather than exposing a second
+inbound surface, cllama keeps its agent-facing contract at
+`/v1/chat/completions` and translates at the **provider boundary**: for models
+that require it, the outbound request is re-encoded as a Responses call and the
+reply is translated back to the chat/completions shape before anything else sees
+it.
+
+Runners need no changes, and every governance surface — audit events, session
+history, budget accounting, managed tool mediation, candidate failover — keeps
+observing the unchanged chat/completions shape. Requests routed this way emit an
+`intervention` audit event with reason `responses_api_adapter`.
+
+Selection is per declared provider/model:
+
+- **Built in:** `openai/gpt-5.6*` and `openai/gpt-5-pro*`. The list is
+  deliberately narrow — rerouting a model that already works on
+  chat/completions would be a regression.
+- **Extend** with `CLLAMA_RESPONSES_API_MODELS`.
+- **Recover automatically:** when upstream rejects a request with a message
+  naming `/v1/responses`, that request is retried once through the adapter and
+  emits `responses_api_adapter_retry`. This covers models OpenAI moves before
+  the built-in list catches up, instead of surfacing a rejection that reads like
+  a credentials problem.
+- **Disable** with `CLLAMA_RESPONSES_API_DISABLED=1`.
+
+Two behaviours are worth knowing:
+
+- Requests are dispatched **non-streaming** upstream, because the Responses
+  event taxonomy differs from chat SSE. An agent that asked for a stream
+  receives synthetic chat SSE built from the buffered completion.
+- The adapter sends `store: false`, preserving the chat/completions property
+  that a turn is not retained on the provider side.
 
 ---
 
