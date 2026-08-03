@@ -64,3 +64,77 @@ func TestComputeCost(t *testing.T) {
 		t.Errorf("expected ~%f, got %f", expected, cost)
 	}
 }
+
+func TestLookupResponsesAdapterBuiltInPricing(t *testing.T) {
+	tests := []struct {
+		model      string
+		wantInput  float64
+		wantOutput float64
+	}{
+		{model: "gpt-5.6", wantInput: 5.0, wantOutput: 30.0},
+		{model: "gpt-5.6-sol", wantInput: 5.0, wantOutput: 30.0},
+		{model: "gpt-5.6-terra", wantInput: 2.0, wantOutput: 12.0},
+		{model: "gpt-5.6-luna", wantInput: 0.20, wantOutput: 1.20},
+		{model: "gpt-5.6-terra-2026-01-01", wantInput: 2.0, wantOutput: 12.0},
+		{model: "gpt-5.6-future-tier", wantInput: 5.0, wantOutput: 30.0},
+		{model: "gpt-5-pro", wantInput: 15.0, wantOutput: 120.0},
+		{model: "gpt-5-pro-2025-10-06", wantInput: 15.0, wantOutput: 120.0},
+	}
+
+	pricing := DefaultPricing()
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			rate, ok := pricing.Lookup("openai", tt.model)
+			if !ok {
+				t.Fatalf("missing pricing for %s", tt.model)
+			}
+			if rate.InputPerMTok != tt.wantInput || rate.OutputPerMTok != tt.wantOutput {
+				t.Fatalf("%s pricing = %+v; want input=%v output=%v", tt.model, rate, tt.wantInput, tt.wantOutput)
+			}
+		})
+	}
+}
+
+func TestGPT56LongContextPricingBoundary(t *testing.T) {
+	const outputTokens = 1000
+	for _, tt := range []struct {
+		model      string
+		inputRate  float64
+		outputRate float64
+	}{
+		{model: "gpt-5.6", inputRate: 5.0, outputRate: 30.0},
+		{model: "gpt-5.6-sol", inputRate: 5.0, outputRate: 30.0},
+		{model: "gpt-5.6-terra", inputRate: 2.0, outputRate: 12.0},
+		{model: "gpt-5.6-luna", inputRate: 0.20, outputRate: 1.20},
+	} {
+		t.Run(tt.model, func(t *testing.T) {
+			rate, ok := DefaultPricing().Lookup("openai", tt.model)
+			if !ok {
+				t.Fatalf("missing %s pricing", tt.model)
+			}
+			standard := float64(272000)/1_000_000*tt.inputRate + float64(outputTokens)/1_000_000*tt.outputRate
+			if got := rate.Compute(272000, outputTokens); got != standard {
+				t.Fatalf("exactly 272K input must retain standard pricing: got %.12f want %.12f", got, standard)
+			}
+
+			tiered := float64(272001)/1_000_000*(tt.inputRate*2.0) + float64(outputTokens)/1_000_000*(tt.outputRate*1.5)
+			if got := rate.Compute(272001, outputTokens); got != tiered {
+				t.Fatalf("input above 272K must price the full request at 2x input and 1.5x output: got %.12f want %.12f", got, tiered)
+			}
+		})
+	}
+}
+
+func TestGPT5ProDoesNotUseGPT56LongContextMultiplier(t *testing.T) {
+	rate, ok := DefaultPricing().Lookup("openai", "gpt-5-pro-2025-10-06")
+	if !ok {
+		t.Fatal("missing dated gpt-5-pro pricing")
+	}
+
+	const inputTokens = 300000
+	const outputTokens = 1000
+	want := float64(inputTokens)/1_000_000*15.0 + float64(outputTokens)/1_000_000*120.0
+	if got := rate.Compute(inputTokens, outputTokens); got != want {
+		t.Fatalf("gpt-5-pro must retain uniform pricing above 272K: got %.12f want %.12f", got, want)
+	}
+}

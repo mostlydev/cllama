@@ -2,14 +2,27 @@ package cost
 
 // Rate is the per-million-token price in USD.
 type Rate struct {
-	InputPerMTok  float64
-	OutputPerMTok float64
+	InputPerMTok                float64
+	OutputPerMTok               float64
+	LongContextThresholdTokens  int
+	LongContextInputMultiplier  float64
+	LongContextOutputMultiplier float64
 }
 
 // Compute returns cost in USD for the given token counts.
 func (r Rate) Compute(inputTokens, outputTokens int) float64 {
-	return float64(inputTokens)/1_000_000*r.InputPerMTok +
-		float64(outputTokens)/1_000_000*r.OutputPerMTok
+	inputRate := r.InputPerMTok
+	outputRate := r.OutputPerMTok
+	if r.LongContextThresholdTokens > 0 && inputTokens > r.LongContextThresholdTokens {
+		if r.LongContextInputMultiplier > 0 {
+			inputRate *= r.LongContextInputMultiplier
+		}
+		if r.LongContextOutputMultiplier > 0 {
+			outputRate *= r.LongContextOutputMultiplier
+		}
+	}
+	return float64(inputTokens)/1_000_000*inputRate +
+		float64(outputTokens)/1_000_000*outputRate
 }
 
 // Pricing is a lookup table: provider -> model -> rate.
@@ -47,6 +60,29 @@ func (p *Pricing) Lookup(provider, model string) (Rate, bool) {
 // DefaultPricing returns a pricing table with well-known models.
 // Prices in USD per million tokens. Updated manually.
 func DefaultPricing() *Pricing {
+	const gpt56LongContextThreshold = 272000
+	gpt56Sol := Rate{
+		InputPerMTok:                5.0,
+		OutputPerMTok:               30.0,
+		LongContextThresholdTokens:  gpt56LongContextThreshold,
+		LongContextInputMultiplier:  2.0,
+		LongContextOutputMultiplier: 1.5,
+	}
+	gpt56Terra := Rate{
+		InputPerMTok:                2.0,
+		OutputPerMTok:               12.0,
+		LongContextThresholdTokens:  gpt56LongContextThreshold,
+		LongContextInputMultiplier:  2.0,
+		LongContextOutputMultiplier: 1.5,
+	}
+	gpt56Luna := Rate{
+		InputPerMTok:                0.20,
+		OutputPerMTok:               1.20,
+		LongContextThresholdTokens:  gpt56LongContextThreshold,
+		LongContextInputMultiplier:  2.0,
+		LongContextOutputMultiplier: 1.5,
+	}
+
 	return &Pricing{rates: map[string]map[string]Rate{
 		"anthropic": {
 			"claude-sonnet-4":   {InputPerMTok: 3.0, OutputPerMTok: 15.0},
@@ -64,6 +100,16 @@ func DefaultPricing() *Pricing {
 			"gpt-4.1-nano": {InputPerMTok: 0.10, OutputPerMTok: 0.40},
 			"o3":           {InputPerMTok: 2.0, OutputPerMTok: 8.0},
 			"o4-mini":      {InputPerMTok: 1.10, OutputPerMTok: 4.40},
+			// Exact lookup prices the unsuffixed alias as Sol. Longest-prefix
+			// lookup gives known siblings their explicit lower rates and makes
+			// an unknown future gpt-5.6 suffix inherit the conservative Sol ceiling.
+			"gpt-5.6":       gpt56Sol,
+			"gpt-5.6-sol":   gpt56Sol,
+			"gpt-5.6-terra": gpt56Terra,
+			"gpt-5.6-luna":  gpt56Luna,
+			// GPT-5 Pro uses uniform pricing across its context window; dated
+			// snapshots inherit this rate through the existing prefix lookup.
+			"gpt-5-pro": {InputPerMTok: 15.0, OutputPerMTok: 120.0},
 		},
 		"openrouter": {
 			// OpenRouter passes through to upstream providers; rates match origin pricing.

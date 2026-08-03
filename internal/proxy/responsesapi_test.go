@@ -2045,6 +2045,61 @@ func TestAdapterTurnRecordsChatShapedSessionHistoryWithCost(t *testing.T) {
 	}
 }
 
+func TestBuiltInResponsesAdapterModelRecordsAuthoritativeCost(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("expected built-in adapter dispatch, got %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_1","object":"response","status":"completed","model":"gpt-5.6-terra",
+			"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],
+			"usage":{"input_tokens":1000,"output_tokens":500,"total_tokens":1500}
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithToken("tiverton", "tiverton:dummy123"), logging.New(io.Discard),
+		WithCostTracking(cost.NewAccumulator(), cost.DefaultPricing()),
+		WithSessionHistory(histDir))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		bytes.NewBufferString(`{"model":"openai/gpt-5.6-terra","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	raw, err := os.ReadFile(filepath.Join(histDir, "tiverton", "history.jsonl"))
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &entry); err != nil {
+		t.Fatalf("unmarshal history: %v", err)
+	}
+	usage, _ := entry["usage"].(map[string]any)
+	if usage["prompt_tokens"] != float64(1000) || usage["completion_tokens"] != float64(500) {
+		t.Fatalf("unexpected usage: %#v", usage)
+	}
+	costUSD, ok := usage["reported_cost_usd"].(float64)
+	if !ok {
+		t.Fatalf("built-in adapter model must have reported_cost_usd: %#v", usage)
+	}
+	// gpt-5.6-terra: 1000 input @ $2/M + 500 output @ $12/M.
+	if want := 0.008; math.Abs(costUSD-want) > 1e-12 {
+		t.Fatalf("reported_cost_usd = %.12f; want %.12f", costUSD, want)
+	}
+}
+
 // The owner's pre-merge ask #2: a multi-round managed-tool turn through the
 // adapter must produce the same tool_trace as the identical turn on the chat
 // path. Both paths run against equivalent backends and the traces are compared
