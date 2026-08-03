@@ -1681,6 +1681,11 @@ func (h *Handler) logToolManifestState(agentID, requestedModel string, agentCtx 
 	toolsCount := 0
 	if agentCtx.Tools != nil {
 		toolsCount = len(agentCtx.Tools.Tools)
+		for _, tool := range agentCtx.Tools.Tools {
+			if _, invalid := managedToolTerminalOnSuccess(tool); invalid {
+				h.logger.LogIntervention(agentID, requestedModel, "managed_tool_terminal_annotation_invalid:"+strings.TrimSpace(tool.Name))
+			}
+		}
 	}
 	h.logger.LogToolManifest(agentID, requestedModel, manifestPresent, toolsCount)
 }
