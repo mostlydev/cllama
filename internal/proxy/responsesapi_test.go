@@ -1779,13 +1779,13 @@ func TestAdapterMediatedToolTraceMatchesChatPath(t *testing.T) {
 	normalize := func(trace []any) string {
 		for _, rawRound := range trace {
 			round, _ := rawRound.(map[string]any)
-			for _, volatile := range []string{"latency_ms", "started_at", "finished_at", "duration_ms"} {
+			for _, volatile := range []string{"latency_ms", "started_at", "finished_at", "duration_ms", "wall_time_ms"} {
 				delete(round, volatile)
 			}
 			calls, _ := round["tool_calls"].([]any)
 			for _, rawCall := range calls {
 				call, _ := rawCall.(map[string]any)
-				for _, volatile := range []string{"latency_ms", "started_at", "finished_at", "duration_ms"} {
+				for _, volatile := range []string{"latency_ms", "started_at", "finished_at", "duration_ms", "wall_time_ms"} {
 					delete(call, volatile)
 				}
 			}
