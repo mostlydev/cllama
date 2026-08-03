@@ -889,6 +889,9 @@ func (h *Handler) dispatchCandidatesJSONWithReasoning(ctx context.Context, r *ht
 		}
 		if upstream.Adapter {
 			h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter")
+			for _, mutation := range upstream.Mutations {
+				h.logger.LogIntervention(agentID, requestedModel, mutation)
+			}
 			if droppedReasoning {
 				h.logger.LogIntervention(agentID, requestedModel, responsesReasoningReplayDroppedIntervention)
 			}
@@ -1032,6 +1035,9 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 					resp.Body.Close()
 					cancel()
 					h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter_retry")
+					for _, mutation := range adapted.Mutations {
+						h.logger.LogIntervention(agentID, requestedModel, mutation)
+					}
 					if droppedReasoning {
 						h.logger.LogIntervention(agentID, requestedModel, responsesReasoningReplayDroppedIntervention)
 					}

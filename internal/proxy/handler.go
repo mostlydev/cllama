@@ -841,6 +841,9 @@ func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, age
 		}
 		if upstream.Adapter {
 			h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter")
+			for _, mutation := range upstream.Mutations {
+				h.logger.LogIntervention(agentID, requestedModel, mutation)
+			}
 		}
 		tryNextCandidate, candidateCooldown, fallbackReason := h.dispatchWithRetry(w, r, agentID, agentCtx, requestedModel, candidate, upstream, outBody, requestOriginal, start, requestInfo, pendingCursor, downstreamStream, downstreamIncludeUsage, canFallback)
 		if !tryNextCandidate {
@@ -993,6 +996,9 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 					resp.Body.Close()
 					cancel()
 					h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter_retry")
+					for _, mutation := range adapted.Mutations {
+						h.logger.LogIntervention(agentID, requestedModel, mutation)
+					}
 					upstream = adapted
 					continue
 				} else if message, ok := responsesAdapterClientError(adaptErr); ok {

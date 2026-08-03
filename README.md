@@ -110,6 +110,8 @@ docker run -p 8080:8080 -p 8081:8081 \
 | `CLLAMA_TOOL_SCHEMA_VALIDATION` | `on` | Set to `off` to disable pre-dispatch validation of managed tool arguments against the manifest `inputSchema`. Emergency rollback knob; validation fails open on schema constructs it does not understand. |
 | `CLLAMA_RESPONSES_API_MODELS` | | Extra provider-scoped model prefixes to dispatch through the Responses API, comma-separated as `<provider>/<model-prefix>` (e.g. `openai/gpt-6`). Adds to the built-in set; see [Responses API adapter](#responses-api-adapter). |
 | `CLLAMA_RESPONSES_API_DISABLED` | `off` | Set to `1` to disable the Responses API adapter entirely. Escape hatch for when a model no longer needs it. |
+| `CLLAMA_RESPONSES_DEFAULT_REASONING_EFFORT` | _(empty)_ | Reasoning effort injected into Responses-adapted requests that omit `reasoning_effort`. Explicit caller values always win. Accepted values: `none`, `minimal`, `low`, `medium`, `high` (case-insensitive); an invalid value skips injection and emits a `responses_reasoning_effort_invalid:<value>` intervention instead of poisoning every adapted request. Applied defaults emit `responses_reasoning_effort_defaulted:<value>`. |
+| `CLLAMA_RESPONSES_REQUIRED_TOOL_CHOICE_AS_AUTO` | `off` | Set to `1` to relax a caller's `tool_choice: "required"` to `"auto"` at the Responses adapter boundary. Opt-in escape hatch for runtimes that apply chat-only tool policy to scheduled turns. Every applied rewrite emits a `responses_required_tool_choice_relaxed` intervention — the mutation is never silent. |
 | `OPENAI_API_KEY` | | Provider key override |
 | `ANTHROPIC_API_KEY` | | Provider key override |
 | `OPENROUTER_API_KEY` | | Provider key override |

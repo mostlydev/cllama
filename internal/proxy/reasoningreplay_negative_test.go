@@ -46,7 +46,7 @@ func TestResponsesReasoningReplayIgnoresMismatchedCallIDs(t *testing.T) {
 			map[string]any{"role": "tool", "tool_call_id": "call_other", "content": `{"ok":true}`},
 		},
 	}
-	translated, err := chatToResponsesRequestWithReasoning(payload, replay)
+	translated, _, err := chatToResponsesRequestWithReasoning(payload, replay)
 	if err != nil {
 		t.Fatalf("translate with reasoning replay: %v", err)
 	}
