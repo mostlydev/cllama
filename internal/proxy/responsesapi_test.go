@@ -6,10 +6,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mostlydev/cllama/internal/cost"
 	"github.com/mostlydev/cllama/internal/logging"
 	"github.com/mostlydev/cllama/internal/provider"
 )
@@ -1583,5 +1586,220 @@ func TestHandlerDoesNotStreamFailedResponsesObjectAsSuccess(t *testing.T) {
 
 	if strings.Contains(w.Body.String(), "data: [DONE]") && w.Code == http.StatusOK {
 		t.Fatalf("a failed Responses object must not become a clean synthetic stream: %s", w.Body.String())
+	}
+}
+
+// The owner's pre-merge ask #1: a turn dispatched through the adapter must land
+// in session history with the same shape as a chat-path turn — chat-shaped
+// request_effective and response, populated usage, and populated
+// reported_cost_usd when pricing knows the model. Proven with a priced model
+// routed through the adapter via the env override, since cost parity cannot be
+// shown on a model the pricing table does not know.
+func TestAdapterTurnRecordsChatShapedSessionHistoryWithCost(t *testing.T) {
+	t.Setenv(EnvResponsesAPIModels, "openai/gpt-4o")
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("expected adapter dispatch, got %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_1","object":"response","status":"completed","model":"gpt-4o",
+			"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],
+			"usage":{"input_tokens":1000,"output_tokens":500,"total_tokens":1500}
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	histDir := t.TempDir()
+	h := NewHandler(reg, stubContextLoaderWithToken("tiverton", "tiverton:dummy123"), logging.New(io.Discard),
+		WithCostTracking(cost.NewAccumulator(), cost.DefaultPricing()),
+		WithSessionHistory(histDir))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		bytes.NewBufferString(`{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	raw, err := os.ReadFile(filepath.Join(histDir, "tiverton", "history.jsonl"))
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(raw, "\n"), &entry); err != nil {
+		t.Fatalf("unmarshal history entry: %v", err)
+	}
+
+	if entry["path"] != "/v1/chat/completions" {
+		t.Errorf("history path must be the agent-facing path: got %#v", entry["path"])
+	}
+	reqEff, _ := entry["request_effective"].(map[string]any)
+	if _, ok := reqEff["messages"]; !ok {
+		t.Errorf("request_effective must stay chat-shaped (messages present): got %#v", reqEff)
+	}
+	if _, ok := reqEff["input"]; ok {
+		t.Error("request_effective must not carry the translated Responses shape")
+	}
+	respPayload, _ := entry["response"].(map[string]any)
+	if respPayload["format"] != "json" {
+		t.Errorf("response format: got %#v", respPayload["format"])
+	}
+	respJSON, _ := respPayload["json"].(map[string]any)
+	if respJSON["object"] != "chat.completion" {
+		t.Errorf("recorded response must be chat-shaped: got %#v", respJSON["object"])
+	}
+	usage, _ := entry["usage"].(map[string]any)
+	if usage["prompt_tokens"] != float64(1000) || usage["completion_tokens"] != float64(500) {
+		t.Errorf("usage tokens must be populated from the translated reply: got %#v", entry["usage"])
+	}
+	costUSD, ok := usage["reported_cost_usd"].(float64)
+	if !ok || costUSD <= 0 {
+		t.Errorf("reported_cost_usd must be populated when pricing knows the model: got %#v", usage["reported_cost_usd"])
+	}
+	// gpt-4o: 1000 in @ $2.50/M + 500 out @ $10/M
+	if want := 0.0075; costUSD < want*0.99 || costUSD > want*1.01 {
+		t.Errorf("reported_cost_usd: got %v, want ~%v", costUSD, want)
+	}
+}
+
+// The owner's pre-merge ask #2: a multi-round managed-tool turn through the
+// adapter must produce the same tool_trace as the identical turn on the chat
+// path. Both paths run against equivalent backends and the traces are compared
+// structurally, with volatile fields normalized.
+func TestAdapterMediatedToolTraceMatchesChatPath(t *testing.T) {
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	alias := managedToolHashlessAliasForCanonical("trading-api.get_market_context")
+
+	runTurn := func(t *testing.T, adapter bool) []any {
+		t.Helper()
+		var rounds int
+		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rounds++
+			w.Header().Set("Content-Type", "application/json")
+			if adapter {
+				if r.URL.Path != "/v1/responses" {
+					t.Errorf("expected adapter dispatch, got %q", r.URL.Path)
+				}
+				if rounds == 1 {
+					_, _ = w.Write([]byte(`{
+						"id":"resp_1","status":"completed","model":"gpt-4o",
+						"output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"` + alias + `","arguments":"{}"}],
+						"usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}
+					}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{
+					"id":"resp_2","status":"completed","model":"gpt-4o",
+					"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],
+					"usage":{"input_tokens":7,"output_tokens":5,"total_tokens":12}
+				}`))
+				return
+			}
+			if r.URL.Path != "/v1/chat/completions" {
+				t.Errorf("expected chat dispatch, got %q", r.URL.Path)
+			}
+			if rounds == 1 {
+				_, _ = w.Write([]byte(`{
+					"id":"chatcmpl-1","model":"gpt-4o",
+					"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[
+						{"id":"call_1","type":"function","function":{"name":"` + alias + `","arguments":"{}"}}
+					]}}],
+					"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}
+				}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-2","model":"gpt-4o",
+				"choices":[{"message":{"role":"assistant","content":"done"}}],
+				"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12}
+			}`))
+		}))
+		defer backend.Close()
+
+		if adapter {
+			t.Setenv(EnvResponsesAPIModels, "openai/gpt-4o")
+		} else {
+			t.Setenv(EnvResponsesAPIModels, "")
+		}
+
+		reg := provider.NewRegistry("")
+		reg.Set("openai", &provider.Provider{
+			Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+		})
+
+		histDir := t.TempDir()
+		h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123",
+			managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")),
+			logging.New(io.Discard), WithSessionHistory(histDir))
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+			bytes.NewBufferString(`{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		if rounds != 2 {
+			t.Fatalf("expected two model rounds, got %d", rounds)
+		}
+
+		raw, err := os.ReadFile(filepath.Join(histDir, "tiverton", "history.jsonl"))
+		if err != nil {
+			t.Fatalf("read history: %v", err)
+		}
+		var entry map[string]any
+		if err := json.Unmarshal(bytes.TrimRight(raw, "\n"), &entry); err != nil {
+			t.Fatalf("unmarshal history entry: %v", err)
+		}
+		trace, _ := entry["tool_trace"].([]any)
+		if len(trace) == 0 {
+			t.Fatalf("expected a tool_trace in history, got %#v", entry["tool_trace"])
+		}
+		return trace
+	}
+
+	normalize := func(trace []any) string {
+		for _, rawRound := range trace {
+			round, _ := rawRound.(map[string]any)
+			for _, volatile := range []string{"latency_ms", "started_at", "finished_at", "duration_ms"} {
+				delete(round, volatile)
+			}
+			calls, _ := round["tool_calls"].([]any)
+			for _, rawCall := range calls {
+				call, _ := rawCall.(map[string]any)
+				for _, volatile := range []string{"latency_ms", "started_at", "finished_at", "duration_ms"} {
+					delete(call, volatile)
+				}
+			}
+		}
+		out, _ := json.Marshal(trace)
+		return string(out)
+	}
+
+	chatTrace := normalize(runTurn(t, false))
+	adapterTrace := normalize(runTurn(t, true))
+	if !strings.Contains(chatTrace, "get_market_context") {
+		t.Fatalf("trace comparison would be vacuous — tool call missing from chat trace: %s", chatTrace)
+	}
+	if chatTrace != adapterTrace {
+		t.Errorf("tool_trace diverges by request shape:\nchat:    %s\nadapter: %s", chatTrace, adapterTrace)
 	}
 }
