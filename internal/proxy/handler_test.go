@@ -3024,6 +3024,105 @@ func TestDispatchCandidatesJSONFallsBackOnUpstream500(t *testing.T) {
 	assertInterventionLogged(t, logs.Bytes(), "provider_candidate_fallback:http_500")
 }
 
+func TestDispatchCandidatesJSONFallsBackOnResponseReadError(t *testing.T) {
+	var logs bytes.Buffer
+	primaryBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"truncated"}`))
+	}))
+	defer primaryBackend.Close()
+
+	var fallbackCalls int
+	fallbackBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-2","choices":[{"message":{"content":"fallback"}}]}`))
+	}))
+	defer fallbackBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: primaryBackend.URL + "/v1", APIKey: "sk-openai", Auth: "bearer",
+	})
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: fallbackBackend.URL + "/v1", APIKey: "sk-or", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, nil, logging.New(&logs))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Content-Type", "application/json")
+	payload := map[string]any{
+		"model":    "openai/gpt-4o",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}
+	candidates := []dispatchCandidate{
+		{ProviderName: "openai", UpstreamModel: "gpt-4o"},
+		{ProviderName: "openrouter", UpstreamModel: "anthropic/claude-haiku-4-5"},
+	}
+
+	resp, status, msg, err := h.dispatchCandidatesJSON(context.Background(), req, "agent-1", "openai/gpt-4o", payload, candidates, nil)
+	if err != nil {
+		t.Fatalf("dispatchCandidatesJSON returned error status=%d msg=%q err=%v", status, msg, err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected fallback 200 response, got %+v", resp)
+	}
+	if resp.ProviderName != "openrouter" || resp.UpstreamModel != "anthropic/claude-haiku-4-5" {
+		t.Fatalf("expected fallback provider metadata, got %+v", resp)
+	}
+	if fallbackCalls != 1 {
+		t.Fatalf("expected one fallback call, got %d", fallbackCalls)
+	}
+	assertInterventionLogged(t, logs.Bytes(), "provider_candidate_fallback:response_read_error")
+	assertInterventionLogged(t, logs.Bytes(), "provider_exhausted_failover")
+	assertFailoverLogged(t, logs.Bytes(), map[string]string{
+		"claw_id":       "agent-1",
+		"model":         "openai/gpt-4o",
+		"from_provider": "openai",
+		"from_model":    "gpt-4o",
+		"to_provider":   "openrouter",
+		"to_model":      "anthropic/claude-haiku-4-5",
+		"reason":        "response_read_error",
+	})
+}
+
+func TestDispatchCandidatesJSONKeepsTerminalResponseReadErrorWithoutFallback(t *testing.T) {
+	primaryBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"truncated"}`))
+	}))
+	defer primaryBackend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: primaryBackend.URL + "/v1", APIKey: "sk-openai", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Content-Type", "application/json")
+	payload := map[string]any{
+		"model":    "openai/gpt-4o",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}
+	candidates := []dispatchCandidate{{ProviderName: "openai", UpstreamModel: "gpt-4o"}}
+
+	resp, status, msg, err := h.dispatchCandidatesJSON(context.Background(), req, "agent-1", "openai/gpt-4o", payload, candidates, nil)
+	if err == nil {
+		t.Fatal("expected response read error")
+	}
+	if resp != nil {
+		t.Fatalf("expected no response, got %+v", resp)
+	}
+	if status != http.StatusBadGateway || msg != "failed to read upstream response" {
+		t.Fatalf("unexpected terminal result: status=%d msg=%q err=%v", status, msg, err)
+	}
+}
+
 func TestDispatchCandidateTimeoutDurationFromEnv(t *testing.T) {
 	t.Setenv(EnvDispatchCandidateTimeoutMS, "1234")
 	if got := dispatchCandidateTimeoutDuration(); got != 1234*time.Millisecond {
