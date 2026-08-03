@@ -53,6 +53,7 @@ func (s stubPolicyEvaluator) Score(ctx context.Context, req PolicyScoreRequest) 
 }
 
 func TestPolicyNilEvaluatorPassthroughConformance(t *testing.T) {
+	const fixtureCreated = int64(1700000000)
 	t.Setenv(EnvPolicyURL, "")
 	cases := []struct {
 		name    string
@@ -82,7 +83,36 @@ func TestPolicyNilEvaluatorPassthroughConformance(t *testing.T) {
 			if withNil.proxyBody != baseline.proxyBody {
 				t.Fatalf("proxy response changed:\nbaseline=%s\nnil=%s", baseline.proxyBody, withNil.proxyBody)
 			}
+			if tc.format == "openai" && tc.managed && tc.stream {
+				assertOpenAIStreamCreated(t, baseline.proxyBody, fixtureCreated)
+				assertOpenAIStreamCreated(t, withNil.proxyBody, fixtureCreated)
+			}
 		})
+	}
+}
+
+func assertOpenAIStreamCreated(t *testing.T, body string, want int64) {
+	t.Helper()
+	sawEvent := false
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+			t.Fatalf("invalid OpenAI SSE event %q: %v", line, err)
+		}
+		created, ok := event["created"].(float64)
+		if !ok {
+			t.Fatalf("OpenAI SSE event has no numeric created field: %#v", event)
+		}
+		if int64(created) != want {
+			t.Errorf("OpenAI SSE created=%d, want fixture value %d", int64(created), want)
+		}
+		sawEvent = true
+	}
+	if !sawEvent {
+		t.Fatal("OpenAI SSE response contained no JSON events")
 	}
 }
 
@@ -402,7 +432,7 @@ func policyRegistryWithCapture(t *testing.T, format string, gotBody *[]byte) (*p
 			_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"backend"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"backend"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","created":1700000000,"choices":[{"message":{"role":"assistant","content":"backend"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
 	}))
 	reg := provider.NewRegistry("")
 	switch format {
