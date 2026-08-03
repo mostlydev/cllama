@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1668,8 +1669,8 @@ func TestAdapterTurnRecordsChatShapedSessionHistoryWithCost(t *testing.T) {
 		t.Errorf("reported_cost_usd must be populated when pricing knows the model: got %#v", usage["reported_cost_usd"])
 	}
 	// gpt-4o: 1000 in @ $2.50/M + 500 out @ $10/M
-	if want := 0.0075; costUSD < want*0.99 || costUSD > want*1.01 {
-		t.Errorf("reported_cost_usd: got %v, want ~%v", costUSD, want)
+	if want := 0.0075; math.Abs(costUSD-want) > 1e-12 {
+		t.Errorf("reported_cost_usd: got %v, want %v", costUSD, want)
 	}
 }
 
@@ -1794,11 +1795,53 @@ func TestAdapterMediatedToolTraceMatchesChatPath(t *testing.T) {
 		return string(out)
 	}
 
-	chatTrace := normalize(runTurn(t, false))
-	adapterTrace := normalize(runTurn(t, true))
-	if !strings.Contains(chatTrace, "get_market_context") {
-		t.Fatalf("trace comparison would be vacuous — tool call missing from chat trace: %s", chatTrace)
+	assertTraceShape := func(t *testing.T, trace []any) {
+		t.Helper()
+		if len(trace) != 1 {
+			t.Fatalf("expected one managed-tool round, got %#v", trace)
+		}
+		round, ok := trace[0].(map[string]any)
+		if !ok {
+			t.Fatalf("tool round is not an object: %#v", trace[0])
+		}
+		if round["round"] != float64(1) || round["prompt_tokens"] != float64(10) {
+			t.Errorf("unexpected round identity or prompt usage: %#v", round)
+		}
+		roundUsage, _ := round["round_usage"].(map[string]any)
+		if roundUsage["prompt_tokens"] != float64(10) || roundUsage["completion_tokens"] != float64(3) {
+			t.Errorf("round usage is incomplete: %#v", roundUsage)
+		}
+		calls, _ := round["tool_calls"].([]any)
+		if len(calls) != 1 {
+			t.Fatalf("expected one traced tool call, got %#v", round["tool_calls"])
+		}
+		call, ok := calls[0].(map[string]any)
+		if !ok {
+			t.Fatalf("tool call is not an object: %#v", calls[0])
+		}
+		if call["name"] != "trading-api.get_market_context" || call["service"] != "trading-api" {
+			t.Errorf("tool identity is incomplete: %#v", call)
+		}
+		if call["status"] != "ok" || call["status_code"] != float64(http.StatusOK) {
+			t.Errorf("tool outcome is incomplete: %#v", call)
+		}
+		arguments, argumentsOK := call["arguments"].(map[string]any)
+		if !argumentsOK || len(arguments) != 0 {
+			t.Errorf("tool arguments were not retained: %#v", call["arguments"])
+		}
+		result, _ := call["result"].(map[string]any)
+		data, _ := result["data"].(map[string]any)
+		if result["ok"] != true || result["status_code"] != float64(http.StatusOK) || data["balance"] != float64(5000) {
+			t.Errorf("tool result was not retained: %#v", call["result"])
+		}
 	}
+
+	chatRaw := runTurn(t, false)
+	adapterRaw := runTurn(t, true)
+	assertTraceShape(t, chatRaw)
+	assertTraceShape(t, adapterRaw)
+	chatTrace := normalize(chatRaw)
+	adapterTrace := normalize(adapterRaw)
 	if chatTrace != adapterTrace {
 		t.Errorf("tool_trace diverges by request shape:\nchat:    %s\nadapter: %s", chatTrace, adapterTrace)
 	}
