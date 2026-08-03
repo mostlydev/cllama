@@ -128,20 +128,40 @@ func responsesAdapterClientError(err error) (string, bool) {
 // chatToResponsesRequest translates a chat/completions request payload into a
 // Responses API request payload. The input payload is not mutated.
 func chatToResponsesRequest(payload map[string]any) (map[string]any, error) {
-	return chatToResponsesRequestWithReasoning(payload, nil)
+	translated, _, err := chatToResponsesRequestWithReasoning(payload, nil)
+	return translated, err
 }
 
-func chatToResponsesRequestWithReasoning(payload map[string]any, replay []responsesReasoningReplay) (map[string]any, error) {
+// validResponsesReasoningEfforts is the accepted value set for
+// CLLAMA_RESPONSES_DEFAULT_REASONING_EFFORT. An invalid configured value skips
+// injection (preserving pre-knob behavior) instead of poisoning every adapted
+// request with an effort upstream will reject.
+var validResponsesReasoningEfforts = map[string]struct{}{
+	"none":    {},
+	"minimal": {},
+	"low":     {},
+	"medium":  {},
+	"high":    {},
+}
+
+// chatToResponsesRequestWithReasoning translates a chat/completions payload
+// for the Responses API. The second return lists env-knob request mutations
+// (tool-choice relaxation, effort defaulting, invalid effort skipped) so
+// dispatch sites can log them as interventions — mutations must never be
+// silent in a governance proxy.
+func chatToResponsesRequestWithReasoning(payload map[string]any, replay []responsesReasoningReplay) (map[string]any, []string, error) {
 	if n, ok := payload["n"]; ok && !isSingleChoice(n) {
-		return nil, &responsesAdapterRequestError{
+		return nil, nil, &responsesAdapterRequestError{
 			message: "n must be 1 for models routed through the Responses API",
 		}
 	}
 	if field, ok := unsupportedSemanticChatField(payload); ok {
-		return nil, &responsesAdapterRequestError{
+		return nil, nil, &responsesAdapterRequestError{
 			message: fmt.Sprintf("%s is not supported for models routed through the Responses API", field),
 		}
 	}
+
+	var mutations []string
 
 	out := make(map[string]any, len(payload))
 
@@ -160,13 +180,21 @@ func chatToResponsesRequestWithReasoning(payload map[string]any, replay []respon
 	if choice, ok := payload["tool_choice"]; ok {
 		if choice == "required" && boolEnv(EnvResponsesRequiredToolChoiceAsAuto) {
 			choice = "auto"
+			mutations = append(mutations, "responses_required_tool_choice_relaxed")
 		}
 		out["tool_choice"] = chatToolChoiceToResponses(choice)
 	}
 	effort, hasEffort := payload["reasoning_effort"]
 	if !hasEffort {
-		effort = strings.TrimSpace(os.Getenv(EnvResponsesDefaultReasoningEffort))
-		hasEffort = effort != ""
+		if configured := strings.ToLower(strings.TrimSpace(os.Getenv(EnvResponsesDefaultReasoningEffort))); configured != "" {
+			if _, valid := validResponsesReasoningEfforts[configured]; valid {
+				effort = configured
+				hasEffort = true
+				mutations = append(mutations, "responses_reasoning_effort_defaulted:"+configured)
+			} else {
+				mutations = append(mutations, "responses_reasoning_effort_invalid:"+configured)
+			}
+		}
 	}
 	if hasEffort {
 		out["reasoning"] = map[string]any{"effort": effort}
@@ -187,7 +215,7 @@ func chatToResponsesRequestWithReasoning(payload map[string]any, replay []respon
 	// adapter compatible with older reasoning models that required the opt-in.
 	out["include"] = []any{"reasoning.encrypted_content"}
 
-	return out, nil
+	return out, mutations, nil
 }
 
 func unsupportedSemanticChatField(payload map[string]any) (string, bool) {
@@ -505,6 +533,9 @@ type upstreamEncoding struct {
 	Path    string
 	Body    []byte
 	Adapter bool
+	// Mutations lists env-knob request rewrites applied during translation.
+	// Dispatch sites log each as an intervention alongside the adapter event.
+	Mutations []string
 }
 
 // encodeUpstreamRequest decides whether a candidate must be dispatched through
@@ -519,7 +550,7 @@ func encodeUpstreamRequestWithReasoning(candidate dispatchCandidate, requestPath
 		return upstreamEncoding{Path: requestPath, Body: chatBody}, false, nil
 	}
 	matchingReplay, droppedReplay := responsesReasoningForCandidate(replay, candidate)
-	translated, err := chatToResponsesRequestWithReasoning(payload, matchingReplay)
+	translated, mutations, err := chatToResponsesRequestWithReasoning(payload, matchingReplay)
 	if err != nil {
 		return upstreamEncoding{}, droppedReplay, err
 	}
@@ -527,7 +558,7 @@ func encodeUpstreamRequestWithReasoning(candidate dispatchCandidate, requestPath
 	if err != nil {
 		return upstreamEncoding{}, droppedReplay, err
 	}
-	return upstreamEncoding{Path: responsesAPIPath, Body: body, Adapter: true}, droppedReplay, nil
+	return upstreamEncoding{Path: responsesAPIPath, Body: body, Adapter: true, Mutations: mutations}, droppedReplay, nil
 }
 
 func responsesReasoningForCandidate(replay []responsesReasoningReplay, candidate dispatchCandidate) ([]responsesReasoningReplay, bool) {
@@ -566,7 +597,7 @@ func adaptChatBodyToResponsesWithReasoning(chatBody []byte, replay []responsesRe
 	if err := json.Unmarshal(chatBody, &payload); err != nil {
 		return upstreamEncoding{}, err
 	}
-	translated, err := chatToResponsesRequestWithReasoning(payload, replay)
+	translated, mutations, err := chatToResponsesRequestWithReasoning(payload, replay)
 	if err != nil {
 		return upstreamEncoding{}, err
 	}
@@ -574,7 +605,7 @@ func adaptChatBodyToResponsesWithReasoning(chatBody []byte, replay []responsesRe
 	if err != nil {
 		return upstreamEncoding{}, err
 	}
-	return upstreamEncoding{Path: responsesAPIPath, Body: body, Adapter: true}, nil
+	return upstreamEncoding{Path: responsesAPIPath, Body: body, Adapter: true, Mutations: mutations}, nil
 }
 
 // responsesOnlyUpstreamSignal reports whether an upstream rejection says the

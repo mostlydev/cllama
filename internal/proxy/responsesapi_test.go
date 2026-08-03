@@ -1116,7 +1116,7 @@ func TestResponsesReasoningReplayAssociatesWithSerializedManagedCalls(t *testing
 			map[string]any{"role": "tool", "tool_call_id": "call_managed", "content": `{"ok":true}`},
 		},
 	}
-	translated, err := chatToResponsesRequestWithReasoning(payload, replay)
+	translated, _, err := chatToResponsesRequestWithReasoning(payload, replay)
 	if err != nil {
 		t.Fatalf("translate with reasoning replay: %v", err)
 	}
@@ -2358,4 +2358,102 @@ func TestAdapterMediatedToolTraceMatchesChatPath(t *testing.T) {
 	if chatTrace != adapterTrace {
 		t.Errorf("tool_trace diverges by request shape:\nchat:    %s\nadapter: %s", chatTrace, adapterTrace)
 	}
+}
+
+// Issue #47: env-knob mutations must be validated and observable.
+
+func TestChatToResponsesRequestRejectsInvalidDefaultReasoningEffort(t *testing.T) {
+	t.Setenv(EnvResponsesDefaultReasoningEffort, "turbo")
+
+	got, mutations, err := chatToResponsesRequestWithReasoning(map[string]any{"model": "gpt-5.6-luna"}, nil)
+	if err != nil {
+		t.Fatalf("chatToResponsesRequestWithReasoning: %v", err)
+	}
+	if _, ok := got["reasoning"]; ok {
+		t.Errorf("invalid configured effort must not be injected: got %#v", got["reasoning"])
+	}
+	if !containsMutation(mutations, "responses_reasoning_effort_invalid:turbo") {
+		t.Errorf("invalid effort must surface as a mutation note, got %v", mutations)
+	}
+}
+
+func TestChatToResponsesRequestNormalizesAndReportsDefaultedEffort(t *testing.T) {
+	t.Setenv(EnvResponsesDefaultReasoningEffort, " MEDIUM ")
+
+	got, mutations, err := chatToResponsesRequestWithReasoning(map[string]any{"model": "gpt-5.6-luna"}, nil)
+	if err != nil {
+		t.Fatalf("chatToResponsesRequestWithReasoning: %v", err)
+	}
+	reasoning, ok := got["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "medium" {
+		t.Errorf("expected normalized medium effort, got %#v", got["reasoning"])
+	}
+	if !containsMutation(mutations, "responses_reasoning_effort_defaulted:medium") {
+		t.Errorf("defaulted effort must surface as a mutation note, got %v", mutations)
+	}
+}
+
+func TestChatToResponsesRequestReportsRelaxedToolChoice(t *testing.T) {
+	t.Setenv(EnvResponsesRequiredToolChoiceAsAuto, "1")
+
+	payload := map[string]any{
+		"model":       "gpt-5.6-luna",
+		"tools":       []any{map[string]any{"type": "function", "function": map[string]any{"name": "t", "parameters": map[string]any{"type": "object"}}}},
+		"tool_choice": "required",
+	}
+	got, mutations, err := chatToResponsesRequestWithReasoning(payload, nil)
+	if err != nil {
+		t.Fatalf("chatToResponsesRequestWithReasoning: %v", err)
+	}
+	if got["tool_choice"] != "auto" {
+		t.Errorf("tool_choice: got %#v", got["tool_choice"])
+	}
+	if !containsMutation(mutations, "responses_required_tool_choice_relaxed") {
+		t.Errorf("relaxed tool choice must surface as a mutation note, got %v", mutations)
+	}
+}
+
+func TestChatToResponsesRequestNoMutationNotesWithoutKnobs(t *testing.T) {
+	t.Setenv(EnvResponsesDefaultReasoningEffort, "")
+	t.Setenv(EnvResponsesRequiredToolChoiceAsAuto, "")
+
+	_, mutations, err := chatToResponsesRequestWithReasoning(map[string]any{
+		"model":       "gpt-5.6-luna",
+		"tool_choice": "required",
+	}, nil)
+	if err != nil {
+		t.Fatalf("chatToResponsesRequestWithReasoning: %v", err)
+	}
+	if len(mutations) != 0 {
+		t.Errorf("no knobs set: mutations must be empty, got %v", mutations)
+	}
+}
+
+func TestEncodeUpstreamRequestCarriesMutations(t *testing.T) {
+	t.Setenv(EnvResponsesDefaultReasoningEffort, "low")
+
+	payload := map[string]any{"model": "gpt-5.6", "messages": []any{}}
+	body, _ := json.Marshal(payload)
+	encoded, _, err := encodeUpstreamRequestWithReasoning(dispatchCandidate{
+		ProviderName:  "openai",
+		UpstreamModel: "gpt-5.6",
+	}, "/v1/chat/completions", payload, body, nil)
+	if err != nil {
+		t.Fatalf("encodeUpstreamRequestWithReasoning: %v", err)
+	}
+	if !encoded.Adapter {
+		t.Fatal("expected adapter encoding for responses-only model")
+	}
+	if !containsMutation(encoded.Mutations, "responses_reasoning_effort_defaulted:low") {
+		t.Errorf("upstreamEncoding must carry mutation notes, got %v", encoded.Mutations)
+	}
+}
+
+func containsMutation(mutations []string, want string) bool {
+	for _, m := range mutations {
+		if m == want {
+			return true
+		}
+	}
+	return false
 }
