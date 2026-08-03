@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -166,6 +167,70 @@ func TestManagedDispatchKeepsTerminal502WhenNoFallbackRemains(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "failed to read upstream response") {
 		t.Errorf("expected the existing terminal message preserved, got %s", w.Body.String())
+	}
+}
+
+// A response read failure can happen after an earlier key in the same provider
+// was rate-limited. Preserve that cooldown signal while advancing so an
+// exhausted candidate list retains the more accurate 503 classification.
+func TestManagedDispatchPreservesCooldownAcrossResponseBodyReadFallback(t *testing.T) {
+	var rateLimitedCalls, readFailureCalls int
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer sk-rate-limited":
+			rateLimitedCalls++
+			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+		case "Bearer sk-read-failure":
+			readFailureCalls++
+			conn, buf, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			defer conn.Close()
+			_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n")
+			_, _ = buf.WriteString(`{"id":"chatcmpl-1","choices":[`)
+			_ = buf.Flush()
+		default:
+			t.Errorf("unexpected authorization header %q", r.Header.Get("Authorization"))
+		}
+	}))
+	defer primary.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: primary.URL + "/v1", APIKey: "sk-rate-limited", Auth: "bearer",
+	})
+	if _, err := reg.AddRuntimeKey("openai", "read-failure", "sk-read-failure"); err != nil {
+		t.Fatalf("AddRuntimeKey: %v", err)
+	}
+
+	h := NewHandler(reg, nil, logging.New(io.Discard))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Content-Type", "application/json")
+	payload := map[string]any{
+		"model":    "openai/gpt-4o",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}
+	candidates := []dispatchCandidate{
+		{ProviderName: "openai", UpstreamModel: "gpt-4o"},
+		{ProviderName: "missing", UpstreamModel: "fallback-model"},
+	}
+
+	resp, status, msg, err := h.dispatchCandidatesJSON(context.Background(), req, "agent-1", "openai/gpt-4o", payload, candidates, nil)
+	if err == nil {
+		t.Fatal("expected exhausted candidate error")
+	}
+	if resp != nil {
+		t.Fatalf("expected no response, got %+v", resp)
+	}
+	if status != http.StatusServiceUnavailable || msg != "all declared provider keys in cooldown" {
+		t.Fatalf("cooldown classification was lost: status=%d msg=%q err=%v", status, msg, err)
+	}
+	if rateLimitedCalls != 1 || readFailureCalls != 1 {
+		t.Fatalf("expected both primary keys once, got rate-limited=%d read-failure=%d", rateLimitedCalls, readFailureCalls)
 	}
 }
 
