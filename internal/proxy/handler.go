@@ -49,6 +49,7 @@ type Handler struct {
 	adminToken                   string
 	snapshots                    *ContextSnapshotStore
 	toolSchemaValidation         bool
+	toolArgPruneSentinels        bool
 	managedDuplicatePolicy       string
 	managedDuplicateStreakCutoff int
 	policyEvaluator              PolicyEvaluator
@@ -187,6 +188,7 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 		snapshots:                    NewContextSnapshotStore(),
 		feedBudget:                   feeds.DefaultBudget(),
 		toolSchemaValidation:         toolSchemaValidationFromEnv(),
+		toolArgPruneSentinels:        toolArgPruneSentinelsFromEnv(),
 		managedDuplicatePolicy:       managedToolDuplicatePolicyFromEnv(),
 		managedDuplicateStreakCutoff: managedToolDuplicateStreakCutoffFromEnv(),
 		policyFailMode:               policyFailModeFromEnv(),
