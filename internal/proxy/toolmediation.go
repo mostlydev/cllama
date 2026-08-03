@@ -775,6 +775,9 @@ func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, a
 		}
 		upstream, err := encodeUpstreamRequest(candidate, r.URL.Path, payload, outBody)
 		if err != nil {
+			if message, ok := responsesAdapterClientError(err); ok {
+				return nil, http.StatusBadRequest, message, err
+			}
 			return nil, http.StatusInternalServerError, "failed to encode upstream body", err
 		}
 		if upstream.Adapter {
@@ -920,6 +923,14 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 					h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter_retry")
 					upstream = adapted
 					continue
+				} else if message, ok := responsesAdapterClientError(adaptErr); ok {
+					resp.Body.Close()
+					cancel()
+					return dispatchJSONAttemptResult{
+						ClientStatus:  http.StatusBadRequest,
+						ClientMessage: message,
+						Err:           adaptErr,
+					}
 				}
 			}
 			if canFallback && isCandidateFallbackStatus(resp.StatusCode) {
@@ -970,6 +981,15 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 				// the loop parses the chat/completions shape.
 				converted, convErr := responsesToChatCompletion(capturedBody)
 				if convErr != nil {
+					if canFallback {
+						h.logCandidateFallback(agentID, requestedModel, "responses_adapter_error")
+						return dispatchJSONAttemptResult{
+							AdvanceToNextCandidate: true,
+							CandidateSawCooldown:   sawCooldown,
+							FallbackReason:         "responses_adapter_error",
+							Err:                    convErr,
+						}
+					}
 					return dispatchJSONAttemptResult{
 						ClientStatus:  http.StatusBadGateway,
 						ClientMessage: "failed to translate responses API reply",

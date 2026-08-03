@@ -3,6 +3,8 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -87,16 +89,48 @@ func boolEnv(name string) bool {
 // forwarding an unknown field to /v1/responses turns into a 400 that the agent
 // sees as an opaque upstream failure.
 var chatPassthroughFields = map[string]bool{
-	"model":               true,
-	"temperature":         true,
-	"top_p":               true,
-	"parallel_tool_calls": true,
-	"metadata":            true,
+	"model":                  true,
+	"temperature":            true,
+	"top_p":                  true,
+	"parallel_tool_calls":    true,
+	"metadata":               true,
+	"user":                   true,
+	"safety_identifier":      true,
+	"prompt_cache_key":       true,
+	"prompt_cache_retention": true,
+	"service_tier":           true,
+}
+
+type responsesAdapterRequestError struct {
+	message string
+}
+
+func (e *responsesAdapterRequestError) Error() string {
+	return e.message
+}
+
+func responsesAdapterClientError(err error) (string, bool) {
+	var requestErr *responsesAdapterRequestError
+	if !errors.As(err, &requestErr) {
+		return "", false
+	}
+	return requestErr.message, true
 }
 
 // chatToResponsesRequest translates a chat/completions request payload into a
 // Responses API request payload. The input payload is not mutated.
 func chatToResponsesRequest(payload map[string]any) (map[string]any, error) {
+	if n, ok := payload["n"]; ok && !isSingleChoice(n) {
+		return nil, &responsesAdapterRequestError{
+			message: "n must be 1 for models routed through the Responses API",
+		}
+	}
+	if field, ok := unsupportedSemanticChatField(payload); ok {
+		return nil, &responsesAdapterRequestError{
+			message: fmt.Sprintf("%s is not supported for models routed through the Responses API", field),
+		}
+	}
+
 	out := make(map[string]any, len(payload))
 
 	for key, value := range payload {
@@ -130,6 +164,96 @@ func chatToResponsesRequest(payload map[string]any) (map[string]any, error) {
 	out["store"] = false
 
 	return out, nil
+}
+
+func unsupportedSemanticChatField(payload map[string]any) (string, bool) {
+	for _, field := range []string{"frequency_penalty", "presence_penalty"} {
+		if value, ok := payload[field]; ok && !isZeroOrNil(value) {
+			return field, true
+		}
+	}
+	if value, ok := payload["logprobs"]; ok {
+		disabled, valid := value.(bool)
+		if !valid || disabled {
+			return "logprobs", true
+		}
+	}
+	if value, ok := payload["logit_bias"]; ok && !isEmptyMapOrNil(value) {
+		return "logit_bias", true
+	}
+	if value, ok := payload["stop"]; ok && !isEmptyStop(value) {
+		return "stop", true
+	}
+	if value, ok := payload["seed"]; ok && value != nil {
+		return "seed", true
+	}
+	if value, ok := payload["store"]; ok {
+		disabled, valid := value.(bool)
+		if !valid || disabled {
+			return "store", true
+		}
+	}
+	return "", false
+}
+
+func isZeroOrNil(raw any) bool {
+	if raw == nil {
+		return true
+	}
+	switch value := raw.(type) {
+	case float64:
+		return value == 0
+	case float32:
+		return value == 0
+	case int:
+		return value == 0
+	case int64:
+		return value == 0
+	case json.Number:
+		parsed, err := value.Float64()
+		return err == nil && parsed == 0
+	default:
+		return false
+	}
+}
+
+func isEmptyMapOrNil(raw any) bool {
+	if raw == nil {
+		return true
+	}
+	value, ok := raw.(map[string]any)
+	return ok && len(value) == 0
+}
+
+func isEmptyStop(raw any) bool {
+	switch value := raw.(type) {
+	case nil:
+		return true
+	case string:
+		return value == ""
+	case []any:
+		return len(value) == 0
+	default:
+		return false
+	}
+}
+
+func isSingleChoice(raw any) bool {
+	switch value := raw.(type) {
+	case float64:
+		return value == 1
+	case float32:
+		return value == 1
+	case int:
+		return value == 1
+	case int64:
+		return value == 1
+	case json.Number:
+		parsed, err := value.Float64()
+		return err == nil && parsed == 1
+	default:
+		return false
+	}
 }
 
 // chatMessagesToResponsesInput converts chat messages into Responses input
@@ -340,8 +464,8 @@ func adaptChatBodyToResponses(chatBody []byte) (upstreamEncoding, error) {
 // model is reachable only through /v1/responses. OpenAI returns this as a 400
 // for "function tools with reasoning" and as a 404 for responses-only models.
 //
-// The body is peeked and restored, so a caller that decides not to retry can
-// still forward the original rejection to the agent.
+// The body prefix is inspected and the entire stream is restored, so a caller
+// that decides not to retry can still forward the original rejection.
 func responsesOnlyUpstreamSignal(resp *http.Response) bool {
 	if resp.Body == nil {
 		return false
@@ -349,9 +473,15 @@ func responsesOnlyUpstreamSignal(resp *http.Response) bool {
 	if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusNotFound {
 		return false
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(body))
+	original := resp.Body
+	body, err := io.ReadAll(io.LimitReader(original, 4096))
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{
+		Reader: io.MultiReader(bytes.NewReader(body), original),
+		Closer: original,
+	}
 	if err != nil {
 		return false
 	}
@@ -371,7 +501,7 @@ func bodyNamesResponsesAPI(body []byte) bool {
 //
 // When the agent asked for a stream, the buffered completion is re-emitted as
 // synthetic chat SSE, because the Responses event taxonomy is not the chat one.
-func adaptResponsesResponse(resp *http.Response, downstreamStream bool) error {
+func adaptResponsesResponse(resp *http.Response, downstreamStream, downstreamIncludeUsage bool) error {
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
@@ -387,7 +517,7 @@ func adaptResponsesResponse(resp *http.Response, downstreamStream bool) error {
 
 	contentType := "application/json"
 	if downstreamStream && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		sse, err := chatCompletionToSSE(converted)
+		sse, err := chatCompletionToSSE(converted, downstreamIncludeUsage)
 		if err != nil {
 			return err
 		}
@@ -416,12 +546,19 @@ func responsesToChatCompletion(body []byte) ([]byte, error) {
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, err
 	}
+	if err := validateResponsesStatus(resp); err != nil {
+		return nil, err
+	}
 	output, ok := resp["output"].([]any)
 	if !ok {
+		if resp["object"] == "response" || stringField(resp, "status") != "" {
+			return nil, fmt.Errorf("responses API reply is missing an output array")
+		}
 		return body, nil
 	}
 
 	var content any
+	var refusal string
 	var toolCalls []any
 	for _, raw := range output {
 		item, ok := raw.(map[string]any)
@@ -432,6 +569,9 @@ func responsesToChatCompletion(body []byte) ([]byte, error) {
 		case "message":
 			if text, ok := responsesOutputText(item); ok {
 				content = text
+			}
+			if explanation, ok := responsesOutputRefusal(item); ok {
+				refusal = explanation
 			}
 		case "function_call":
 			toolCalls = append(toolCalls, map[string]any{
@@ -444,6 +584,9 @@ func responsesToChatCompletion(body []byte) ([]byte, error) {
 	}
 
 	message := map[string]any{"role": "assistant", "content": content}
+	if refusal != "" {
+		message["refusal"] = refusal
+	}
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
 	}
@@ -474,10 +617,27 @@ func responsesToChatCompletion(body []byte) ([]byte, error) {
 	return json.Marshal(chat)
 }
 
+func validateResponsesStatus(resp map[string]any) error {
+	status := stringField(resp, "status")
+	switch status {
+	case "failed", "cancelled", "in_progress", "queued":
+		message := ""
+		if failure, ok := resp["error"].(map[string]any); ok {
+			message = stringField(failure, "message")
+		}
+		if message == "" {
+			return fmt.Errorf("responses API returned status %q", status)
+		}
+		return fmt.Errorf("responses API returned status %q: %s", status, message)
+	default:
+		return nil
+	}
+}
+
 // chatCompletionToSSE re-emits a buffered chat completion as a chat SSE stream.
 // The adapter always dispatches non-streaming upstream, so this is what an agent
 // that asked for a stream receives.
-func chatCompletionToSSE(body []byte) ([]byte, error) {
+func chatCompletionToSSE(body []byte, includeUsage bool) ([]byte, error) {
 	var completion map[string]any
 	if err := json.Unmarshal(body, &completion); err != nil {
 		return nil, err
@@ -523,6 +683,9 @@ func chatCompletionToSSE(body []byte) ([]byte, error) {
 	if content, ok := message["content"].(string); ok && content != "" {
 		writeSSEChunk(&stream, deltaChunk(map[string]any{"content": content}))
 	}
+	if refusal, ok := message["refusal"].(string); ok && refusal != "" {
+		writeSSEChunk(&stream, deltaChunk(map[string]any{"refusal": refusal}))
+	}
 	if calls, ok := message["tool_calls"].([]any); ok {
 		for i, raw := range calls {
 			call, ok := raw.(map[string]any)
@@ -551,7 +714,7 @@ func chatCompletionToSSE(body []byte) ([]byte, error) {
 		"finish_reason": finishReason,
 	}}))
 
-	if usage, ok := completion["usage"]; ok {
+	if usage, ok := completion["usage"]; ok && includeUsage {
 		final := envelope([]any{})
 		final["usage"] = usage
 		writeSSEChunk(&stream, final)
@@ -584,10 +747,33 @@ func responsesOutputText(item map[string]any) (string, bool) {
 	return joined, found
 }
 
+func responsesOutputRefusal(item map[string]any) (string, bool) {
+	parts, ok := item["content"].([]any)
+	if !ok {
+		return "", false
+	}
+	var joined string
+	found := false
+	for _, raw := range parts {
+		part, ok := raw.(map[string]any)
+		if !ok || part["type"] != "refusal" {
+			continue
+		}
+		if explanation, ok := part["refusal"].(string); ok {
+			joined += explanation
+			found = true
+		}
+	}
+	return joined, found
+}
+
 func responsesFinishReason(resp map[string]any, hasToolCalls bool) string {
 	if details, ok := resp["incomplete_details"].(map[string]any); ok {
-		if stringField(details, "reason") == "max_output_tokens" {
+		switch stringField(details, "reason") {
+		case "max_output_tokens":
 			return "length"
+		case "content_filter":
+			return "content_filter"
 		}
 	}
 	if hasToolCalls {
@@ -639,6 +825,9 @@ func chatToolsToResponsesTools(tools []any) []any {
 		flat := map[string]any{"type": "function"}
 		for key, value := range fn {
 			flat[key] = value
+		}
+		if _, ok := flat["strict"]; !ok {
+			flat["strict"] = false
 		}
 		out = append(out, flat)
 	}

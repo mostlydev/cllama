@@ -818,6 +818,10 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit) {
 	sawCooldown := false
 	downstreamStream := payloadRequestsStream(payload)
+	downstreamIncludeUsage := false
+	if responsesAdapterEligible(r.URL.Path) {
+		_, downstreamIncludeUsage = requestedOpenAIStreamOptions(payload)
+	}
 	for i, candidate := range candidates {
 		canFallback := i+1 < len(candidates)
 		payload["model"] = candidate.UpstreamModel
@@ -828,13 +832,17 @@ func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, age
 		}
 		upstream, err := encodeUpstreamRequest(candidate, r.URL.Path, payload, outBody)
 		if err != nil {
+			if message, ok := responsesAdapterClientError(err); ok {
+				h.fail(w, http.StatusBadRequest, message, agentID, requestedModel, start, err)
+				return
+			}
 			h.fail(w, http.StatusInternalServerError, "failed to encode upstream body", agentID, requestedModel, start, err)
 			return
 		}
 		if upstream.Adapter {
 			h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter")
 		}
-		tryNextCandidate, candidateCooldown, fallbackReason := h.dispatchWithRetry(w, r, agentID, agentCtx, requestedModel, candidate, upstream, outBody, requestOriginal, start, requestInfo, pendingCursor, downstreamStream, canFallback)
+		tryNextCandidate, candidateCooldown, fallbackReason := h.dispatchWithRetry(w, r, agentID, agentCtx, requestedModel, candidate, upstream, outBody, requestOriginal, start, requestInfo, pendingCursor, downstreamStream, downstreamIncludeUsage, canFallback)
 		if !tryNextCandidate {
 			return
 		}
@@ -869,7 +877,7 @@ func payloadRequestsStream(payload map[string]any) bool {
 // records as the effective request, even when upstream carries the translated
 // Responses shape, so history and policy stay consistent with the recorded
 // request path.
-func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, candidate dispatchCandidate, upstream upstreamEncoding, outBody []byte, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit, downstreamStream bool, canFallback bool) (bool, bool, string) {
+func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, candidate dispatchCandidate, upstream upstreamEncoding, outBody []byte, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit, downstreamStream, downstreamIncludeUsage, canFallback bool) (bool, bool, string) {
 	const maxKeyAttempts = 5
 	sawCooldown := false
 
@@ -987,6 +995,11 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 					h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter_retry")
 					upstream = adapted
 					continue
+				} else if message, ok := responsesAdapterClientError(adaptErr); ok {
+					resp.Body.Close()
+					cancel()
+					h.fail(w, http.StatusBadRequest, message, agentID, requestedModel, start, adaptErr)
+					return false, sawCooldown, ""
 				}
 			}
 			if canFallback && isCandidateFallbackStatus(resp.StatusCode) {
@@ -997,7 +1010,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 				return true, sawCooldown, reason
 			}
 			if upstream.Adapter {
-				if err := adaptResponsesResponse(resp, downstreamStream); err != nil {
+				if err := adaptResponsesResponse(resp, downstreamStream, downstreamIncludeUsage); err != nil {
 					resp.Body.Close()
 					cancel()
 					if canFallback {

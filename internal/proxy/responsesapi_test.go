@@ -269,6 +269,9 @@ func TestHandlerSynthesizesSSEForStreamedResponsesOnlyModel(t *testing.T) {
 	chunks := parseSSEChunks(t, w.Body.Bytes())
 	var sawContent bool
 	for _, chunk := range chunks {
+		if _, ok := chunk["usage"]; ok {
+			t.Errorf("usage chunk must be omitted unless stream_options.include_usage was requested: %#v", chunk)
+		}
 		if sseDelta(t, chunk)["content"] == "streamed hello" {
 			sawContent = true
 		}
@@ -469,6 +472,25 @@ func TestHandlerDoesNotRetryUnrelatedBadRequests(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "Unknown parameter") {
 		t.Errorf("expected the upstream error body preserved, got %s", w.Body.String())
+	}
+}
+
+func TestResponsesOnlyUpstreamSignalPreservesEntireUnrelatedBody(t *testing.T) {
+	body := []byte(`{"error":{"message":"` + strings.Repeat("x", 8192) + `"}}`)
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+
+	if responsesOnlyUpstreamSignal(resp) {
+		t.Fatal("unrelated error must not trigger the adapter")
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read restored response body: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("response body was not preserved: got %d bytes, want %d", len(got), len(body))
 	}
 }
 
@@ -813,6 +835,31 @@ func TestChatToResponsesRequestFlattensFunctionTools(t *testing.T) {
 	}
 }
 
+// Chat Completions leaves strict disabled when it is omitted, while Responses
+// enables strict validation by default. The adapter must preserve the caller's
+// original non-strict tool contract.
+func TestChatToResponsesRequestDefaultsOmittedFunctionStrictToFalse(t *testing.T) {
+	got, err := chatToResponsesRequest(map[string]any{
+		"model": "gpt-5.6-terra",
+		"tools": []any{map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":       "ping",
+				"parameters": map[string]any{"type": "object"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("chatToResponsesRequest: %v", err)
+	}
+
+	tools, _ := got["tools"].([]any)
+	tool, _ := tools[0].(map[string]any)
+	if tool["strict"] != false {
+		t.Errorf("omitted Chat strict must become explicit false for Responses: got %#v", tool["strict"])
+	}
+}
+
 func TestChatToResponsesRequestMapsTokenAndToolChoiceParams(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -870,16 +917,15 @@ func TestChatToResponsesRequestMapsTokenAndToolChoiceParams(t *testing.T) {
 	}
 }
 
-func TestChatToResponsesRequestDropsChatOnlyParams(t *testing.T) {
+func TestChatToResponsesRequestDropsTransportAndNeutralParams(t *testing.T) {
 	payload := map[string]any{
 		"model":               "gpt-5.6-terra",
 		"stream":              true,
 		"stream_options":      map[string]any{"include_usage": true},
-		"n":                   float64(2),
-		"frequency_penalty":   float64(0.5),
-		"presence_penalty":    float64(0.5),
-		"logprobs":            true,
-		"logit_bias":          map[string]any{"1": 1},
+		"frequency_penalty":   float64(0),
+		"presence_penalty":    float64(0),
+		"logprobs":            false,
+		"logit_bias":          map[string]any{},
 		"parallel_tool_calls": true,
 	}
 
@@ -888,13 +934,103 @@ func TestChatToResponsesRequestDropsChatOnlyParams(t *testing.T) {
 		t.Fatalf("chatToResponsesRequest: %v", err)
 	}
 
-	for _, key := range []string{"stream", "stream_options", "n", "frequency_penalty", "presence_penalty", "logprobs", "logit_bias"} {
+	for _, key := range []string{"stream", "stream_options", "frequency_penalty", "presence_penalty", "logprobs", "logit_bias"} {
 		if _, ok := got[key]; ok {
 			t.Errorf("%s must not survive translation, got %#v", key, got[key])
 		}
 	}
 	if got["parallel_tool_calls"] != true {
 		t.Errorf("parallel_tool_calls is supported by responses and must survive: got %#v", got["parallel_tool_calls"])
+	}
+}
+
+func TestChatToResponsesRequestRejectsUnsupportedSemanticParams(t *testing.T) {
+	cases := []struct {
+		name  string
+		field string
+		value any
+	}{
+		{name: "frequency penalty", field: "frequency_penalty", value: float64(0.5)},
+		{name: "presence penalty", field: "presence_penalty", value: float64(0.5)},
+		{name: "log probabilities", field: "logprobs", value: true},
+		{name: "logit bias", field: "logit_bias", value: map[string]any{"1": float64(1)}},
+		{name: "stop sequence", field: "stop", value: "END"},
+		{name: "seed", field: "seed", value: float64(42)},
+		{name: "upstream storage", field: "store", value: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := chatToResponsesRequest(map[string]any{
+				"model":  "gpt-5.6-terra",
+				tc.field: tc.value,
+			})
+			if err == nil {
+				t.Fatalf("expected %s to be rejected rather than silently dropped", tc.field)
+			}
+		})
+	}
+}
+
+func TestChatToResponsesRequestPreservesSharedOptionalFields(t *testing.T) {
+	payload := map[string]any{
+		"model":                  "gpt-5.6-terra",
+		"user":                   "user-123",
+		"safety_identifier":      "safety-123",
+		"prompt_cache_key":       "cache-123",
+		"prompt_cache_retention": "24h",
+		"service_tier":           "priority",
+	}
+
+	got, err := chatToResponsesRequest(payload)
+	if err != nil {
+		t.Fatalf("chatToResponsesRequest: %v", err)
+	}
+	for _, field := range []string{"user", "safety_identifier", "prompt_cache_key", "prompt_cache_retention", "service_tier"} {
+		if got[field] != payload[field] {
+			t.Errorf("%s: got %#v, want %#v", field, got[field], payload[field])
+		}
+	}
+}
+
+// Responses cannot generate multiple choices. Silently dropping n would turn
+// a request for two completions into one successful-looking completion.
+func TestChatToResponsesRequestRejectsMultipleChoices(t *testing.T) {
+	_, err := chatToResponsesRequest(map[string]any{
+		"model": "gpt-5.6-terra",
+		"n":     float64(2),
+	})
+	if err == nil {
+		t.Fatal("expected n > 1 to be rejected")
+	}
+}
+
+func TestHandlerRejectsMultipleChoicesBeforeResponsesDispatch(t *testing.T) {
+	dispatches := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dispatches++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+	h := NewHandler(reg, stubContextLoaderWithToken("tiverton", "tiverton:dummy123"), logging.New(io.Discard))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		bytes.NewBufferString(`{"model":"openai/gpt-5.6-terra","n":2,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if dispatches != 0 {
+		t.Fatalf("unsupported request reached upstream %d time(s)", dispatches)
 	}
 }
 
@@ -965,7 +1101,7 @@ func TestChatCompletionToSSEEmitsTextStream(t *testing.T) {
 		"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}
 	}`)
 
-	sse, err := chatCompletionToSSE(body)
+	sse, err := chatCompletionToSSE(body, true)
 	if err != nil {
 		t.Fatalf("chatCompletionToSSE: %v", err)
 	}
@@ -1015,7 +1151,7 @@ func TestChatCompletionToSSEEmitsToolCallStream(t *testing.T) {
 		]},"finish_reason":"tool_calls"}]
 	}`)
 
-	sse, err := chatCompletionToSSE(body)
+	sse, err := chatCompletionToSSE(body, false)
 	if err != nil {
 		t.Fatalf("chatCompletionToSSE: %v", err)
 	}
@@ -1280,6 +1416,70 @@ func TestResponsesToChatCompletionMapsIncompleteToLengthFinishReason(t *testing.
 	choice, _ := choices[0].(map[string]any)
 	if choice["finish_reason"] != "length" {
 		t.Errorf("finish_reason: got %#v", choice["finish_reason"])
+	}
+}
+
+func TestResponsesToChatCompletionMapsContentFilterFinishReason(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_1","status":"incomplete","model":"gpt-5.6-terra",
+		"incomplete_details":{"reason":"content_filter"},
+		"output":[{"type":"message","role":"assistant","content":[]}]
+	}`)
+
+	got, err := responsesToChatCompletion(body)
+	if err != nil {
+		t.Fatalf("responsesToChatCompletion: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(got, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	choices, _ := chat["choices"].([]any)
+	choice, _ := choices[0].(map[string]any)
+	if choice["finish_reason"] != "content_filter" {
+		t.Fatalf("finish_reason: got %#v", choice["finish_reason"])
+	}
+}
+
+func TestResponsesToChatCompletionMapsRefusal(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_1","status":"completed","model":"gpt-5.6-terra",
+		"output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I cannot help with that."}]}]
+	}`)
+
+	got, err := responsesToChatCompletion(body)
+	if err != nil {
+		t.Fatalf("responsesToChatCompletion: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(got, &chat); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	choices, _ := chat["choices"].([]any)
+	choice, _ := choices[0].(map[string]any)
+	msg, _ := choice["message"].(map[string]any)
+	if msg["refusal"] != "I cannot help with that." {
+		t.Fatalf("refusal was lost: got %#v", msg)
+	}
+}
+
+func TestResponsesToChatCompletionRejectsFailedResponse(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_1","object":"response","status":"failed",
+		"error":{"code":"server_error","message":"generation failed"},
+		"output":[]
+	}`)
+
+	if _, err := responsesToChatCompletion(body); err == nil {
+		t.Fatal("failed Responses object must not become an empty successful completion")
+	}
+}
+
+func TestResponsesToChatCompletionRejectsResponseWithoutOutput(t *testing.T) {
+	body := []byte(`{"id":"resp_1","object":"response","status":"completed","output":null}`)
+
+	if _, err := responsesToChatCompletion(body); err == nil {
+		t.Fatal("malformed Responses object must not leak through the chat/completions endpoint")
 	}
 }
 

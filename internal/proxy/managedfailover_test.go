@@ -168,3 +168,70 @@ func TestManagedDispatchKeepsTerminal502WhenNoFallbackRemains(t *testing.T) {
 		t.Errorf("expected the existing terminal message preserved, got %s", w.Body.String())
 	}
 }
+
+// Direct dispatch already advances when a Responses reply cannot be translated.
+// Managed dispatch must preserve the same declared-fallback guarantee instead of
+// turning a failed Responses object into a terminal adapter error.
+func TestManagedDispatchAdvancesToFallbackOnResponsesAdapterError(t *testing.T) {
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	primaryCalls := 0
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_1","object":"response","status":"failed",
+			"error":{"code":"server_error","message":"generation failed"},"output":[]
+		}`))
+	}))
+	defer primary.Close()
+
+	fallbackCalls := 0
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-2","choices":[{"message":{"role":"assistant","content":"fallback answered"}}]}`))
+	}))
+	defer fallback.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: primary.URL + "/v1", APIKey: "sk-openai", Auth: "bearer",
+	})
+	reg.Set("openrouter", &provider.Provider{
+		Name: "openrouter", BaseURL: fallback.URL + "/v1", APIKey: "sk-or", Auth: "bearer",
+	})
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "openai/gpt-5.6-terra"},
+			{Slot: "fallback", Ref: "openrouter/gpt-4o-mini"},
+		},
+	}
+
+	var logs bytes.Buffer
+	h := NewHandler(reg, stubContextLoaderWithToolsAndPolicy("weston", "weston:dummy123",
+		managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", ""), policy),
+		logging.New(&logs))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		bytes.NewBufferString(`{"model":"openai/gpt-5.6-terra","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer weston:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected fallback 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if primaryCalls != 1 || fallbackCalls != 1 {
+		t.Fatalf("expected one primary and one fallback dispatch, got primary=%d fallback=%d", primaryCalls, fallbackCalls)
+	}
+	if !strings.Contains(logs.String(), "responses_adapter_error") {
+		t.Fatalf("expected responses_adapter_error fallback reason, got %s", logs.String())
+	}
+}

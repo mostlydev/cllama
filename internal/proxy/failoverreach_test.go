@@ -53,7 +53,7 @@ func TestCandidateRefsExcludeNonFailoverSlots(t *testing.T) {
 	}
 }
 
-// The silent collapse is what made the production incident hard to read: the
+// The silent collapse is what made the reported incident hard to read: the
 // operator declared two models and got a 502 that pointed at credentials. If
 // failover is unreachable, say so.
 func TestHandlerWarnsWhenDeclaredModelsCannotFailOver(t *testing.T) {

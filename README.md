@@ -258,8 +258,12 @@ Two behaviours are worth knowing:
 - Requests are dispatched **non-streaming** upstream, because the Responses
   event taxonomy differs from chat SSE. An agent that asked for a stream
   receives synthetic chat SSE built from the buffered completion.
-- The adapter sends `store: false`, preserving the chat/completions property
-  that a turn is not retained on the provider side.
+- The adapter sends `store: false` so translated turns remain stateless and are
+  not retained on the provider side. A caller that explicitly asks for
+  `store: true` receives a 400 instead of having that choice silently changed.
+- Chat-only controls that Responses cannot preserve (for example, non-default
+  frequency or presence penalties, logit bias, stop sequences, seeds, and
+  token log probabilities) receive a 400 instead of being silently discarded.
 
 ---
 
