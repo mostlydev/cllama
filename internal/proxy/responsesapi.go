@@ -35,6 +35,10 @@ const (
 	// effort only when the inbound Chat Completions request omits one. Explicit
 	// caller values always win; leaving this unset preserves existing behavior.
 	EnvResponsesDefaultReasoningEffort = "CLLAMA_RESPONSES_DEFAULT_REASONING_EFFORT"
+	// EnvResponsesRequiredToolChoiceAsAuto relaxes only a caller's required
+	// tool choice at the Responses adapter boundary. It is an opt-in escape
+	// hatch for runtimes that apply chat-only tool policy to scheduled turns.
+	EnvResponsesRequiredToolChoiceAsAuto = "CLLAMA_RESPONSES_REQUIRED_TOOL_CHOICE_AS_AUTO"
 
 	// responsesAPIPath is the upstream path the adapter dispatches to. It is
 	// expressed as an inbound-style path because buildUpstreamURL strips the
@@ -154,6 +158,9 @@ func chatToResponsesRequestWithReasoning(payload map[string]any, replay []respon
 		out["tools"] = chatToolsToResponsesTools(tools)
 	}
 	if choice, ok := payload["tool_choice"]; ok {
+		if choice == "required" && boolEnv(EnvResponsesRequiredToolChoiceAsAuto) {
+			choice = "auto"
+		}
 		out["tool_choice"] = chatToolChoiceToResponses(choice)
 	}
 	effort, hasEffort := payload["reasoning_effort"]

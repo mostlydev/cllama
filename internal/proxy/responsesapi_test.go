@@ -708,6 +708,47 @@ func TestChatToResponsesRequestDefaultsReasoningEffortFromEnvironment(t *testing
 	})
 }
 
+func TestChatToResponsesRequestCanRelaxRequiredToolChoice(t *testing.T) {
+	t.Run("configured rewrite changes required to auto", func(t *testing.T) {
+		t.Setenv(EnvResponsesRequiredToolChoiceAsAuto, "true")
+
+		got, err := chatToResponsesRequest(map[string]any{"tool_choice": "required"})
+		if err != nil {
+			t.Fatalf("chatToResponsesRequest: %v", err)
+		}
+
+		if got["tool_choice"] != "auto" {
+			t.Errorf("tool_choice: got %#v", got["tool_choice"])
+		}
+	})
+
+	t.Run("unset environment preserves required", func(t *testing.T) {
+		t.Setenv(EnvResponsesRequiredToolChoiceAsAuto, "")
+
+		got, err := chatToResponsesRequest(map[string]any{"tool_choice": "required"})
+		if err != nil {
+			t.Fatalf("chatToResponsesRequest: %v", err)
+		}
+
+		if got["tool_choice"] != "required" {
+			t.Errorf("tool_choice: got %#v", got["tool_choice"])
+		}
+	})
+
+	t.Run("configured rewrite preserves other choices", func(t *testing.T) {
+		t.Setenv(EnvResponsesRequiredToolChoiceAsAuto, "true")
+
+		got, err := chatToResponsesRequest(map[string]any{"tool_choice": "none"})
+		if err != nil {
+			t.Fatalf("chatToResponsesRequest: %v", err)
+		}
+
+		if got["tool_choice"] != "none" {
+			t.Errorf("tool_choice: got %#v", got["tool_choice"])
+		}
+	})
+}
+
 // Managed tool mediation replays prior rounds as an assistant message carrying
 // tool_calls followed by role:"tool" results. Responses represents both as
 // top-level input items, so a wrong mapping here silently breaks every
