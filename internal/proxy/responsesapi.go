@@ -510,6 +510,13 @@ func adaptResponsesResponse(resp *http.Response, downstreamStream, downstreamInc
 
 	converted, err := responsesToChatCompletion(body)
 	if err != nil {
+		// A recognized Responses object in a failure state must surface as a
+		// failure — passing it through would hand the agent a 200 whose body
+		// is a raw failed Responses object (or, streamed, a clean empty stop).
+		var failure *responsesFailureError
+		if errors.As(err, &failure) {
+			return err
+		}
 		// Not a Responses object (an upstream error page, say). Pass it through
 		// rather than masking the failure with a synthesized empty reply.
 		converted = body
@@ -552,7 +559,7 @@ func responsesToChatCompletion(body []byte) ([]byte, error) {
 	output, ok := resp["output"].([]any)
 	if !ok {
 		if resp["object"] == "response" || stringField(resp, "status") != "" {
-			return nil, fmt.Errorf("responses API reply is missing an output array")
+			return nil, &responsesFailureError{message: "responses API reply is missing an output array"}
 		}
 		return body, nil
 	}
@@ -617,6 +624,17 @@ func responsesToChatCompletion(body []byte) ([]byte, error) {
 	return json.Marshal(chat)
 }
 
+// responsesFailureError marks a body that IS a recognized Responses object but
+// cannot be presented as a successful chat completion. It is distinguished from
+// ordinary translation errors so callers pass through only unrecognized bodies.
+type responsesFailureError struct {
+	message string
+}
+
+func (e *responsesFailureError) Error() string {
+	return e.message
+}
+
 func validateResponsesStatus(resp map[string]any) error {
 	status := stringField(resp, "status")
 	switch status {
@@ -626,9 +644,9 @@ func validateResponsesStatus(resp map[string]any) error {
 			message = stringField(failure, "message")
 		}
 		if message == "" {
-			return fmt.Errorf("responses API returned status %q", status)
+			return &responsesFailureError{message: fmt.Sprintf("responses API returned status %q", status)}
 		}
-		return fmt.Errorf("responses API returned status %q: %s", status, message)
+		return &responsesFailureError{message: fmt.Sprintf("responses API returned status %q: %s", status, message)}
 	default:
 		return nil
 	}

@@ -1520,3 +1520,68 @@ func TestChatToResponsesRequestDoesNotMutateInput(t *testing.T) {
 		t.Errorf("input payload mutated:\nbefore %s\nafter  %s", before, after)
 	}
 }
+
+// The unit-level rejection of failed Responses objects is not enough: the
+// direct dispatch path recovers from translation errors by passing the body
+// through, which would hand the agent a 200 whose body is a raw failed
+// Responses object. A recognized-but-failed reply must surface as a failure
+// (or a declared-fallback advance), never as a success.
+func TestHandlerDoesNotForwardFailedResponsesObjectAsSuccess(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_1","object":"response","status":"failed",
+			"error":{"code":"server_error","message":"generation failed"},"output":[]
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithToken("tiverton", "tiverton:dummy123"), logging.New(io.Discard))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		bytes.NewBufferString(`{"model":"openai/gpt-5.6-terra","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code == http.StatusOK {
+		t.Fatalf("a failed Responses object must not reach the agent as a 200: %s", w.Body.String())
+	}
+}
+
+// Same guarantee for a streamed request: a failed Responses object must not be
+// synthesized into an SSE stream that ends with a clean stop and no content.
+func TestHandlerDoesNotStreamFailedResponsesObjectAsSuccess(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_1","object":"response","status":"failed",
+			"error":{"code":"server_error","message":"generation failed"},"output":[]
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	h := NewHandler(reg, stubContextLoaderWithToken("tiverton", "tiverton:dummy123"), logging.New(io.Discard))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		bytes.NewBufferString(`{"model":"openai/gpt-5.6-terra","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if strings.Contains(w.Body.String(), "data: [DONE]") && w.Code == http.StatusOK {
+		t.Fatalf("a failed Responses object must not become a clean synthetic stream: %s", w.Body.String())
+	}
+}
