@@ -138,6 +138,7 @@ Each agent is a subdirectory under `CLAW_CONTEXT_ROOT`:
 │   ├── metadata.json     # bearer token, pod, service, type
 │   ├── AGENTS.md         # behavioral contract
 │   ├── CLAWDAPUS.md      # infrastructure map
+│   ├── tools.json        # optional managed-tool manifest
 │   └── context-blocks.json     # optional runtime context blocks
 ├── westin/
 │   └── ...
@@ -161,6 +162,16 @@ If `context-blocks.json` is present, cllama injects enabled `every_turn` blocks
 as distinct runtime-context segments. Blocks may render before or after feeds,
 with the default placement after feeds and before time context. The original
 system prompt remains unchanged.
+
+Managed tools may opt into terminal-on-success behavior with the namespaced
+annotation `"x-claw.terminalOnSuccess": true` in `tools.json`. After an
+annotated call returns a 2xx response whose normalized managed envelope has
+top-level `ok: true`, cllama records the receipt and ends the mediated turn with
+a protocol-valid empty assistant response instead of requesting another model
+round. A terminal-on-success call must be the final tool call in its round; an
+invalid order is rejected before any tool executes. Failed annotated calls and
+unannotated tools retain the normal recovery loop. The annotation value must be
+a JSON boolean; other value types are ignored and logged as invalid.
 
 ### Provider registry
 

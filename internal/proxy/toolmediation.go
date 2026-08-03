@@ -64,6 +64,11 @@ const duplicateManagedToolCallFinalizationIntervention = "duplicate_managed_tool
 const managedToolBudgetFinalizationIntervention = "managed_tool_budget_finalization"
 const managedToolSoftDeadlineFinalizationIntervention = "managed_tool_soft_deadline_finalization"
 const managedToolSchemaRejectedIntervention = "managed_tool_schema_rejected"
+const managedToolTerminalOnSuccessIntervention = "managed_tool_terminal_on_success"
+const managedToolTerminalOnSuccessAnnotation = "x-claw.terminalOnSuccess"
+const managedToolTerminalOrderRejectedIntervention = "managed_tool_terminal_order_rejected"
+
+const managedToolTerminalOrderMessage = "A terminal-on-success managed tool must be the final tool call in the round. No tools were executed. Re-emit calls in a safe order."
 
 const managedToolBudgetFinalizationMessage = "Managed tool budget exhausted. Do not call tools again. Produce the best final answer now using the tool results already in this conversation. If the evidence is insufficient, say exactly what was checked and give the explicit no-go or defer decision."
 const managedToolSoftDeadlineFinalizationMessage = managedToolBudgetFinalizationMessage + " Note: data may be stale because the managed tool soft deadline was reached."
@@ -105,8 +110,9 @@ type anthropicToolUse struct {
 }
 
 type managedToolOutcome struct {
-	RawJSON []byte
-	Trace   sessionhistory.ToolCallTrace
+	RawJSON         []byte
+	Trace           sessionhistory.ToolCallTrace
+	TerminalSuccess bool
 }
 
 type managedToolPolicy struct {
@@ -389,6 +395,17 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			continue
 		}
 
+		if terminalOnSuccessOrderInvalidOpenAI(agentCtx, toolCalls) {
+			h.logger.LogIntervention(agentID, requestedModel, managedToolTerminalOrderRejectedIntervention)
+			toolMessages, roundTrace := buildOpenAITerminalOrderRetryRound(agentCtx, toolCalls, usage)
+			roundTrace.Round = len(toolTrace) + 1
+			finishToolRoundTrace(&roundTrace, roundStarted)
+			toolTrace = append(toolTrace, roundTrace)
+			appendOpenAIAssistantAndToolMessages(payload, assistantMessage, toolMessages)
+			hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, assistantMessage, toolMessages)
+			continue
+		}
+
 		if ownership == openAIToolsUnsafeMixed {
 			h.logger.LogIntervention(agentID, requestedModel, mixedToolOrderInternalRetryIntervention)
 			toolMessages, roundTrace := buildOpenAIUnsafeMixedRetryRound(agentCtx, toolCalls, usage)
@@ -407,6 +424,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 		roundTrace := newToolRoundTrace(len(toolTrace)+1, usage)
 		finalizeAfterDuplicate := false
 		finalizeAfterSoftDeadline := false
+		terminalSuccessTool := ""
 		for i, call := range managedCalls {
 			if managedToolSoftDeadlineReached(loopStart, policy) {
 				h.logger.LogIntervention(agentID, requestedModel, managedToolSoftDeadlineFinalizationIntervention)
@@ -415,7 +433,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				break
 			}
 			if duplicate := duplicates.ObserveOpenAI(agentCtx, call, len(toolTrace)+1); duplicate != nil {
-				outcome := duplicateManagedToolOutcome(duplicate, h.managedDuplicatePolicy)
+				outcome := duplicateManagedToolOutcomeForCall(agentCtx, call.Name, duplicate, h.managedDuplicatePolicy)
 				h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallIntervention+":"+duplicate.CanonicalName)
 				if !finalizeAfterDuplicate && duplicate.Streak >= h.managedDuplicateStreakCutoff {
 					h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallFinalizationIntervention+":"+duplicate.CanonicalName)
@@ -427,6 +445,9 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 					"tool_call_id": call.ID,
 					"content":      string(outcome.RawJSON),
 				})
+				if outcome.TerminalSuccess {
+					terminalSuccessTool = outcome.Trace.Name
+				}
 				continue
 			}
 			toolCtx, toolCancel := managedToolExecutionContext(loopCtx, loopStart, policy)
@@ -461,6 +482,9 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				"tool_call_id": call.ID,
 				"content":      string(outcome.RawJSON),
 			})
+			if outcome.TerminalSuccess {
+				terminalSuccessTool = outcome.Trace.Name
+			}
 		}
 		finishToolRoundTrace(&roundTrace, roundStarted)
 		toolTrace = append(toolTrace, roundTrace)
@@ -469,11 +493,37 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			managedAssistant = buildOpenAIAssistantMessage(assistantMessage, managedCalls, true)
 		}
 		appendOpenAIAssistantAndToolMessages(payload, managedAssistant, toolMessages)
+		hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, managedAssistant, toolMessages)
+		if terminalSuccessTool != "" {
+			h.logger.LogIntervention(agentID, requestedModel, managedToolTerminalOnSuccessIntervention+":"+terminalSuccessTool)
+			terminalBody, terminalAssistant := managedOpenAIEmptyTerminal(resp.UpstreamModel, usageAgg)
+			terminalHeader := resp.Header.Clone()
+			terminalHeader.Del("Content-Length")
+			responseBytes := terminalBody
+			if downstreamStream {
+				sse, synthErr := synthesizeOpenAIStream(terminalBody, resp.UpstreamModel, usageAgg, downstreamIncludeUsage)
+				if synthErr != nil {
+					h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed terminal stream"), usageAgg, toolTrace)
+					h.fail(w, http.StatusBadGateway, "failed to synthesize managed terminal stream", agentID, requestedModel, start, synthErr)
+					return
+				}
+				streamKeepalive.writeFinal(sse)
+				responseBytes = sse
+			} else {
+				var ok bool
+				responseBytes, ok = h.writeBufferedResponseAfterPolicy(r.Context(), w, agentID, agentCtx, "openai", policyMode(agentCtx), false, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusOK, terminalHeader, terminalBody, start)
+				if !ok {
+					return
+				}
+			}
+			h.managedTurns.ObserveTerminalAssistant(agentID, terminalAssistant, hiddenMessages)
+			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusOK, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
+			return
+		}
 		if finalizeAfterSoftDeadline {
 			appendOpenAISoftDeadlineFinalizationInstruction(payload)
 			disableOpenAITools(payload)
 			finalizingAfterBudget = true
-			hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, managedAssistant, toolMessages)
 			continue
 		}
 		if finalizeAfterDuplicate {
@@ -484,7 +534,6 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 		// Persist the filtered managed-only assistant so the hidden continuity
 		// transcript matches the serialized round the model actually saw before
 		// the runner-native handoff.
-		hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, managedAssistant, toolMessages)
 	}
 }
 
@@ -672,6 +721,17 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			continue
 		}
 
+		if terminalOnSuccessOrderInvalidAnthropic(agentCtx, toolUses) {
+			h.logger.LogIntervention(agentID, requestedModel, managedToolTerminalOrderRejectedIntervention)
+			toolResults, roundTrace := buildAnthropicTerminalOrderRetryRound(agentCtx, toolUses, usage)
+			roundTrace.Round = len(toolTrace) + 1
+			finishToolRoundTrace(&roundTrace, roundStarted)
+			toolTrace = append(toolTrace, roundTrace)
+			toolResultMessage := appendAnthropicAssistantAndToolResultMessages(payload, assistantMessage, toolResults)
+			hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, assistantMessage, toolResultMessage)
+			continue
+		}
+
 		if ownership == anthropicToolsUnsafeMixed {
 			h.logger.LogIntervention(agentID, requestedModel, mixedToolOrderInternalRetryIntervention)
 			toolResults, roundTrace := buildAnthropicUnsafeMixedRetryRound(agentCtx, toolUses, usage)
@@ -690,6 +750,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 		roundTrace := newToolRoundTrace(len(toolTrace)+1, usage)
 		finalizeAfterDuplicate := false
 		finalizeAfterSoftDeadline := false
+		terminalSuccessTool := ""
 		for i, call := range managedToolUses {
 			if managedToolSoftDeadlineReached(loopStart, policy) {
 				h.logger.LogIntervention(agentID, requestedModel, managedToolSoftDeadlineFinalizationIntervention)
@@ -698,7 +759,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				break
 			}
 			if duplicate := duplicates.ObserveAnthropic(agentCtx, call, len(toolTrace)+1); duplicate != nil {
-				outcome := duplicateManagedToolOutcome(duplicate, h.managedDuplicatePolicy)
+				outcome := duplicateManagedToolOutcomeForCall(agentCtx, call.Name, duplicate, h.managedDuplicatePolicy)
 				h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallIntervention+":"+duplicate.CanonicalName)
 				if !finalizeAfterDuplicate && duplicate.Streak >= h.managedDuplicateStreakCutoff {
 					h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallFinalizationIntervention+":"+duplicate.CanonicalName)
@@ -706,6 +767,9 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				}
 				roundTrace.ToolCalls = append(roundTrace.ToolCalls, outcome.Trace)
 				toolResults = append(toolResults, anthropicToolResultBlock(call.ID, outcome.RawJSON))
+				if outcome.TerminalSuccess {
+					terminalSuccessTool = outcome.Trace.Name
+				}
 				continue
 			}
 			toolCtx, toolCancel := managedToolExecutionContext(loopCtx, loopStart, policy)
@@ -736,6 +800,9 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			duplicates.StoreAnthropicResult(agentCtx, call, len(toolTrace)+1, outcome)
 			roundTrace.ToolCalls = append(roundTrace.ToolCalls, outcome.Trace)
 			toolResults = append(toolResults, anthropicToolResultBlock(call.ID, outcome.RawJSON))
+			if outcome.TerminalSuccess {
+				terminalSuccessTool = outcome.Trace.Name
+			}
 		}
 		finishToolRoundTrace(&roundTrace, roundStarted)
 		toolTrace = append(toolTrace, roundTrace)
@@ -744,11 +811,37 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			managedAssistant = buildAnthropicAssistantMessage(assistantMessage, managedToolUses, true)
 		}
 		toolResultMessage := appendAnthropicAssistantAndToolResultMessages(payload, managedAssistant, toolResults)
+		hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, managedAssistant, toolResultMessage)
+		if terminalSuccessTool != "" {
+			h.logger.LogIntervention(agentID, requestedModel, managedToolTerminalOnSuccessIntervention+":"+terminalSuccessTool)
+			terminalBody, terminalAssistant := managedAnthropicEmptyTerminal(resp.UpstreamModel, usageAgg)
+			terminalHeader := resp.Header.Clone()
+			terminalHeader.Del("Content-Length")
+			responseBytes := terminalBody
+			if downstreamStream {
+				sse, synthErr := synthesizeAnthropicStream(terminalBody, resp.UpstreamModel, usageAgg)
+				if synthErr != nil {
+					h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed terminal stream"), usageAgg, toolTrace)
+					h.fail(w, http.StatusBadGateway, "failed to synthesize managed terminal stream", agentID, requestedModel, start, synthErr)
+					return
+				}
+				streamKeepalive.writeFinal(sse)
+				responseBytes = sse
+			} else {
+				var ok bool
+				responseBytes, ok = h.writeBufferedResponseAfterPolicy(r.Context(), w, agentID, agentCtx, "anthropic", policyMode(agentCtx), false, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusOK, terminalHeader, terminalBody, start)
+				if !ok {
+					return
+				}
+			}
+			h.managedAnthropicTurns.ObserveTerminalAssistant(agentID, terminalAssistant, hiddenMessages)
+			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusOK, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
+			return
+		}
 		if finalizeAfterSoftDeadline {
 			appendAnthropicSoftDeadlineFinalizationInstruction(toolResultMessage)
 			disableAnthropicTools(payload)
 			finalizingAfterBudget = true
-			hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, managedAssistant, toolResultMessage)
 			continue
 		}
 		if finalizeAfterDuplicate {
@@ -759,7 +852,6 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 		// Persist the filtered managed-only assistant so the hidden continuity
 		// transcript matches the serialized round the model actually saw before
 		// the runner-native handoff.
-		hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, managedAssistant, toolResultMessage)
 	}
 }
 
@@ -1206,6 +1298,14 @@ func duplicateManagedToolOutcome(duplicate *managedToolDuplicate, policy string)
 	return managedToolOutcome{RawJSON: raw, Trace: trace}
 }
 
+func duplicateManagedToolOutcomeForCall(agentCtx *agentctx.AgentContext, name string, duplicate *managedToolDuplicate, policy string) managedToolOutcome {
+	outcome := duplicateManagedToolOutcome(duplicate, policy)
+	if policy == managedDuplicatePolicyReplay {
+		outcome.TerminalSuccess = managedToolCallTerminalSuccess(agentCtx, name, outcome.Trace.Result, outcome.Trace.StatusCode)
+	}
+	return outcome
+}
+
 func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, requestedModel string, agentCtx *agentctx.AgentContext, call openAIToolCall, policy managedToolPolicy) (managedToolOutcome, error) {
 	trace := sessionhistory.ToolCallTrace{
 		Name:      managedToolDisplayName(agentCtx, call.Name),
@@ -1266,7 +1366,11 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 		return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 	}
 	trace.Result = raw
-	return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
+	return managedToolOutcome{
+		RawJSON:         modelRaw,
+		Trace:           trace,
+		TerminalSuccess: managedToolCallTerminalSuccess(agentCtx, call.Name, raw, statusCode),
+	}, nil
 }
 
 // rejectSchemaViolations validates model-emitted arguments against the
@@ -1355,7 +1459,84 @@ func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID strin
 		return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
 	}
 	trace.Result = raw
-	return managedToolOutcome{RawJSON: modelRaw, Trace: trace}, nil
+	return managedToolOutcome{
+		RawJSON:         modelRaw,
+		Trace:           trace,
+		TerminalSuccess: managedToolCallTerminalSuccess(agentCtx, call.Name, raw, statusCode),
+	}, nil
+}
+
+func managedToolCallTerminalSuccess(agentCtx *agentctx.AgentContext, name string, raw []byte, statusCode int) bool {
+	resolved, ok := resolveManagedTool(agentCtx, name)
+	if !ok {
+		return false
+	}
+	enabled, _ := managedToolTerminalOnSuccess(resolved.Manifest)
+	if !enabled || statusCode < 200 || statusCode >= 300 {
+		return false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return false
+	}
+	succeeded, _ := payload["ok"].(bool)
+	return succeeded
+}
+
+func managedToolTerminalOnSuccess(tool agentctx.ToolManifestEntry) (enabled, invalid bool) {
+	if tool.Annotations == nil {
+		return false, false
+	}
+	raw, exists := tool.Annotations[managedToolTerminalOnSuccessAnnotation]
+	if !exists {
+		return false, false
+	}
+	value, ok := raw.(bool)
+	if !ok {
+		return false, true
+	}
+	return value, false
+}
+
+func managedOpenAIEmptyTerminal(model string, usage managedUsageAggregate) ([]byte, map[string]any) {
+	assistant := map[string]any{"role": "assistant", "content": ""}
+	payload := map[string]any{
+		"id":      "chatcmpl-managed-terminal",
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"message":       assistant,
+			"finish_reason": "stop",
+		}},
+		"usage": map[string]any{
+			"prompt_tokens":     usage.PromptTokens,
+			"completion_tokens": usage.CompletionTokens,
+			"total_tokens":      usage.TotalTokens,
+		},
+	}
+	raw, _ := json.Marshal(payload)
+	return raw, assistant
+}
+
+func managedAnthropicEmptyTerminal(model string, usage managedUsageAggregate) ([]byte, map[string]any) {
+	content := []any{map[string]any{"type": "text", "text": ""}}
+	assistant := map[string]any{"role": "assistant", "content": content}
+	payload := map[string]any{
+		"id":          "msg_managed_terminal",
+		"type":        "message",
+		"role":        "assistant",
+		"model":       model,
+		"content":     content,
+		"stop_reason": "end_turn",
+		"usage": map[string]any{
+			"input_tokens":  usage.PromptTokens,
+			"output_tokens": usage.CompletionTokens,
+		},
+	}
+	raw, _ := json.Marshal(payload)
+	return raw, assistant
 }
 
 func (h *Handler) callManagedHTTPTool(ctx context.Context, agentID string, tool agentctx.ToolManifestEntry, args map[string]any) ([]byte, int, error) {
@@ -1946,6 +2127,33 @@ func classifyAnthropicToolUses(agentCtx *agentctx.AgentContext, calls []anthropi
 	}
 }
 
+func terminalOnSuccessOrderInvalidOpenAI(agentCtx *agentctx.AgentContext, calls []openAIToolCall) bool {
+	return terminalOnSuccessOrderInvalid(agentCtx, len(calls), func(index int) string { return calls[index].Name })
+}
+
+func terminalOnSuccessOrderInvalidAnthropic(agentCtx *agentctx.AgentContext, calls []anthropicToolUse) bool {
+	return terminalOnSuccessOrderInvalid(agentCtx, len(calls), func(index int) string { return calls[index].Name })
+}
+
+func terminalOnSuccessOrderInvalid(agentCtx *agentctx.AgentContext, count int, nameAt func(int) string) bool {
+	found := false
+	for i := 0; i < count; i++ {
+		resolved, ok := resolveManagedTool(agentCtx, nameAt(i))
+		if !ok {
+			continue
+		}
+		enabled, _ := managedToolTerminalOnSuccess(resolved.Manifest)
+		if !enabled {
+			continue
+		}
+		if found || i != count-1 {
+			return true
+		}
+		found = true
+	}
+	return false
+}
+
 func buildOpenAIAssistantMessage(base map[string]any, calls []openAIToolCall, includeContent bool) map[string]any {
 	msg := cloneAnyMap(base)
 	msg["role"] = "assistant"
@@ -1994,6 +2202,32 @@ func buildOpenAIUnsafeMixedRetryRound(agentCtx *agentctx.AgentContext, calls []o
 
 func buildAnthropicUnsafeMixedRetryRound(agentCtx *agentctx.AgentContext, calls []anthropicToolUse, usage cost.Usage) ([]map[string]any, sessionhistory.ToolRoundTrace) {
 	raw := mixedToolOrderRetryPayload()
+	toolResults := make([]map[string]any, 0, len(calls))
+	roundTrace := newToolRoundTrace(0, usage)
+	for _, call := range calls {
+		toolResults = append(toolResults, anthropicToolResultBlock(call.ID, raw))
+		roundTrace.ToolCalls = append(roundTrace.ToolCalls, buildRejectedToolTrace(agentCtx, call.Name, call.ArgumentsRaw, raw))
+	}
+	return toolResults, roundTrace
+}
+
+func buildOpenAITerminalOrderRetryRound(agentCtx *agentctx.AgentContext, calls []openAIToolCall, usage cost.Usage) ([]any, sessionhistory.ToolRoundTrace) {
+	raw := managedToolTerminalOrderRetryPayload()
+	toolMessages := make([]any, 0, len(calls))
+	roundTrace := newToolRoundTrace(0, usage)
+	for _, call := range calls {
+		toolMessages = append(toolMessages, map[string]any{
+			"role":         "tool",
+			"tool_call_id": call.ID,
+			"content":      string(raw),
+		})
+		roundTrace.ToolCalls = append(roundTrace.ToolCalls, buildRejectedToolTrace(agentCtx, call.Name, call.ArgumentsRaw, raw))
+	}
+	return toolMessages, roundTrace
+}
+
+func buildAnthropicTerminalOrderRetryRound(agentCtx *agentctx.AgentContext, calls []anthropicToolUse, usage cost.Usage) ([]map[string]any, sessionhistory.ToolRoundTrace) {
+	raw := managedToolTerminalOrderRetryPayload()
 	toolResults := make([]map[string]any, 0, len(calls))
 	roundTrace := newToolRoundTrace(0, usage)
 	for _, call := range calls {
@@ -2090,6 +2324,13 @@ func buildSyntheticToolTrace(agentCtx *agentctx.AgentContext, name string, args 
 
 func mixedToolOrderRetryPayload() []byte {
 	return toolErrorPayload("mixed_tool_order", mixedToolOrderMessage, http.StatusConflict, nil)
+}
+
+func managedToolTerminalOrderRetryPayload() []byte {
+	return toolErrorPayload("terminal_on_success_order", managedToolTerminalOrderMessage, http.StatusConflict, map[string]any{
+		"tools_executed": false,
+		"required_order": "terminal_on_success_last",
+	})
 }
 
 func managedToolBudgetFinalizationPayload(maxRounds int) []byte {
@@ -2747,9 +2988,6 @@ func anthropicMessageTextBlocks(message map[string]any) []string {
 				continue
 			}
 			text, _ := block["text"].(string)
-			if text == "" {
-				continue
-			}
 			parts = append(parts, text)
 		}
 		return parts
