@@ -493,6 +493,10 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			managedAssistant = buildOpenAIAssistantMessage(assistantMessage, managedCalls, true)
 		}
 		appendOpenAIAssistantAndToolMessages(payload, managedAssistant, toolMessages)
+		// Persist the filtered managed-only assistant so the hidden continuity
+		// transcript matches what the model saw — including the authoritative
+		// receipt round, which is what prevents a later turn from re-executing
+		// a terminal action it cannot see.
 		hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, managedAssistant, toolMessages)
 		if terminalSuccessTool != "" {
 			h.logger.LogIntervention(agentID, requestedModel, managedToolTerminalOnSuccessIntervention+":"+terminalSuccessTool)
@@ -531,9 +535,6 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			disableOpenAITools(payload)
 			finalizingAfterDuplicate = true
 		}
-		// Persist the filtered managed-only assistant so the hidden continuity
-		// transcript matches the serialized round the model actually saw before
-		// the runner-native handoff.
 	}
 }
 
@@ -811,6 +812,10 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			managedAssistant = buildAnthropicAssistantMessage(assistantMessage, managedToolUses, true)
 		}
 		toolResultMessage := appendAnthropicAssistantAndToolResultMessages(payload, managedAssistant, toolResults)
+		// Persist the filtered managed-only assistant so the hidden continuity
+		// transcript matches what the model saw — including the authoritative
+		// receipt round, which is what prevents a later turn from re-executing
+		// a terminal action it cannot see.
 		hiddenMessages = appendManagedAnthropicContinuityMessages(hiddenMessages, managedAssistant, toolResultMessage)
 		if terminalSuccessTool != "" {
 			h.logger.LogIntervention(agentID, requestedModel, managedToolTerminalOnSuccessIntervention+":"+terminalSuccessTool)
@@ -849,9 +854,6 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			disableAnthropicTools(payload)
 			finalizingAfterDuplicate = true
 		}
-		// Persist the filtered managed-only assistant so the hidden continuity
-		// transcript matches the serialized round the model actually saw before
-		// the runner-native handoff.
 	}
 }
 
