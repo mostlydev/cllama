@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mostlydev/cllama/internal/agentctx"
 	"github.com/mostlydev/cllama/internal/cost"
 	"github.com/mostlydev/cllama/internal/logging"
 	"github.com/mostlydev/cllama/internal/provider"
@@ -361,13 +362,17 @@ func TestHandlerRetriesThroughAdapterOnResponsesOnlyUpstreamSignal(t *testing.T)
 }
 
 func TestManagedMediationRetriesThroughAdapterOnResponsesOnlyUpstreamSignal(t *testing.T) {
+	const ciphertext = "reactive-adapter-reasoning"
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"balance":5000}`))
 	}))
 	defer toolSrv.Close()
 
+	alias := managedToolHashlessAliasForCanonical("trading-api.get_market_context")
 	var paths []string
+	var secondResponsesBody []byte
+	responsesRounds := 0
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
@@ -376,8 +381,24 @@ func TestManagedMediationRetriesThroughAdapterOnResponsesOnlyUpstreamSignal(t *t
 			_, _ = w.Write([]byte(`{"error":{"message":"To use function tools, use /v1/responses."}}`))
 			return
 		}
+		responsesRounds++
+		if responsesRounds == 1 {
+			_, _ = w.Write([]byte(`{
+				"id":"resp_1","status":"completed","model":"gpt-9-experimental",
+				"output":[
+					{"type":"reasoning","id":"rs_1","encrypted_content":"` + ciphertext + `"},
+					{"type":"function_call","id":"fc_1","call_id":"call_1","name":"` + alias + `","arguments":"{}"}
+				]
+			}`))
+			return
+		}
+		var err error
+		secondResponsesBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read second Responses body: %v", err)
+		}
 		_, _ = w.Write([]byte(`{
-			"id":"resp_1","status":"completed","model":"gpt-9-experimental",
+			"id":"resp_2","status":"completed","model":"gpt-9-experimental",
 			"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recovered"}]}]
 		}`))
 	}))
@@ -402,10 +423,16 @@ func TestManagedMediationRetriesThroughAdapterOnResponsesOnlyUpstreamSignal(t *t
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected the retry to succeed with 200, got %d: %s", w.Code, w.Body.String())
 	}
-	want := []string{"/v1/chat/completions", "/v1/responses"}
-	if len(paths) != 2 || paths[0] != want[0] || paths[1] != want[1] {
+	want := []string{"/v1/chat/completions", "/v1/responses", "/v1/chat/completions", "/v1/responses"}
+	if len(paths) != len(want) {
 		t.Fatalf("expected dispatch sequence %v, got %v", want, paths)
 	}
+	for i := range want {
+		if paths[i] != want[i] {
+			t.Fatalf("expected dispatch sequence %v, got %v", want, paths)
+		}
+	}
+	assertResponsesReasoningReplayBeforeCall(t, secondResponsesBody, ciphertext, "call_1")
 }
 
 // The adapter is an OpenAI chat/completions concept. The Anthropic path must
@@ -698,6 +725,350 @@ func TestChatToResponsesRequestTranslatesToolCallRounds(t *testing.T) {
 	}
 	if _, ok := result["role"]; ok {
 		t.Error("role must not survive on a function_call_output item")
+	}
+}
+
+func TestAdapterManagedRoundReplaysEncryptedReasoningWithoutGovernanceLeak(t *testing.T) {
+	const ciphertext = "opaque-reasoning-secret"
+
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	alias := managedToolHashlessAliasForCanonical("trading-api.get_market_context")
+	var upstreamBodies [][]byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream body: %v", err)
+		}
+		upstreamBodies = append(upstreamBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		if len(upstreamBodies) == 1 {
+			_, _ = w.Write([]byte(`{
+				"id":"resp_1","object":"response","status":"completed","model":"gpt-5.6-terra",
+				"output":[
+					{"type":"reasoning","id":"rs_1","encrypted_content":"` + ciphertext + `","summary":[]},
+					{"type":"function_call","id":"fc_1","call_id":"call_1","name":"` + alias + `","arguments":"{}"}
+				],
+				"usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}
+			}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{
+			"id":"resp_2","object":"response","status":"completed","model":"gpt-5.6-terra",
+			"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],
+			"usage":{"input_tokens":7,"output_tokens":5,"total_tokens":12}
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+
+	histDir := t.TempDir()
+	snapshots := NewContextSnapshotStore()
+	var logs bytes.Buffer
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123",
+		managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")),
+		logging.New(&logs), WithSessionHistory(histDir), WithSnapshotStore(snapshots))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		bytes.NewBufferString(`{"model":"openai/gpt-5.6-terra","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(upstreamBodies) != 2 {
+		t.Fatalf("expected two Responses rounds, got %d", len(upstreamBodies))
+	}
+	assertResponsesReasoningReplayBeforeCall(t, upstreamBodies[1], ciphertext, "call_1")
+
+	var firstRequest map[string]any
+	if err := json.Unmarshal(upstreamBodies[0], &firstRequest); err != nil {
+		t.Fatalf("unmarshal first upstream request: %v", err)
+	}
+	include, _ := firstRequest["include"].([]any)
+	if len(include) != 1 || include[0] != "reasoning.encrypted_content" {
+		t.Fatalf("adapter must request legacy-compatible encrypted reasoning, got %#v", firstRequest["include"])
+	}
+
+	history, err := os.ReadFile(filepath.Join(histDir, "tiverton", "history.jsonl"))
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	var historyEntry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(history), &historyEntry); err != nil {
+		t.Fatalf("unmarshal history: %v", err)
+	}
+	snapshot, ok := snapshots.Get("tiverton")
+	if !ok {
+		t.Fatal("expected context snapshot")
+	}
+	snapshotJSON, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal context snapshot: %v", err)
+	}
+	for surface, raw := range map[string][]byte{
+		"downstream body":           w.Body.Bytes(),
+		"history request_original":  mustMarshalJSON(t, historyEntry["request_original"]),
+		"history request_effective": mustMarshalJSON(t, historyEntry["request_effective"]),
+		"history response":          mustMarshalJSON(t, historyEntry["response"]),
+		"history tool_trace":        mustMarshalJSON(t, historyEntry["tool_trace"]),
+		"context snapshot":          snapshotJSON,
+		"audit log":                 logs.Bytes(),
+	} {
+		if bytes.Contains(raw, []byte(ciphertext)) {
+			t.Errorf("encrypted reasoning leaked into %s: %s", surface, raw)
+		}
+	}
+}
+
+func mustMarshalJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal JSON test value: %v", err)
+	}
+	return raw
+}
+
+func TestAdapterReasoningReplayFollowsUnsafeMixedRetryRound(t *testing.T) {
+	const ciphertext = "opaque-retry-reasoning"
+
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unsafe mixed order must be rejected before tool execution")
+	}))
+	defer toolSrv.Close()
+
+	alias := managedToolHashlessAliasForCanonical("trading-api.get_market_context")
+	var upstreamBodies [][]byte
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream body: %v", err)
+		}
+		upstreamBodies = append(upstreamBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		if len(upstreamBodies) == 1 {
+			_, _ = w.Write([]byte(`{
+				"id":"resp_1","object":"response","status":"completed","model":"gpt-5.6-terra",
+				"output":[
+					{"type":"reasoning","id":"rs_retry","encrypted_content":"` + ciphertext + `"},
+					{"type":"function_call","id":"fc_native","call_id":"call_native","name":"runner_native","arguments":"{}"},
+					{"type":"function_call","id":"fc_managed","call_id":"call_managed","name":"` + alias + `","arguments":"{}"}
+				]
+			}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{
+			"id":"resp_2","object":"response","status":"completed","model":"gpt-5.6-terra",
+			"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recovered"}]}]
+		}`))
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{
+		Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-real", Auth: "bearer",
+	})
+	h := NewHandler(reg, stubContextLoaderWithTools("tiverton", "tiverton:dummy123",
+		managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")),
+		logging.New(io.Discard))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		bytes.NewBufferString(`{"model":"openai/gpt-5.6-terra","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"runner_native","parameters":{"type":"object"}}}]}`))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(upstreamBodies) != 2 {
+		t.Fatalf("expected two Responses rounds, got %d", len(upstreamBodies))
+	}
+	assertResponsesReasoningReplayBeforeCall(t, upstreamBodies[1], ciphertext, "call_native")
+}
+
+func TestAdapterDropsEncryptedReasoningWhenManagedRoundFailsOver(t *testing.T) {
+	const ciphertext = "provider-bound-reasoning"
+	t.Setenv(EnvResponsesAPIModels, "alpha/reasoner-a,beta/reasoner-b")
+
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	alias := managedToolHashlessAliasForCanonical("trading-api.get_market_context")
+	alphaCalls := 0
+	alpha := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		alphaCalls++
+		w.Header().Set("Content-Type", "application/json")
+		if alphaCalls == 1 {
+			_, _ = w.Write([]byte(`{
+				"id":"resp_1","object":"response","status":"completed","model":"reasoner-a",
+				"output":[
+					{"type":"reasoning","id":"rs_alpha","encrypted_content":"` + ciphertext + `"},
+					{"type":"function_call","id":"fc_1","call_id":"call_1","name":"` + alias + `","arguments":"{}"}
+				]
+			}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"alpha unavailable"}}`))
+	}))
+	defer alpha.Close()
+
+	var betaBody []byte
+	beta := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		betaBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read beta body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_2","object":"response","status":"completed","model":"reasoner-b",
+			"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fallback done"}]}]
+		}`))
+	}))
+	defer beta.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("alpha", &provider.Provider{Name: "alpha", BaseURL: alpha.URL + "/v1", APIKey: "sk-alpha", Auth: "bearer"})
+	reg.Set("beta", &provider.Provider{Name: "beta", BaseURL: beta.URL + "/v1", APIKey: "sk-beta", Auth: "bearer"})
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "alpha/reasoner-a"},
+			{Slot: "fallback", Ref: "beta/reasoner-b"},
+		},
+	}
+
+	var logs bytes.Buffer
+	h := NewHandler(reg, stubContextLoaderWithToolsAndPolicy("weston", "weston:dummy123",
+		managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", ""), policy),
+		logging.New(&logs))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		bytes.NewBufferString(`{"model":"alpha/reasoner-a","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer weston:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected fallback 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if alphaCalls != 2 {
+		t.Fatalf("expected alpha to produce round 1 then fail round 2, got %d calls", alphaCalls)
+	}
+	if len(betaBody) == 0 {
+		t.Fatal("expected beta fallback request")
+	}
+	if bytes.Contains(betaBody, []byte(ciphertext)) {
+		t.Fatalf("provider-bound reasoning leaked to fallback candidate: %s", betaBody)
+	}
+	if !strings.Contains(logs.String(), "reasoning_replay_dropped_failover") {
+		t.Fatalf("expected reasoning replay drop intervention, got %s", logs.String())
+	}
+}
+
+func TestEncryptedResponsesReasoningItemsRequireCiphertext(t *testing.T) {
+	body := []byte(`{
+		"output":[
+			{"type":"reasoning","id":"rs_missing"},
+			{"type":"reasoning","id":"rs_empty","encrypted_content":""},
+			{"type":"message","encrypted_content":"not-reasoning"},
+			{"type":"reasoning", "id":"rs_keep", "encrypted_content":"opaque"}
+		]
+	}`)
+
+	items := encryptedResponsesReasoningItems(body)
+	if len(items) != 1 {
+		t.Fatalf("expected only the encrypted reasoning item, got %q", items)
+	}
+	if string(items[0]) != `{"type":"reasoning", "id":"rs_keep", "encrypted_content":"opaque"}` {
+		t.Fatalf("reasoning item bytes changed: %s", items[0])
+	}
+}
+
+func TestResponsesReasoningReplayAssociatesWithSerializedManagedCalls(t *testing.T) {
+	const ciphertext = "managed-prefix-reasoning"
+	managedAssistant := map[string]any{
+		"role": "assistant",
+		"tool_calls": []any{
+			map[string]any{
+				"id":       "call_managed",
+				"type":     "function",
+				"function": map[string]any{"name": "managed_tool", "arguments": `{}`},
+			},
+		},
+	}
+	replay := appendResponsesReasoningReplay(nil, &capturedResponse{
+		ProviderName:       "openai",
+		UpstreamModel:      "gpt-5.6-terra",
+		ResponsesReasoning: []json.RawMessage{json.RawMessage(`{"type":"reasoning","id":"rs_1","encrypted_content":"` + ciphertext + `"}`)},
+	}, managedAssistant)
+	payload := map[string]any{
+		"model": "gpt-5.6-terra",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+			managedAssistant,
+			map[string]any{"role": "tool", "tool_call_id": "call_managed", "content": `{"ok":true}`},
+		},
+	}
+	translated, err := chatToResponsesRequestWithReasoning(payload, replay)
+	if err != nil {
+		t.Fatalf("translate with reasoning replay: %v", err)
+	}
+	body, err := json.Marshal(translated)
+	if err != nil {
+		t.Fatalf("marshal translated request: %v", err)
+	}
+	assertResponsesReasoningReplayBeforeCall(t, body, ciphertext, "call_managed")
+	if bytes.Contains(body, []byte("call_native")) {
+		t.Fatalf("a filtered runner-native suffix must not reappear through reasoning replay: %s", body)
+	}
+}
+
+func assertResponsesReasoningReplayBeforeCall(t *testing.T, body []byte, ciphertext, callID string) {
+	t.Helper()
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("unmarshal upstream request: %v", err)
+	}
+	input, _ := payload["input"].([]any)
+	reasoningIndex := -1
+	callIndex := -1
+	for i, raw := range input {
+		item, _ := raw.(map[string]any)
+		if item["type"] == "reasoning" && item["encrypted_content"] == ciphertext {
+			reasoningIndex = i
+		}
+		if item["type"] == "function_call" && item["call_id"] == callID {
+			callIndex = i
+		}
+	}
+	if reasoningIndex < 0 {
+		t.Fatalf("encrypted reasoning item missing from input: %#v", input)
+	}
+	if callIndex < 0 {
+		t.Fatalf("function call %q missing from input: %#v", callID, input)
+	}
+	if reasoningIndex >= callIndex {
+		t.Fatalf("reasoning must precede its function call: reasoning=%d call=%d input=%#v", reasoningIndex, callIndex, input)
 	}
 }
 

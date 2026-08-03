@@ -120,6 +120,10 @@ func responsesAdapterClientError(err error) (string, bool) {
 // chatToResponsesRequest translates a chat/completions request payload into a
 // Responses API request payload. The input payload is not mutated.
 func chatToResponsesRequest(payload map[string]any) (map[string]any, error) {
+	return chatToResponsesRequestWithReasoning(payload, nil)
+}
+
+func chatToResponsesRequestWithReasoning(payload map[string]any, replay []responsesReasoningReplay) (map[string]any, error) {
 	if n, ok := payload["n"]; ok && !isSingleChoice(n) {
 		return nil, &responsesAdapterRequestError{
 			message: "n must be 1 for models routed through the Responses API",
@@ -140,7 +144,7 @@ func chatToResponsesRequest(payload map[string]any) (map[string]any, error) {
 	}
 
 	if messages, ok := payload["messages"].([]any); ok {
-		out["input"] = chatMessagesToResponsesInput(messages)
+		out["input"] = chatMessagesToResponsesInputWithReasoning(messages, replay)
 	}
 	if tools, ok := payload["tools"].([]any); ok {
 		out["tools"] = chatToolsToResponsesTools(tools)
@@ -162,6 +166,10 @@ func chatToResponsesRequest(payload map[string]any) (map[string]any, error) {
 	// routing through the adapter does not quietly start retaining agent
 	// traffic on the provider side.
 	out["store"] = false
+	// Stateless Responses requests return encrypted reasoning by default on
+	// current models. The legacy include value remains accepted and keeps the
+	// adapter compatible with older reasoning models that required the opt-in.
+	out["include"] = []any{"reasoning.encrypted_content"}
 
 	return out, nil
 }
@@ -261,7 +269,12 @@ func isSingleChoice(raw any) bool {
 // function_call / function_call_output items rather than message fields, which
 // is what keeps multi-round managed tool mediation working through the adapter.
 func chatMessagesToResponsesInput(messages []any) []any {
+	return chatMessagesToResponsesInputWithReasoning(messages, nil)
+}
+
+func chatMessagesToResponsesInputWithReasoning(messages []any, replay []responsesReasoningReplay) []any {
 	input := make([]any, 0, len(messages))
+	usedReplay := make([]bool, len(replay))
 	for _, raw := range messages {
 		msg, ok := raw.(map[string]any)
 		if !ok {
@@ -279,6 +292,9 @@ func chatMessagesToResponsesInput(messages []any) []any {
 		}
 
 		toolCalls, _ := msg["tool_calls"].([]any)
+		if items := reasoningItemsForAssistant(toolCalls, replay, usedReplay); len(items) > 0 {
+			input = append(input, items...)
+		}
 		if content, ok := nonEmptyContent(msg["content"]); ok || len(toolCalls) == 0 {
 			item := map[string]any{"role": role}
 			if ok {
@@ -307,6 +323,65 @@ func chatMessagesToResponsesInput(messages []any) []any {
 		}
 	}
 	return input
+}
+
+type responsesReasoningReplay struct {
+	ProviderName  string
+	UpstreamModel string
+	ToolCallIDs   []string
+	Items         []json.RawMessage
+}
+
+func reasoningItemsForAssistant(toolCalls []any, replay []responsesReasoningReplay, used []bool) []any {
+	callIDs := chatToolCallIDs(toolCalls)
+	if len(callIDs) == 0 {
+		return nil
+	}
+	for i, segment := range replay {
+		if i < len(used) && used[i] {
+			continue
+		}
+		if !equalStrings(callIDs, segment.ToolCallIDs) {
+			continue
+		}
+		items := make([]any, 0, len(segment.Items))
+		for _, raw := range segment.Items {
+			if !json.Valid(raw) {
+				continue
+			}
+			items = append(items, append(json.RawMessage(nil), raw...))
+		}
+		if i < len(used) {
+			used[i] = true
+		}
+		return items
+	}
+	return nil
+}
+
+func chatToolCallIDs(toolCalls []any) []string {
+	ids := make([]string, 0, len(toolCalls))
+	for _, raw := range toolCalls {
+		call, _ := raw.(map[string]any)
+		id := strings.TrimSpace(stringField(call, "id"))
+		if id == "" {
+			return nil
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // chatContentToResponsesContent rewrites content-part types. Responses
@@ -419,18 +494,40 @@ type upstreamEncoding struct {
 // encodeUpstreamRequest decides whether a candidate must be dispatched through
 // the Responses API and, if so, produces the translated path and body.
 func encodeUpstreamRequest(candidate dispatchCandidate, requestPath string, payload map[string]any, chatBody []byte) (upstreamEncoding, error) {
+	encoded, _, err := encodeUpstreamRequestWithReasoning(candidate, requestPath, payload, chatBody, nil)
+	return encoded, err
+}
+
+func encodeUpstreamRequestWithReasoning(candidate dispatchCandidate, requestPath string, payload map[string]any, chatBody []byte, replay []responsesReasoningReplay) (upstreamEncoding, bool, error) {
 	if !responsesAdapterEligible(requestPath) || !responsesAPIRequired(candidate.ProviderName, candidate.UpstreamModel) {
-		return upstreamEncoding{Path: requestPath, Body: chatBody}, nil
+		return upstreamEncoding{Path: requestPath, Body: chatBody}, false, nil
 	}
-	translated, err := chatToResponsesRequest(payload)
+	matchingReplay, droppedReplay := responsesReasoningForCandidate(replay, candidate)
+	translated, err := chatToResponsesRequestWithReasoning(payload, matchingReplay)
 	if err != nil {
-		return upstreamEncoding{}, err
+		return upstreamEncoding{}, droppedReplay, err
 	}
 	body, err := json.Marshal(translated)
 	if err != nil {
-		return upstreamEncoding{}, err
+		return upstreamEncoding{}, droppedReplay, err
 	}
-	return upstreamEncoding{Path: responsesAPIPath, Body: body, Adapter: true}, nil
+	return upstreamEncoding{Path: responsesAPIPath, Body: body, Adapter: true}, droppedReplay, nil
+}
+
+func responsesReasoningForCandidate(replay []responsesReasoningReplay, candidate dispatchCandidate) ([]responsesReasoningReplay, bool) {
+	matching := make([]responsesReasoningReplay, 0, len(replay))
+	dropped := false
+	for _, segment := range replay {
+		if strings.EqualFold(strings.TrimSpace(segment.ProviderName), strings.TrimSpace(candidate.ProviderName)) &&
+			strings.TrimSpace(segment.UpstreamModel) == strings.TrimSpace(candidate.UpstreamModel) {
+			matching = append(matching, segment)
+			continue
+		}
+		if len(segment.Items) > 0 {
+			dropped = true
+		}
+	}
+	return matching, dropped
 }
 
 // responsesAdapterEligible reports whether an inbound path may be translated to
@@ -445,11 +542,15 @@ func responsesAdapterEligible(requestPath string) bool {
 // body for the Responses API. It is the recovery path for models upstream
 // declares responses-only that the built-in list does not yet know about.
 func adaptChatBodyToResponses(chatBody []byte) (upstreamEncoding, error) {
+	return adaptChatBodyToResponsesWithReasoning(chatBody, nil)
+}
+
+func adaptChatBodyToResponsesWithReasoning(chatBody []byte, replay []responsesReasoningReplay) (upstreamEncoding, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(chatBody, &payload); err != nil {
 		return upstreamEncoding{}, err
 	}
-	translated, err := chatToResponsesRequest(payload)
+	translated, err := chatToResponsesRequestWithReasoning(payload, replay)
 	if err != nil {
 		return upstreamEncoding{}, err
 	}
@@ -622,6 +723,38 @@ func responsesToChatCompletion(body []byte) ([]byte, error) {
 	}
 
 	return json.Marshal(chat)
+}
+
+func responsesToChatCompletionWithReasoning(body []byte) ([]byte, []json.RawMessage, error) {
+	converted, err := responsesToChatCompletion(body)
+	if err != nil {
+		return nil, nil, err
+	}
+	return converted, encryptedResponsesReasoningItems(body), nil
+}
+
+// encryptedResponsesReasoningItems retains the opaque output objects exactly
+// as received. They are never added to the chat-shaped response or request;
+// managed mediation may replay them only at the outbound Responses boundary.
+func encryptedResponsesReasoningItems(body []byte) []json.RawMessage {
+	var response struct {
+		Output []json.RawMessage `json:"output"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil
+	}
+	items := make([]json.RawMessage, 0, len(response.Output))
+	for _, raw := range response.Output {
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		if stringField(item, "type") != "reasoning" || strings.TrimSpace(stringField(item, "encrypted_content")) == "" {
+			continue
+		}
+		items = append(items, append(json.RawMessage(nil), raw...))
+	}
+	return items
 }
 
 // responsesFailureError marks a body that IS a recognized Responses object but
