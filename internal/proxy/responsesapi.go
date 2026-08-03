@@ -31,6 +31,10 @@ const (
 	// hatch for the day OpenAI makes these models work on chat/completions and
 	// the built-in list becomes wrong.
 	EnvResponsesAPIDisabled = "CLLAMA_RESPONSES_API_DISABLED"
+	// EnvResponsesDefaultReasoningEffort supplies a Responses API reasoning
+	// effort only when the inbound Chat Completions request omits one. Explicit
+	// caller values always win; leaving this unset preserves existing behavior.
+	EnvResponsesDefaultReasoningEffort = "CLLAMA_RESPONSES_DEFAULT_REASONING_EFFORT"
 
 	// responsesAPIPath is the upstream path the adapter dispatches to. It is
 	// expressed as an inbound-style path because buildUpstreamURL strips the
@@ -152,7 +156,12 @@ func chatToResponsesRequestWithReasoning(payload map[string]any, replay []respon
 	if choice, ok := payload["tool_choice"]; ok {
 		out["tool_choice"] = chatToolChoiceToResponses(choice)
 	}
-	if effort, ok := payload["reasoning_effort"]; ok {
+	effort, hasEffort := payload["reasoning_effort"]
+	if !hasEffort {
+		effort = strings.TrimSpace(os.Getenv(EnvResponsesDefaultReasoningEffort))
+		hasEffort = effort != ""
+	}
+	if hasEffort {
 		out["reasoning"] = map[string]any{"effort": effort}
 	}
 	if limit, ok := firstPresent(payload, "max_completion_tokens", "max_tokens"); ok {
