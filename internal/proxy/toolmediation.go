@@ -936,6 +936,19 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			resp.Body.Close()
 			if readErr != nil {
 				cancel()
+				// Headers were committed upstream, but no downstream bytes were
+				// written, so advancing is as safe here as it is for transport
+				// errors and 5xx. Without this the runner retries the failing
+				// primary instead of cllama using the declared fallback.
+				if canFallback {
+					h.logCandidateFallback(agentID, requestedModel, "response_read_error")
+					return dispatchJSONAttemptResult{
+						AdvanceToNextCandidate: true,
+						CandidateSawCooldown:   sawCooldown,
+						FallbackReason:         "response_read_error",
+						Err:                    readErr,
+					}
+				}
 				return dispatchJSONAttemptResult{
 					ClientStatus:  http.StatusBadGateway,
 					ClientMessage: "failed to read upstream response",
