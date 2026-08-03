@@ -264,19 +264,39 @@ func jsonTypeName(value any) string {
 	return fmt.Sprintf("%T", value)
 }
 
-// EnvToolArgPruneSentinels opts a pod into dropping optional arguments whose
-// value is the schema's own `minimum`. Default off: this discards data the
-// model emitted, so it is only correct where a model is known to fabricate
-// these, and it must be a deliberate operator choice.
+// EnvToolArgPruneSentinels selects which models get sentinel-argument pruning,
+// as a comma-separated list of "<provider>/<model-prefix>" entries — the same
+// shape as EnvResponsesAPIModels. Empty means the feature is off.
+//
+// It is a model selector rather than a global switch on purpose. Pruning
+// discards data the model emitted, and whether that is correct depends
+// entirely on which model produced it: fabricating minima is a trait of
+// specific model families, and a pod routinely runs several models at once.
+// A global flag would apply a judgement made about one model to every other
+// model sharing the proxy.
 const EnvToolArgPruneSentinels = "CLLAMA_TOOL_ARG_PRUNE_SENTINELS"
 
-func toolArgPruneSentinelsFromEnv() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvToolArgPruneSentinels))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
+// toolArgPruneSentinelsFor reports whether pruning is selected for a declared
+// model reference such as "vercel/openai/gpt-5.6-luna". The reference is split
+// on its first separator into provider and upstream model, matching how
+// EnvResponsesAPIModels entries are matched.
+func toolArgPruneSentinelsFor(declaredModel string) bool {
+	provider, model, ok := strings.Cut(strings.TrimSpace(declaredModel), "/")
+	if !ok || provider == "" || model == "" {
 		return false
 	}
+	provider = strings.ToLower(provider)
+	for _, entry := range strings.Split(os.Getenv(EnvToolArgPruneSentinels), ",") {
+		entryProvider, entryPrefix, ok := strings.Cut(strings.TrimSpace(entry), "/")
+		if !ok || entryPrefix == "" {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(entryProvider), provider) &&
+			strings.HasPrefix(model, strings.TrimSpace(entryPrefix)) {
+			return true
+		}
+	}
+	return false
 }
 
 // pruneSentinelOptionalArgs removes top-level optional arguments whose value is

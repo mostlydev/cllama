@@ -1420,6 +1420,7 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 		trace.Result = raw
 		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
 	}
+	h.pruneSentinelArgs(agentID, requestedModel, resolved, call.Arguments)
 	if rejected := h.rejectSchemaViolations(agentID, requestedModel, resolved, call.Arguments, &trace); rejected != nil {
 		return *rejected, nil
 	}
@@ -1469,6 +1470,25 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 	}, nil
 }
 
+// pruneSentinelArgs drops optional arguments a selected model fabricated at
+// their schema minimum, before validation and before dispatch.
+//
+// Deliberately independent of toolSchemaValidation. Pruning used to live
+// inside rejectSchemaViolations, which meant turning validation off — an
+// emergency rollback knob for an unrelated concern — silently turned pruning
+// off too. Two separate operator decisions should not share one switch.
+func (h *Handler) pruneSentinelArgs(agentID, requestedModel string, resolved resolvedManagedTool, args map[string]any) {
+	if !toolArgPruneSentinelsFor(requestedModel) {
+		return
+	}
+	pruned := pruneSentinelOptionalArgs(resolved.Manifest.InputSchema, args)
+	if len(pruned) == 0 {
+		return
+	}
+	h.logger.LogIntervention(agentID, requestedModel,
+		managedToolArgsPrunedIntervention+":"+resolved.CanonicalName+":"+strings.Join(pruned, ","))
+}
+
 // rejectSchemaViolations validates model-emitted arguments against the
 // manifest inputSchema before the providing-service dispatch. Nil means the
 // call may proceed. The rejection consumes a mediation round (the model must
@@ -1476,12 +1496,6 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 func (h *Handler) rejectSchemaViolations(agentID, requestedModel string, resolved resolvedManagedTool, args map[string]any, trace *sessionhistory.ToolCallTrace) *managedToolOutcome {
 	if !h.toolSchemaValidation {
 		return nil
-	}
-	if h.toolArgPruneSentinels {
-		if pruned := pruneSentinelOptionalArgs(resolved.Manifest.InputSchema, args); len(pruned) > 0 {
-			h.logger.LogIntervention(agentID, requestedModel,
-				managedToolArgsPrunedIntervention+":"+resolved.CanonicalName+":"+strings.Join(pruned, ","))
-		}
 	}
 	violations := validateManagedToolArgs(resolved.Manifest.InputSchema, args)
 	if len(violations) == 0 {
@@ -1519,6 +1533,7 @@ func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID strin
 		trace.Result = raw
 		return managedToolOutcome{RawJSON: raw, Trace: trace}, nil
 	}
+	h.pruneSentinelArgs(agentID, requestedModel, resolved, call.Arguments)
 	if rejected := h.rejectSchemaViolations(agentID, requestedModel, resolved, call.Arguments, &trace); rejected != nil {
 		return *rejected, nil
 	}
