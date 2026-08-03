@@ -710,6 +710,9 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	if resolution.Intervention != "" {
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}
+	if agentCtx != nil && failoverUnreachable(agentCtx.ModelPolicy, resolution.Candidates) {
+		h.logger.LogIntervention(agentID, requestedModel, "policy_failover_unreachable")
+	}
 	if managedTool {
 		h.handleManagedOpenAI(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, downstreamStream, downstreamIncludeUsage, start, feedCtx.PendingCommit, requestInfo)
 		return
@@ -801,6 +804,9 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	if resolution.Intervention != "" {
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}
+	if agentCtx != nil && failoverUnreachable(agentCtx.ModelPolicy, resolution.Candidates) {
+		h.logger.LogIntervention(agentID, requestedModel, "policy_failover_unreachable")
+	}
 	if managedTool {
 		h.handleManagedAnthropic(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, downstreamStream, start, feedCtx.PendingCommit, requestInfo)
 		return
@@ -812,6 +818,10 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit) {
 	sawCooldown := false
 	downstreamStream := payloadRequestsStream(payload)
+	downstreamIncludeUsage := false
+	if responsesAdapterEligible(r.URL.Path) {
+		_, downstreamIncludeUsage = requestedOpenAIStreamOptions(payload)
+	}
 	for i, candidate := range candidates {
 		canFallback := i+1 < len(candidates)
 		payload["model"] = candidate.UpstreamModel
@@ -820,7 +830,19 @@ func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, age
 			h.fail(w, http.StatusInternalServerError, "failed to encode upstream body", agentID, requestedModel, start, err)
 			return
 		}
-		tryNextCandidate, candidateCooldown, fallbackReason := h.dispatchWithRetry(w, r, agentID, agentCtx, requestedModel, candidate, outBody, requestOriginal, start, requestInfo, pendingCursor, downstreamStream, canFallback)
+		upstream, err := encodeUpstreamRequest(candidate, r.URL.Path, payload, outBody)
+		if err != nil {
+			if message, ok := responsesAdapterClientError(err); ok {
+				h.fail(w, http.StatusBadRequest, message, agentID, requestedModel, start, err)
+				return
+			}
+			h.fail(w, http.StatusInternalServerError, "failed to encode upstream body", agentID, requestedModel, start, err)
+			return
+		}
+		if upstream.Adapter {
+			h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter")
+		}
+		tryNextCandidate, candidateCooldown, fallbackReason := h.dispatchWithRetry(w, r, agentID, agentCtx, requestedModel, candidate, upstream, outBody, requestOriginal, start, requestInfo, pendingCursor, downstreamStream, downstreamIncludeUsage, canFallback)
 		if !tryNextCandidate {
 			return
 		}
@@ -851,7 +873,11 @@ func payloadRequestsStream(payload map[string]any) bool {
 // 5xx and transport errors do NOT cause key state changes, but can advance to
 // the next declared model candidate before any downstream response is written.
 // It returns (advanceToNextCandidate, candidateSawCooldown, fallbackReason).
-func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, candidate dispatchCandidate, outBody []byte, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit, downstreamStream bool, canFallback bool) (bool, bool, string) {
+// outBody is the agent-facing chat/completions body. It is what governance
+// records as the effective request, even when upstream carries the translated
+// Responses shape, so history and policy stay consistent with the recorded
+// request path.
+func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, candidate dispatchCandidate, upstream upstreamEncoding, outBody []byte, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit, downstreamStream, downstreamIncludeUsage, canFallback bool) (bool, bool, string) {
 	const maxKeyAttempts = 5
 	sawCooldown := false
 
@@ -864,14 +890,18 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			return true, sawCooldown, "provider_key_unavailable"
 		}
 
-		targetURL, err := buildUpstreamURL(prov.BaseURL, r.URL.Path, r.URL.RawQuery)
+		targetURL, err := buildUpstreamURL(prov.BaseURL, upstream.Path, r.URL.RawQuery)
 		if err != nil {
 			h.fail(w, http.StatusBadGateway, "invalid provider URL", agentID, requestedModel, start, err)
 			return false, sawCooldown, ""
 		}
 
-		reqCtx, cancel := dispatchAttemptContext(r.Context(), downstreamStream)
-		outReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(outBody))
+		// A streamed downstream request still dispatches non-streaming through
+		// the adapter: the Responses event taxonomy differs from chat SSE, so
+		// the SSE the agent asked for is synthesized from the buffered result.
+		attemptStream := downstreamStream && !upstream.Adapter
+		reqCtx, cancel := adapterAwareAttemptContext(r.Context(), downstreamStream, upstream.Adapter)
+		outReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(upstream.Body))
 		if err != nil {
 			cancel()
 			h.fail(w, http.StatusBadGateway, "failed to create upstream request", agentID, requestedModel, start, err)
@@ -879,6 +909,12 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		}
 		copyRequestHeaders(outReq.Header, r.Header)
 		outReq.Header.Set("Content-Type", "application/json")
+		if upstream.Adapter {
+			// The adapter rewrites the body, so it must be able to read it.
+			// Copying the agent's Accept-Encoding would disable Go's
+			// transparent decompression and hand us a compressed body.
+			outReq.Header.Set("Accept-Encoding", "identity")
+		}
 
 		// Forward Anthropic-specific headers for the Anthropic path.
 		if strings.HasPrefix(r.URL.Path, "/v1/messages") {
@@ -896,7 +932,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		}
 
 		h.logger.LogRequestWithInfo(agentID, requestedModel, requestInfo)
-		resp, err := h.doUpstreamRequest(outReq, cancel, downstreamStream)
+		resp, err := h.doUpstreamRequest(outReq, cancel, attemptStream)
 		if err != nil {
 			cancel()
 			if !canFallback {
@@ -948,12 +984,42 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			continue // try next key
 
 		default:
+			// Upstream may declare a model responses-only that the built-in
+			// list does not know about yet. Retry it through the adapter once
+			// rather than handing the agent a rejection that reads like a
+			// credentials or provider-pool problem.
+			if !upstream.Adapter && responsesAdapterEligible(r.URL.Path) && responsesOnlyUpstreamSignal(resp) {
+				if adapted, adaptErr := adaptChatBodyToResponses(outBody); adaptErr == nil {
+					resp.Body.Close()
+					cancel()
+					h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter_retry")
+					upstream = adapted
+					continue
+				} else if message, ok := responsesAdapterClientError(adaptErr); ok {
+					resp.Body.Close()
+					cancel()
+					h.fail(w, http.StatusBadRequest, message, agentID, requestedModel, start, adaptErr)
+					return false, sawCooldown, ""
+				}
+			}
 			if canFallback && isCandidateFallbackStatus(resp.StatusCode) {
 				reason := fmt.Sprintf("http_%d", resp.StatusCode)
 				resp.Body.Close()
 				cancel()
 				h.logCandidateFallback(agentID, requestedModel, reason)
 				return true, sawCooldown, reason
+			}
+			if upstream.Adapter {
+				if err := adaptResponsesResponse(resp, downstreamStream, downstreamIncludeUsage); err != nil {
+					resp.Body.Close()
+					cancel()
+					if canFallback {
+						h.logCandidateFallback(agentID, requestedModel, "responses_adapter_error")
+						return true, sawCooldown, "responses_adapter_error"
+					}
+					h.fail(w, http.StatusBadGateway, "failed to translate responses API reply", agentID, requestedModel, start, err)
+					return false, sawCooldown, ""
+				}
 			}
 			// Success or non-retryable status: forward response back, no key state change.
 			fallbackReason := h.forwardResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start, pendingCursor)
@@ -971,6 +1037,17 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 	}
 
 	return true, sawCooldown, "provider_keys_exhausted"
+}
+
+// adapterAwareAttemptContext bounds one upstream attempt. A buffered adapter
+// attempt for a streamed request keeps the stream first-byte budget instead of
+// dropping to the much shorter dispatch-candidate timeout: the agent asked for
+// a stream, and responses-only models are the slowest cllama dispatches to.
+func adapterAwareAttemptContext(parent context.Context, downstreamStream, adapter bool) (context.Context, context.CancelFunc) {
+	if downstreamStream && adapter {
+		return context.WithTimeout(parent, streamFirstByteTimeoutDuration())
+	}
+	return dispatchAttemptContext(parent, downstreamStream && !adapter)
 }
 
 func dispatchAttemptContext(parent context.Context, downstreamStream bool) (context.Context, context.CancelFunc) {

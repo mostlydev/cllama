@@ -53,30 +53,40 @@ func (p *ModelPolicy) DefaultModel() string {
 	return ""
 }
 
+// FailoverRefs returns the dispatch order for declared-model failover: the
+// primary first, then every declared fallback in declared order.
+//
+// Participation is deliberately explicit. A model declared under any other slot
+// — an "analysis" slot, say — is allowed but is not a failover target, because
+// the slot expresses what the model is for.
 func (p *ModelPolicy) FailoverRefs() []string {
 	if p == nil {
 		return nil
 	}
 	out := make([]string, 0, 2)
 	seen := make(map[string]struct{}, 2)
-	appendSlot := func(slot string) {
-		for _, entry := range p.Allowed {
-			if !strings.EqualFold(strings.TrimSpace(entry.Slot), slot) {
-				continue
-			}
-			ref := strings.TrimSpace(entry.Ref)
-			if ref == "" {
-				return
-			}
-			if _, ok := seen[ref]; ok {
-				return
-			}
-			seen[ref] = struct{}{}
-			out = append(out, ref)
+	appendRef := func(ref string) {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
 			return
 		}
+		if _, ok := seen[ref]; ok {
+			return
+		}
+		seen[ref] = struct{}{}
+		out = append(out, ref)
 	}
-	appendSlot("primary")
-	appendSlot("fallback")
+
+	for _, entry := range p.Allowed {
+		if strings.EqualFold(strings.TrimSpace(entry.Slot), "primary") {
+			appendRef(entry.Ref)
+			break
+		}
+	}
+	for _, entry := range p.Allowed {
+		if strings.EqualFold(strings.TrimSpace(entry.Slot), "fallback") {
+			appendRef(entry.Ref)
+		}
+	}
 	return out
 }
