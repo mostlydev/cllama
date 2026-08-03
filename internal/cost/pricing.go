@@ -82,13 +82,24 @@ func DefaultPricing() *Pricing {
 		LongContextInputMultiplier:  2.0,
 		LongContextOutputMultiplier: 1.5,
 	}
+	claudeFable5 := Rate{InputPerMTok: 10.0, OutputPerMTok: 50.0}
+	claudeOpus5 := Rate{InputPerMTok: 5.0, OutputPerMTok: 25.0}
+	// Anthropic offers Sonnet 5 at 2/10 through 2026-08-31. Use the
+	// published 3/15 standard rate as a conservative static ceiling so budget
+	// enforcement does not begin undercounting when the promotion ends.
+	claudeSonnet5 := Rate{InputPerMTok: 3.0, OutputPerMTok: 15.0}
+	claudeHaiku45 := Rate{InputPerMTok: 1.0, OutputPerMTok: 5.0}
+	gemini36Flash := Rate{InputPerMTok: 1.50, OutputPerMTok: 7.50}
 
 	return &Pricing{rates: map[string]map[string]Rate{
 		"anthropic": {
+			"claude-fable-5":    claudeFable5,
+			"claude-opus-5":     claudeOpus5,
+			"claude-sonnet-5":   claudeSonnet5,
 			"claude-sonnet-4":   {InputPerMTok: 3.0, OutputPerMTok: 15.0},
 			"claude-sonnet-4-6": {InputPerMTok: 3.0, OutputPerMTok: 15.0},
 			"claude-haiku-3-5":  {InputPerMTok: 0.80, OutputPerMTok: 4.0},
-			"claude-haiku-4-5":  {InputPerMTok: 0.80, OutputPerMTok: 4.0},
+			"claude-haiku-4-5":  claudeHaiku45,
 			"claude-opus-4":     {InputPerMTok: 15.0, OutputPerMTok: 75.0},
 			"claude-opus-4-6":   {InputPerMTok: 15.0, OutputPerMTok: 75.0},
 		},
@@ -112,14 +123,21 @@ func DefaultPricing() *Pricing {
 			"gpt-5-pro": {InputPerMTok: 15.0, OutputPerMTok: 120.0},
 		},
 		"openrouter": {
-			// OpenRouter passes through to upstream providers; rates match origin pricing.
+			// OpenRouter passes through upstream pricing. Sonnet 5 deliberately
+			// retains the conservative post-promotion ceiling described above.
+			"anthropic/claude-fable-5":   claudeFable5,
+			"anthropic/claude-opus-5":    claudeOpus5,
+			"anthropic/claude-sonnet-5":  claudeSonnet5,
 			"anthropic/claude-sonnet-4":  {InputPerMTok: 3.0, OutputPerMTok: 15.0},
+			"anthropic/claude-haiku-4.5": claudeHaiku45,
 			"anthropic/claude-haiku-3-5": {InputPerMTok: 0.80, OutputPerMTok: 4.0},
+			"google/gemini-3.6-flash":    gemini36Flash,
 			"google/gemini-2.5-pro":      {InputPerMTok: 1.25, OutputPerMTok: 10.0},
 			"google/gemini-2.5-flash":    {InputPerMTok: 0.15, OutputPerMTok: 0.60},
 		},
 		// Google pricing is simplified to the standard <=200k-token text tier.
 		"google": {
+			"gemini-3.6-flash": gemini36Flash,
 			"gemini-2.5-pro":   {InputPerMTok: 1.25, OutputPerMTok: 10.0},
 			"gemini-2.5-flash": {InputPerMTok: 0.30, OutputPerMTok: 2.50},
 		},
