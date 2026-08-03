@@ -64,6 +64,7 @@ const duplicateManagedToolCallFinalizationIntervention = "duplicate_managed_tool
 const managedToolBudgetFinalizationIntervention = "managed_tool_budget_finalization"
 const managedToolSoftDeadlineFinalizationIntervention = "managed_tool_soft_deadline_finalization"
 const managedToolSchemaRejectedIntervention = "managed_tool_schema_rejected"
+const responsesReasoningReplayDroppedIntervention = "reasoning_replay_dropped_failover"
 const managedToolTerminalOnSuccessIntervention = "managed_tool_terminal_on_success"
 const managedToolTerminalOnSuccessAnnotation = "x-claw.terminalOnSuccess"
 const managedToolTerminalOrderRejectedIntervention = "managed_tool_terminal_order_rejected"
@@ -75,12 +76,13 @@ const managedToolSoftDeadlineFinalizationMessage = managedToolBudgetFinalization
 const managedToolDuplicateFinalizationMessage = "This managed tool call was repeated with identical arguments. Do not call tools again. Produce your final answer now from the earlier tool result; if evidence is insufficient, give an explicit no-go/defer."
 
 type capturedResponse struct {
-	StatusCode    int
-	Header        http.Header
-	Body          []byte
-	ProviderName  string
-	UpstreamModel string
-	RequestBody   []byte
+	StatusCode         int
+	Header             http.Header
+	Body               []byte
+	ProviderName       string
+	UpstreamModel      string
+	RequestBody        []byte
+	ResponsesReasoning []json.RawMessage
 }
 
 type dispatchJSONAttemptResult struct {
@@ -226,6 +228,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 	}()
 	var toolTrace []sessionhistory.ToolRoundTrace
 	var hiddenMessages []json.RawMessage
+	var reasoningReplay []responsesReasoningReplay
 	var requestEffective []byte
 	var lastProvider string
 	var lastUpstreamModel string
@@ -242,7 +245,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 		}
 		roundStarted := time.Now()
 		dispatchResult := waitWithManagedKeepalive(streamKeepalive, managedModelWaitComment(len(toolTrace)+1), func() managedDispatchResult {
-			resp, status, msg, err := h.dispatchCandidatesJSON(loopCtx, r, agentID, requestedModel, payload, candidates, requestInfo)
+			resp, status, msg, err := h.dispatchCandidatesJSONWithReasoning(loopCtx, r, agentID, requestedModel, payload, candidates, requestInfo, reasoningReplay)
 			return managedDispatchResult{
 				Response: resp,
 				Status:   status,
@@ -375,6 +378,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			finishToolRoundTrace(&roundTrace, roundStarted)
 			toolTrace = append(toolTrace, roundTrace)
 			appendOpenAIAssistantAndToolMessages(payload, assistantMessage, toolMessages)
+			reasoningReplay = appendResponsesReasoningReplay(reasoningReplay, resp, assistantMessage)
 			appendOpenAIFinalizationInstruction(payload)
 			disableOpenAITools(payload)
 			hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, assistantMessage, toolMessages)
@@ -388,6 +392,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			finishToolRoundTrace(&roundTrace, roundStarted)
 			toolTrace = append(toolTrace, roundTrace)
 			appendOpenAIAssistantAndToolMessages(payload, assistantMessage, toolMessages)
+			reasoningReplay = appendResponsesReasoningReplay(reasoningReplay, resp, assistantMessage)
 			appendOpenAISoftDeadlineFinalizationInstruction(payload)
 			disableOpenAITools(payload)
 			hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, assistantMessage, toolMessages)
@@ -402,6 +407,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			finishToolRoundTrace(&roundTrace, roundStarted)
 			toolTrace = append(toolTrace, roundTrace)
 			appendOpenAIAssistantAndToolMessages(payload, assistantMessage, toolMessages)
+			reasoningReplay = appendResponsesReasoningReplay(reasoningReplay, resp, assistantMessage)
 			hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, assistantMessage, toolMessages)
 			continue
 		}
@@ -413,6 +419,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			finishToolRoundTrace(&roundTrace, roundStarted)
 			toolTrace = append(toolTrace, roundTrace)
 			appendOpenAIAssistantAndToolMessages(payload, assistantMessage, toolMessages)
+			reasoningReplay = appendResponsesReasoningReplay(reasoningReplay, resp, assistantMessage)
 			hiddenMessages = appendManagedOpenAIContinuityMessages(hiddenMessages, assistantMessage, toolMessages)
 			continue
 		}
@@ -493,6 +500,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			managedAssistant = buildOpenAIAssistantMessage(assistantMessage, managedCalls, true)
 		}
 		appendOpenAIAssistantAndToolMessages(payload, managedAssistant, toolMessages)
+		reasoningReplay = appendResponsesReasoningReplay(reasoningReplay, resp, managedAssistant)
 		// Persist the filtered managed-only assistant so the hidden continuity
 		// transcript matches what the model saw — including the authoritative
 		// receipt round, which is what prevents a later turn from re-executing
@@ -858,6 +866,10 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 }
 
 func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, agentID string, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestInfo *logging.RequestInfo) (*capturedResponse, int, string, error) {
+	return h.dispatchCandidatesJSONWithReasoning(ctx, r, agentID, requestedModel, payload, candidates, requestInfo, nil)
+}
+
+func (h *Handler) dispatchCandidatesJSONWithReasoning(ctx context.Context, r *http.Request, agentID string, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestInfo *logging.RequestInfo, reasoningReplay []responsesReasoningReplay) (*capturedResponse, int, string, error) {
 	sawCooldown := false
 	start := time.Now()
 	for i, candidate := range candidates {
@@ -867,7 +879,7 @@ func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, a
 		if err != nil {
 			return nil, http.StatusInternalServerError, "failed to encode upstream body", err
 		}
-		upstream, err := encodeUpstreamRequest(candidate, r.URL.Path, payload, outBody)
+		upstream, droppedReasoning, err := encodeUpstreamRequestWithReasoning(candidate, r.URL.Path, payload, outBody, reasoningReplay)
 		if err != nil {
 			if message, ok := responsesAdapterClientError(err); ok {
 				return nil, http.StatusBadRequest, message, err
@@ -876,8 +888,11 @@ func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, a
 		}
 		if upstream.Adapter {
 			h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter")
+			if droppedReasoning {
+				h.logger.LogIntervention(agentID, requestedModel, responsesReasoningReplayDroppedIntervention)
+			}
 		}
-		result := h.dispatchJSONWithRetry(ctx, r, agentID, requestedModel, candidate, upstream, outBody, requestInfo, canFallback)
+		result := h.dispatchJSONWithRetry(ctx, r, agentID, requestedModel, candidate, upstream, outBody, requestInfo, canFallback, reasoningReplay)
 		if result.Response != nil {
 			return result.Response, 0, "", nil
 		}
@@ -901,7 +916,7 @@ func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, a
 
 // outBody is the agent-facing chat/completions body, retained as the captured
 // request even when upstream carries the translated Responses shape.
-func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, agentID string, requestedModel string, candidate dispatchCandidate, upstream upstreamEncoding, outBody []byte, requestInfo *logging.RequestInfo, canFallback bool) dispatchJSONAttemptResult {
+func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, agentID string, requestedModel string, candidate dispatchCandidate, upstream upstreamEncoding, outBody []byte, requestInfo *logging.RequestInfo, canFallback bool, reasoningReplay []responsesReasoningReplay) dispatchJSONAttemptResult {
 	const maxKeyAttempts = 5
 	sawCooldown := false
 
@@ -1011,10 +1026,14 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			// Same recovery as the direct dispatch path: upstream may declare a
 			// model responses-only that the built-in list does not know yet.
 			if !upstream.Adapter && responsesAdapterEligible(r.URL.Path) && responsesOnlyUpstreamSignal(resp) {
-				if adapted, adaptErr := adaptChatBodyToResponses(outBody); adaptErr == nil {
+				matchingReasoning, droppedReasoning := responsesReasoningForCandidate(reasoningReplay, candidate)
+				if adapted, adaptErr := adaptChatBodyToResponsesWithReasoning(outBody, matchingReasoning); adaptErr == nil {
 					resp.Body.Close()
 					cancel()
 					h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter_retry")
+					if droppedReasoning {
+						h.logger.LogIntervention(agentID, requestedModel, responsesReasoningReplayDroppedIntervention)
+					}
 					upstream = adapted
 					continue
 				} else if message, ok := responsesAdapterClientError(adaptErr); ok {
@@ -1070,10 +1089,11 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			}
 			cancel()
 			capturedBody := limited.Body
+			var responsesReasoning []json.RawMessage
 			if upstream.Adapter {
 				// Translate before the mediation loop sees it: every round of
 				// the loop parses the chat/completions shape.
-				converted, convErr := responsesToChatCompletion(capturedBody)
+				converted, reasoning, convErr := responsesToChatCompletionWithReasoning(capturedBody)
 				if convErr != nil {
 					if canFallback {
 						h.logCandidateFallback(agentID, requestedModel, "responses_adapter_error")
@@ -1091,15 +1111,17 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 					}
 				}
 				capturedBody = converted
+				responsesReasoning = reasoning
 			}
 			return dispatchJSONAttemptResult{
 				Response: &capturedResponse{
-					StatusCode:    resp.StatusCode,
-					Header:        resp.Header.Clone(),
-					Body:          capturedBody,
-					ProviderName:  candidate.ProviderName,
-					UpstreamModel: candidate.UpstreamModel,
-					RequestBody:   append([]byte(nil), outBody...),
+					StatusCode:         resp.StatusCode,
+					Header:             resp.Header.Clone(),
+					Body:               capturedBody,
+					ProviderName:       candidate.ProviderName,
+					UpstreamModel:      candidate.UpstreamModel,
+					RequestBody:        append([]byte(nil), outBody...),
+					ResponsesReasoning: responsesReasoning,
 				},
 			}
 		}
@@ -2506,6 +2528,37 @@ func appendOpenAIAssistantAndToolMessages(payload map[string]any, assistantMessa
 	messages = append(messages, assistantMessage)
 	messages = append(messages, toolMessages...)
 	payload["messages"] = messages
+}
+
+func appendResponsesReasoningReplay(dst []responsesReasoningReplay, resp *capturedResponse, assistantMessage map[string]any) []responsesReasoningReplay {
+	if resp == nil || len(resp.ResponsesReasoning) == 0 {
+		return dst
+	}
+	toolCalls, _ := assistantMessage["tool_calls"].([]any)
+	callIDs := chatToolCallIDs(toolCalls)
+	if len(callIDs) == 0 {
+		return dst
+	}
+	if len(dst) > 0 {
+		last := dst[len(dst)-1]
+		if !strings.EqualFold(strings.TrimSpace(last.ProviderName), strings.TrimSpace(resp.ProviderName)) ||
+			strings.TrimSpace(last.UpstreamModel) != strings.TrimSpace(resp.UpstreamModel) {
+			// A candidate transition breaks the opaque reasoning chain. Never
+			// revive an earlier candidate's ciphertext after a later round was
+			// produced by another model.
+			dst = nil
+		}
+	}
+	items := make([]json.RawMessage, 0, len(resp.ResponsesReasoning))
+	for _, raw := range resp.ResponsesReasoning {
+		items = append(items, append(json.RawMessage(nil), raw...))
+	}
+	return append(dst, responsesReasoningReplay{
+		ProviderName:  resp.ProviderName,
+		UpstreamModel: resp.UpstreamModel,
+		ToolCallIDs:   append([]string(nil), callIDs...),
+		Items:         items,
+	})
 }
 
 func appendOpenAIFinalizationInstruction(payload map[string]any) {
