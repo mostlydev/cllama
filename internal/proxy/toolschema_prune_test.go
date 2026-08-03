@@ -85,3 +85,36 @@ func TestPruneIsInertWithoutSchema(t *testing.T) {
 		t.Fatal("args mutated without a schema")
 	}
 }
+
+func TestPruneSelectionIsModelScoped(t *testing.T) {
+	t.Setenv(EnvToolArgPruneSentinels, "vercel/openai/gpt-5.6")
+
+	if !toolArgPruneSentinelsFor("vercel/openai/gpt-5.6-luna") {
+		t.Fatal("selected model should prune")
+	}
+	// A different model sharing the same proxy must be unaffected: the
+	// judgement was made about one model family, not the pod.
+	if toolArgPruneSentinelsFor("vercel/minimax/minimax-m3") {
+		t.Fatal("unselected model must not prune")
+	}
+	if toolArgPruneSentinelsFor("openai/gpt-5.6-luna") {
+		t.Fatal("provider must match, not just the model prefix")
+	}
+}
+
+func TestPruneIsOffWhenUnset(t *testing.T) {
+	t.Setenv(EnvToolArgPruneSentinels, "")
+	if toolArgPruneSentinelsFor("vercel/openai/gpt-5.6-luna") {
+		t.Fatal("empty selector must disable pruning entirely")
+	}
+}
+
+func TestPruneSelectorIgnoresMalformedEntries(t *testing.T) {
+	t.Setenv(EnvToolArgPruneSentinels, "garbage,,vercel/,/x,vercel/openai/gpt-5.6")
+	if !toolArgPruneSentinelsFor("vercel/openai/gpt-5.6-luna") {
+		t.Fatal("a valid entry alongside malformed ones must still select")
+	}
+	if toolArgPruneSentinelsFor("vercel/anthropic/claude-haiku-4.5") {
+		t.Fatal("malformed entries must not widen selection")
+	}
+}
