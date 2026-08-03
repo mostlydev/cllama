@@ -295,6 +295,18 @@ func bareModelAliases(ref string) []string {
 	return out
 }
 
+// failoverUnreachable reports a policy that declares several models but resolves
+// to a single dispatch candidate — because the extra models sit in slots that do
+// not participate in failover. The operator asked for protection and has none,
+// and today the only symptom is a bare 502 that reads like a credentials
+// problem, so this is worth saying out loud.
+func failoverUnreachable(policy *agentctx.ModelPolicy, candidates []dispatchCandidate) bool {
+	if policy == nil || len(candidates) != 1 {
+		return false
+	}
+	return len(policy.AllowedModelRefs()) > 1
+}
+
 func candidateRefsFromPolicy(policy *agentctx.ModelPolicy, chosenRef string) []string {
 	if strings.TrimSpace(chosenRef) == "" {
 		return nil

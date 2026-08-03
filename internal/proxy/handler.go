@@ -710,6 +710,9 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	if resolution.Intervention != "" {
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}
+	if agentCtx != nil && failoverUnreachable(agentCtx.ModelPolicy, resolution.Candidates) {
+		h.logger.LogIntervention(agentID, requestedModel, "policy_failover_unreachable")
+	}
 	if managedTool {
 		h.handleManagedOpenAI(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, downstreamStream, downstreamIncludeUsage, start, feedCtx.PendingCommit, requestInfo)
 		return
@@ -800,6 +803,9 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	h.captureContextSnapshot(agentID, "anthropic", requestedModel, payload, resolution, feedCtx.Blocks, contextBlocks.Snapshots, memoryRecall, timeContext, managedTool, 1)
 	if resolution.Intervention != "" {
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
+	}
+	if agentCtx != nil && failoverUnreachable(agentCtx.ModelPolicy, resolution.Candidates) {
+		h.logger.LogIntervention(agentID, requestedModel, "policy_failover_unreachable")
 	}
 	if managedTool {
 		h.handleManagedAnthropic(w, r, agentID, agentCtx, requestedModel, payload, resolution.Candidates, inBody, downstreamStream, start, feedCtx.PendingCommit, requestInfo)
