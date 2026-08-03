@@ -54,6 +54,43 @@ func TestLookupGoogleGeminiProModel(t *testing.T) {
 	}
 }
 
+func TestLookupCurrentClaudeAndGeminiModels(t *testing.T) {
+	tests := []struct {
+		provider   string
+		model      string
+		wantInput  float64
+		wantOutput float64
+	}{
+		{provider: "anthropic", model: "claude-fable-5", wantInput: 10.0, wantOutput: 50.0},
+		{provider: "anthropic", model: "claude-opus-5", wantInput: 5.0, wantOutput: 25.0},
+		{provider: "anthropic", model: "claude-sonnet-5", wantInput: 3.0, wantOutput: 15.0},
+		{provider: "anthropic", model: "claude-haiku-4-5", wantInput: 1.0, wantOutput: 5.0},
+		{provider: "google", model: "gemini-3.6-flash", wantInput: 1.5, wantOutput: 7.5},
+		{provider: "openrouter", model: "anthropic/claude-fable-5", wantInput: 10.0, wantOutput: 50.0},
+		{provider: "openrouter", model: "anthropic/claude-opus-5", wantInput: 5.0, wantOutput: 25.0},
+		{provider: "openrouter", model: "anthropic/claude-sonnet-5", wantInput: 3.0, wantOutput: 15.0},
+		{provider: "openrouter", model: "anthropic/claude-haiku-4.5", wantInput: 1.0, wantOutput: 5.0},
+		{provider: "openrouter", model: "google/gemini-3.6-flash", wantInput: 1.5, wantOutput: 7.5},
+	}
+
+	pricing := DefaultPricing()
+	for _, tt := range tests {
+		t.Run(tt.provider+"/"+tt.model, func(t *testing.T) {
+			rate, ok := pricing.Lookup(tt.provider, tt.model)
+			if !ok {
+				t.Fatalf("missing pricing for %s/%s", tt.provider, tt.model)
+			}
+			if rate.InputPerMTok != tt.wantInput || rate.OutputPerMTok != tt.wantOutput {
+				t.Fatalf("%s/%s pricing = %+v; want input=%v output=%v", tt.provider, tt.model, rate, tt.wantInput, tt.wantOutput)
+			}
+			wantCost := tt.wantInput + tt.wantOutput
+			if got := rate.Compute(1_000_000, 1_000_000); got != wantCost {
+				t.Fatalf("%s/%s cost = %v; want %v", tt.provider, tt.model, got, wantCost)
+			}
+		})
+	}
+}
+
 func TestComputeCost(t *testing.T) {
 	rate := Rate{InputPerMTok: 3.0, OutputPerMTok: 15.0}
 	cost := rate.Compute(1000, 500)
