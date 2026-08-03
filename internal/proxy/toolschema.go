@@ -1,9 +1,11 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 )
 
@@ -260,4 +262,95 @@ func jsonTypeName(value any) string {
 		return "number"
 	}
 	return fmt.Sprintf("%T", value)
+}
+
+// EnvToolArgPruneSentinels opts a pod into dropping optional arguments whose
+// value is the schema's own `minimum`. Default off: this discards data the
+// model emitted, so it is only correct where a model is known to fabricate
+// these, and it must be a deliberate operator choice.
+const EnvToolArgPruneSentinels = "CLLAMA_TOOL_ARG_PRUNE_SENTINELS"
+
+func toolArgPruneSentinelsFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvToolArgPruneSentinels))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// pruneSentinelOptionalArgs removes top-level optional arguments whose value is
+// exactly the `minimum` their own schema declares, returning the names dropped.
+//
+// Some model families populate every optional parameter rather than omitting
+// the ones they were not asked for, and reach for the schema's lower bound as
+// the filler. On a trading API that turns a valid order into a rejected one:
+// an otherwise correct LIMIT proposal arrives carrying amount_requested 0.01
+// and stop_price 0.0001, and the service refuses it.
+//
+// Scope is deliberately narrow. Only top-level properties, only ones absent
+// from `required`, only numbers, and only an exact match against `minimum` —
+// a value the caller had to go out of its way to choose, since it is the least
+// useful legal value of a field it was not asked to set. Anything else is
+// left alone and remains the service's business to accept or reject.
+//
+// This is lossy by construction and cannot distinguish fabrication from a
+// caller that genuinely meant the minimum, which is why it is opt-in.
+func pruneSentinelOptionalArgs(schema map[string]any, args map[string]any) []string {
+	if len(schema) == 0 || len(args) == 0 {
+		return nil
+	}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	required := map[string]bool{}
+	if list, ok := schema["required"].([]any); ok {
+		for _, name := range list {
+			if s, ok := name.(string); ok {
+				required[s] = true
+			}
+		}
+	}
+
+	var pruned []string
+	for name, value := range args {
+		if required[name] {
+			continue
+		}
+		property, ok := properties[name].(map[string]any)
+		if !ok {
+			continue
+		}
+		minimum, ok := toFloat(property["minimum"])
+		if !ok {
+			continue
+		}
+		actual, ok := toFloat(value)
+		if !ok || actual != minimum {
+			continue
+		}
+		delete(args, name)
+		pruned = append(pruned, name)
+	}
+	sort.Strings(pruned)
+	return pruned
+}
+
+func toFloat(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case json.Number:
+		f, err := v.Float64()
+		return f, err == nil
+	default:
+		return 0, false
+	}
 }

@@ -64,6 +64,7 @@ const duplicateManagedToolCallFinalizationIntervention = "duplicate_managed_tool
 const managedToolBudgetFinalizationIntervention = "managed_tool_budget_finalization"
 const managedToolSoftDeadlineFinalizationIntervention = "managed_tool_soft_deadline_finalization"
 const managedToolSchemaRejectedIntervention = "managed_tool_schema_rejected"
+const managedToolArgsPrunedIntervention = "managed_tool_args_pruned"
 const responsesReasoningReplayDroppedIntervention = "reasoning_replay_dropped_failover"
 const managedToolTerminalOnSuccessIntervention = "managed_tool_terminal_on_success"
 const managedToolTerminalOnSuccessAnnotation = "x-claw.terminalOnSuccess"
@@ -1475,6 +1476,12 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 func (h *Handler) rejectSchemaViolations(agentID, requestedModel string, resolved resolvedManagedTool, args map[string]any, trace *sessionhistory.ToolCallTrace) *managedToolOutcome {
 	if !h.toolSchemaValidation {
 		return nil
+	}
+	if h.toolArgPruneSentinels {
+		if pruned := pruneSentinelOptionalArgs(resolved.Manifest.InputSchema, args); len(pruned) > 0 {
+			h.logger.LogIntervention(agentID, requestedModel,
+				managedToolArgsPrunedIntervention+":"+resolved.CanonicalName+":"+strings.Join(pruned, ","))
+		}
 	}
 	violations := validateManagedToolArgs(resolved.Manifest.InputSchema, args)
 	if len(violations) == 0 {
