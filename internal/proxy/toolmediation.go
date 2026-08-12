@@ -60,6 +60,7 @@ const mixedToolOrderMessage = "mixed managed and runner-native tool calls are no
 const managedMixedPrefixSerializedIntervention = "managed_prefix_native_suffix_serialized"
 const mixedToolOrderInternalRetryIntervention = "mixed_tool_order_internal_retry"
 const duplicateManagedToolCallIntervention = "duplicate_managed_tool_call"
+const repeatedFailedManagedToolCallSuppressedIntervention = "repeated_failed_managed_tool_call_suppressed"
 const duplicateManagedToolCallFinalizationIntervention = "duplicate_managed_tool_call_finalization"
 const managedToolBudgetFinalizationIntervention = "managed_tool_budget_finalization"
 const managedToolSoftDeadlineFinalizationIntervention = "managed_tool_soft_deadline_finalization"
@@ -132,24 +133,30 @@ type managedToolDuplicateTracker struct {
 }
 
 type managedToolSeen struct {
-	Round      int
-	Count      int
-	Result     []byte
-	Status     string
-	StatusCode int
+	Round        int
+	Count        int
+	Result       []byte
+	Status       string
+	StatusCode   int
+	FailureClass string
+	FailureCount int
 }
 
 type managedToolDuplicate struct {
-	CanonicalName   string
-	Service         string
-	Arguments       json.RawMessage
-	FirstRound      int
-	Count           int
-	Streak          int
-	CachedResult    []byte
-	HasCachedResult bool
-	Status          string
-	StatusCode      int
+	CanonicalName     string
+	Service           string
+	Arguments         json.RawMessage
+	FirstRound        int
+	Count             int
+	Streak            int
+	CachedResult      []byte
+	HasCachedResult   bool
+	Status            string
+	StatusCode        int
+	Failed            bool
+	FailureClass      string
+	FailureCount      int
+	AmbiguousMutation bool
 }
 
 type managedUsageAggregate struct {
@@ -440,9 +447,12 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				finalizeAfterSoftDeadline = true
 				break
 			}
-			if duplicate := duplicates.ObserveOpenAI(agentCtx, call, len(toolTrace)+1); duplicate != nil {
+			if duplicate := duplicates.ObserveOpenAI(agentCtx, call, len(toolTrace)+1); shouldSuppressManagedDuplicate(duplicate, h.managedDuplicatePolicy) {
 				outcome := duplicateManagedToolOutcomeForCall(agentCtx, call.Name, duplicate, h.managedDuplicatePolicy)
 				h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallIntervention+":"+duplicate.CanonicalName)
+				if duplicate.Failed && h.managedDuplicatePolicy == managedDuplicatePolicyReplay {
+					h.logger.LogIntervention(agentID, requestedModel, repeatedFailedManagedToolCallSuppressedIntervention+":"+duplicate.CanonicalName)
+				}
 				if !finalizeAfterDuplicate && duplicate.Streak >= h.managedDuplicateStreakCutoff {
 					h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallFinalizationIntervention+":"+duplicate.CanonicalName)
 					finalizeAfterDuplicate = true
@@ -768,9 +778,12 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				finalizeAfterSoftDeadline = true
 				break
 			}
-			if duplicate := duplicates.ObserveAnthropic(agentCtx, call, len(toolTrace)+1); duplicate != nil {
+			if duplicate := duplicates.ObserveAnthropic(agentCtx, call, len(toolTrace)+1); shouldSuppressManagedDuplicate(duplicate, h.managedDuplicatePolicy) {
 				outcome := duplicateManagedToolOutcomeForCall(agentCtx, call.Name, duplicate, h.managedDuplicatePolicy)
 				h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallIntervention+":"+duplicate.CanonicalName)
+				if duplicate.Failed && h.managedDuplicatePolicy == managedDuplicatePolicyReplay {
+					h.logger.LogIntervention(agentID, requestedModel, repeatedFailedManagedToolCallSuppressedIntervention+":"+duplicate.CanonicalName)
+				}
 				if !finalizeAfterDuplicate && duplicate.Streak >= h.managedDuplicateStreakCutoff {
 					h.logger.LogIntervention(agentID, requestedModel, duplicateManagedToolCallFinalizationIntervention+":"+duplicate.CanonicalName)
 					finalizeAfterDuplicate = true
@@ -1244,7 +1257,7 @@ func (t *managedToolDuplicateTracker) ObserveOpenAI(agentCtx *agentctx.AgentCont
 	if !ok {
 		return nil
 	}
-	return t.observe(resolved.CanonicalName, resolved.Manifest.Execution.Service, call.ArgumentsRaw, call.Arguments, round)
+	return t.observe(resolved.CanonicalName, resolved.Manifest.Execution.Service, resolved.Manifest.Execution.Method, call.ArgumentsRaw, call.Arguments, round)
 }
 
 func (t *managedToolDuplicateTracker) StoreOpenAIResult(agentCtx *agentctx.AgentContext, call openAIToolCall, round int, outcome managedToolOutcome) {
@@ -1266,7 +1279,7 @@ func (t *managedToolDuplicateTracker) ObserveAnthropic(agentCtx *agentctx.AgentC
 	if !ok {
 		return nil
 	}
-	return t.observe(resolved.CanonicalName, resolved.Manifest.Execution.Service, call.ArgumentsRaw, call.Arguments, round)
+	return t.observe(resolved.CanonicalName, resolved.Manifest.Execution.Service, resolved.Manifest.Execution.Method, call.ArgumentsRaw, call.Arguments, round)
 }
 
 func (t *managedToolDuplicateTracker) StoreAnthropicResult(agentCtx *agentctx.AgentContext, call anthropicToolUse, round int, outcome managedToolOutcome) {
@@ -1280,7 +1293,7 @@ func (t *managedToolDuplicateTracker) StoreAnthropicResult(agentCtx *agentctx.Ag
 	t.store(resolved.CanonicalName, call.ArgumentsRaw, call.Arguments, round, outcome)
 }
 
-func (t *managedToolDuplicateTracker) observe(canonicalName, service string, rawArgs json.RawMessage, args map[string]any, round int) *managedToolDuplicate {
+func (t *managedToolDuplicateTracker) observe(canonicalName, service, method string, rawArgs json.RawMessage, args map[string]any, round int) *managedToolDuplicate {
 	signature, canonicalArgs, ok := managedToolDuplicateSignature(canonicalName, rawArgs, args)
 	if !ok {
 		return nil
@@ -1298,16 +1311,20 @@ func (t *managedToolDuplicateTracker) observe(canonicalName, service string, raw
 	t.seen[signature] = seen
 	t.duplicateStreak++
 	return &managedToolDuplicate{
-		CanonicalName:   canonicalName,
-		Service:         service,
-		Arguments:       canonicalArgs,
-		FirstRound:      seen.Round,
-		Count:           seen.Count,
-		Streak:          t.duplicateStreak,
-		CachedResult:    append([]byte(nil), seen.Result...),
-		HasCachedResult: len(seen.Result) > 0,
-		Status:          seen.Status,
-		StatusCode:      seen.StatusCode,
+		CanonicalName:     canonicalName,
+		Service:           service,
+		Arguments:         canonicalArgs,
+		FirstRound:        seen.Round,
+		Count:             seen.Count,
+		Streak:            t.duplicateStreak,
+		CachedResult:      append([]byte(nil), seen.Result...),
+		HasCachedResult:   len(seen.Result) > 0,
+		Status:            seen.Status,
+		StatusCode:        seen.StatusCode,
+		Failed:            seen.FailureCount > 0,
+		FailureClass:      seen.FailureClass,
+		FailureCount:      seen.FailureCount,
+		AmbiguousMutation: managedToolFailureMayHaveMutated(method, seen.StatusCode),
 	}
 }
 
@@ -1326,7 +1343,54 @@ func (t *managedToolDuplicateTracker) store(canonicalName string, rawArgs json.R
 	if strings.TrimSpace(seen.Status) == "" {
 		seen.Status = managedToolResponseStatus(outcome.RawJSON, seen.StatusCode)
 	}
+	if failureClass, failed := managedToolFailureClass(outcome); failed {
+		if failureClass == seen.FailureClass {
+			seen.FailureCount++
+		} else {
+			seen.FailureClass = failureClass
+			seen.FailureCount = 1
+		}
+	} else {
+		seen.FailureClass = ""
+		seen.FailureCount = 0
+	}
 	t.seen[signature] = seen
+}
+
+func managedToolFailureClass(outcome managedToolOutcome) (string, bool) {
+	status := strings.TrimSpace(outcome.Trace.Status)
+	if status == "" {
+		status = managedToolResponseStatus(outcome.Trace.Result, outcome.Trace.StatusCode)
+	}
+	if !strings.EqualFold(status, "error") && outcome.Trace.StatusCode < http.StatusBadRequest {
+		return "", false
+	}
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(outcome.Trace.Result, &payload)
+	code := strings.TrimSpace(payload.Error.Code)
+	if code == "" {
+		code = "error"
+	}
+	return fmt.Sprintf("%d:%s", outcome.Trace.StatusCode, code), true
+}
+
+func shouldSuppressManagedDuplicate(duplicate *managedToolDuplicate, policy string) bool {
+	if duplicate == nil {
+		return false
+	}
+	return policy != managedDuplicatePolicyReplay || !duplicate.Failed || duplicate.AmbiguousMutation || duplicate.FailureCount >= 2
+}
+
+func managedToolFailureMayHaveMutated(method string, statusCode int) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	}
+	return statusCode == 0 || statusCode == http.StatusRequestTimeout || statusCode >= http.StatusInternalServerError
 }
 
 func managedToolDuplicateSignature(canonicalName string, rawArgs json.RawMessage, args map[string]any) (string, json.RawMessage, bool) {
@@ -1368,7 +1432,23 @@ func duplicateManagedToolOutcome(duplicate *managedToolDuplicate, policy string)
 	raw := append([]byte(nil), duplicate.CachedResult...)
 	status := duplicate.Status
 	statusCode := duplicate.StatusCode
-	if policy == managedDuplicatePolicyReject || !duplicate.HasCachedResult {
+	if duplicate.Failed && policy == managedDuplicatePolicyReplay {
+		details := map[string]any{
+			"tool":            duplicate.CanonicalName,
+			"failure_class":   duplicate.FailureClass,
+			"failure_count":   duplicate.FailureCount,
+			"first_round":     duplicate.FirstRound,
+			"change_required": true,
+		}
+		message := fmt.Sprintf("This exact managed tool call already failed %d times with error class %s. The retry was suppressed; change the arguments, tool, or approach before continuing.", duplicate.FailureCount, duplicate.FailureClass)
+		if duplicate.AmbiguousMutation {
+			details["verify_state"] = true
+			message = fmt.Sprintf("This mutating managed tool call failed with ambiguous error class %s and may have completed. The retry was suppressed to avoid a duplicate mutation; verify current state with a read tool before deciding whether to retry.", duplicate.FailureClass)
+		}
+		raw = toolErrorPayload("repeated_failed_tool_call", message, http.StatusConflict, details)
+		status = "error"
+		statusCode = http.StatusConflict
+	} else if policy == managedDuplicatePolicyReject || !duplicate.HasCachedResult {
 		details := map[string]any{
 			"tool":             duplicate.CanonicalName,
 			"first_round":      duplicate.FirstRound,

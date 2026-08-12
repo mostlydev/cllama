@@ -13,6 +13,7 @@ import (
 
 	"github.com/mostlydev/cllama/internal/agentctx"
 	"github.com/mostlydev/cllama/internal/logging"
+	"github.com/mostlydev/cllama/internal/sessionhistory"
 )
 
 func TestBuildManagedToolRequestPreservesFlatJSONBodyByDefault(t *testing.T) {
@@ -367,5 +368,99 @@ func TestManagedToolDuplicateTrackerCanonicalizesArguments(t *testing.T) {
 	anthropicTracker.StoreAnthropicResult(agentCtx, use, 1, managedToolOutcome{RawJSON: firstResult})
 	if duplicate := anthropicTracker.ObserveAnthropic(agentCtx, use, 2); duplicate == nil || duplicate.FirstRound != 1 || duplicate.Streak != 1 || !bytes.Equal(duplicate.CachedResult, firstResult) {
 		t.Fatalf("expected anthropic duplicate metadata, got %+v", duplicate)
+	}
+}
+
+func TestManagedToolDuplicateTrackerRetriesFailuresBeforeSuppressing(t *testing.T) {
+	agentCtx := &agentctx.AgentContext{Tools: managedToolManifest()}
+	tracker := newManagedToolDuplicateTracker()
+	call := openAIToolCall{
+		Name:         "trading-api.get_market_context",
+		Arguments:    map[string]any{"ticker": "NVDA"},
+		ArgumentsRaw: json.RawMessage(`{"ticker":"NVDA"}`),
+	}
+	failure := func(code string, statusCode int) managedToolOutcome {
+		raw := toolErrorPayload(code, "failed", statusCode, nil)
+		return managedToolOutcome{RawJSON: raw, Trace: sessionhistory.ToolCallTrace{
+			Name: "trading-api.get_market_context", Result: raw, Status: "error", StatusCode: statusCode,
+		}}
+	}
+
+	if duplicate := tracker.ObserveOpenAI(agentCtx, call, 1); duplicate != nil {
+		t.Fatalf("first call should execute: %+v", duplicate)
+	}
+	tracker.StoreOpenAIResult(agentCtx, call, 1, failure("http_422", http.StatusUnprocessableEntity))
+
+	second := tracker.ObserveOpenAI(agentCtx, call, 2)
+	if second == nil || !second.Failed || second.FailureCount != 1 || second.FailureClass != "422:http_422" {
+		t.Fatalf("second failed call should be eligible to re-execute: %+v", second)
+	}
+	if shouldSuppressManagedDuplicate(second, managedDuplicatePolicyReplay) {
+		t.Fatal("second failed call must execute instead of replaying stale failure")
+	}
+	tracker.StoreOpenAIResult(agentCtx, call, 2, failure("http_422", http.StatusUnprocessableEntity))
+
+	third := tracker.ObserveOpenAI(agentCtx, call, 3)
+	if third == nil || !third.Failed || third.FailureCount != 2 {
+		t.Fatalf("third same-class failure should be suppressible: %+v", third)
+	}
+	if !shouldSuppressManagedDuplicate(third, managedDuplicatePolicyReplay) {
+		t.Fatal("third same-class failed retry should be suppressed")
+	}
+	outcome := duplicateManagedToolOutcome(third, managedDuplicatePolicyReplay)
+	if outcome.Trace.StatusCode != http.StatusConflict || !bytes.Contains(outcome.RawJSON, []byte(`"code":"repeated_failed_tool_call"`)) {
+		t.Fatalf("expected compact failed-retry advisory, got trace=%+v raw=%s", outcome.Trace, outcome.RawJSON)
+	}
+
+	classChange := newManagedToolDuplicateTracker()
+	_ = classChange.ObserveOpenAI(agentCtx, call, 1)
+	classChange.StoreOpenAIResult(agentCtx, call, 1, failure("http_422", http.StatusUnprocessableEntity))
+	_ = classChange.ObserveOpenAI(agentCtx, call, 2)
+	classChange.StoreOpenAIResult(agentCtx, call, 2, failure("http_409", http.StatusConflict))
+	if duplicate := classChange.ObserveOpenAI(agentCtx, call, 3); duplicate == nil || duplicate.FailureCount != 1 || duplicate.FailureClass != "409:http_409" {
+		t.Fatalf("different error class should restart the failure count: %+v", duplicate)
+	}
+
+	recovery := newManagedToolDuplicateTracker()
+	_ = recovery.ObserveOpenAI(agentCtx, call, 1)
+	recovery.StoreOpenAIResult(agentCtx, call, 1, failure("http_422", http.StatusUnprocessableEntity))
+	_ = recovery.ObserveOpenAI(agentCtx, call, 2)
+	successRaw := []byte(`{"ok":true,"status_code":200}`)
+	recovery.StoreOpenAIResult(agentCtx, call, 2, managedToolOutcome{RawJSON: successRaw, Trace: sessionhistory.ToolCallTrace{
+		Name: "trading-api.get_market_context", Result: successRaw, Status: "ok", StatusCode: http.StatusOK,
+	}})
+	if duplicate := recovery.ObserveOpenAI(agentCtx, call, 3); duplicate == nil || duplicate.Failed || duplicate.FailureCount != 0 || !bytes.Equal(duplicate.CachedResult, successRaw) {
+		t.Fatalf("successful retry should replace the failed state: %+v", duplicate)
+	}
+}
+
+func TestManagedToolDuplicateTrackerDoesNotBlindlyRetryAmbiguousMutation(t *testing.T) {
+	if managedToolFailureMayHaveMutated(http.MethodPost, http.StatusUnprocessableEntity) {
+		t.Fatal("clean 422 rejection must remain eligible for a corrective retry")
+	}
+	if !managedToolFailureMayHaveMutated(http.MethodPost, http.StatusGatewayTimeout) {
+		t.Fatal("mutating timeout must be treated as possibly committed")
+	}
+	if managedToolFailureMayHaveMutated(http.MethodGet, http.StatusGatewayTimeout) {
+		t.Fatal("read-only timeout cannot create a duplicate mutation")
+	}
+
+	duplicate := &managedToolDuplicate{
+		CanonicalName:     "trading-api.create_trigger",
+		Failed:            true,
+		FailureClass:      "504:timeout",
+		FailureCount:      1,
+		AmbiguousMutation: true,
+		HasCachedResult:   true,
+		CachedResult:      toolErrorPayload("timeout", "timed out", http.StatusGatewayTimeout, nil),
+		Status:            "error",
+		StatusCode:        http.StatusGatewayTimeout,
+	}
+	if !shouldSuppressManagedDuplicate(duplicate, managedDuplicatePolicyReplay) {
+		t.Fatal("ambiguous mutating failure should be suppressed before blind retry")
+	}
+	outcome := duplicateManagedToolOutcome(duplicate, managedDuplicatePolicyReplay)
+	if !bytes.Contains(outcome.RawJSON, []byte(`"verify_state":true`)) || !bytes.Contains(outcome.RawJSON, []byte("may have completed")) {
+		t.Fatalf("expected read-back guidance, got %s", outcome.RawJSON)
 	}
 }
