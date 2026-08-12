@@ -280,6 +280,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 
 		lastProvider = resp.ProviderName
 		lastUpstreamModel = resp.UpstreamModel
+		candidates = stickyManagedCandidates(candidates, resp)
 
 		usage, _ := cost.ExtractUsage(resp.Body)
 		usageAgg.AddRound(agentID, usage, resp.ProviderName, resp.UpstreamModel, h)
@@ -615,6 +616,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 
 		lastProvider = resp.ProviderName
 		lastUpstreamModel = resp.UpstreamModel
+		candidates = stickyManagedCandidates(candidates, resp)
 
 		usage, _ := cost.ExtractUsage(resp.Body)
 		usageAgg.AddRound(agentID, usage, resp.ProviderName, resp.UpstreamModel, h)
@@ -881,6 +883,24 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 
 func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, agentID string, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestInfo *logging.RequestInfo) (*capturedResponse, int, string, error) {
 	return h.dispatchCandidatesJSONWithReasoning(ctx, r, agentID, requestedModel, payload, candidates, requestInfo, nil)
+}
+
+// Once a managed turn falls through to a declared fallback, keep subsequent
+// model rounds on that candidate (or a later one). Retrying the failed primary
+// after every tool result turns one upstream outage into N full candidate
+// timeouts and can consume the managed turn deadline before it can answer.
+// Match provider and upstream model because several policy slots may share a
+// gateway provider while selecting different models.
+func stickyManagedCandidates(candidates []dispatchCandidate, resp *capturedResponse) []dispatchCandidate {
+	if resp == nil {
+		return candidates
+	}
+	for i, candidate := range candidates {
+		if candidate.ProviderName == resp.ProviderName && candidate.UpstreamModel == resp.UpstreamModel {
+			return candidates[i:]
+		}
+	}
+	return candidates
 }
 
 func (h *Handler) dispatchCandidatesJSONWithReasoning(ctx context.Context, r *http.Request, agentID string, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestInfo *logging.RequestInfo, reasoningReplay []responsesReasoningReplay) (*capturedResponse, int, string, error) {

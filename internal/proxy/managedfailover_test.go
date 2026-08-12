@@ -130,6 +130,77 @@ func TestManagedDispatchAdvancesToFallbackOnResponseBodyReadError(t *testing.T) 
 	}
 }
 
+// A managed turn may need several model rounds. After the primary fails and a
+// fallback asks for a tool, the next round must stay on that fallback instead
+// of paying the primary failure timeout again.
+func TestManagedTurnKeepsFallbackStickyAcrossToolRounds(t *testing.T) {
+	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":5000}`))
+	}))
+	defer toolSrv.Close()
+
+	var primaryCalls, fallbackCalls int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch payload["model"] {
+		case "primary-model":
+			primaryCalls++
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"message":"primary unavailable"}}`))
+		case "fallback-model":
+			fallbackCalls++
+			if fallbackCalls == 1 {
+				_, _ = w.Write([]byte(`{"id":"chatcmpl-tool","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"trading-api.get_market_context","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-final","choices":[{"message":{"role":"assistant","content":"fallback finished"},"finish_reason":"stop"}]}`))
+		default:
+			t.Fatalf("unexpected model %#v", payload["model"])
+		}
+	}))
+	defer backend.Close()
+
+	reg := provider.NewRegistry("")
+	reg.Set("vercel", &provider.Provider{
+		Name: "vercel", BaseURL: backend.URL + "/v1", APIKey: "gateway-key", Auth: "bearer",
+	})
+	policy := &agentctx.ModelPolicy{
+		Mode: "clamp",
+		Allowed: []agentctx.AllowedModel{
+			{Slot: "primary", Ref: "vercel/primary-model"},
+			{Slot: "fallback", Ref: "vercel/fallback-model"},
+		},
+	}
+	h := NewHandler(reg, stubContextLoaderWithToolsAndPolicy("tiverton", "tiverton:dummy123",
+		managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", ""), policy),
+		logging.New(io.Discard))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		bytes.NewBufferString(`{"model":"vercel/primary-model","messages":[{"role":"user","content":"check"}]}`))
+	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected fallback turn to complete, got %d: %s", w.Code, w.Body.String())
+	}
+	if primaryCalls != 1 {
+		t.Fatalf("primary calls = %d; want 1 across the whole managed turn", primaryCalls)
+	}
+	if fallbackCalls != 2 {
+		t.Fatalf("fallback calls = %d; want tool round plus final round", fallbackCalls)
+	}
+	if !strings.Contains(w.Body.String(), "fallback finished") {
+		t.Fatalf("unexpected downstream body: %s", w.Body.String())
+	}
+}
+
 // With no declared fallback the terminal 502 and its message are preserved.
 func TestManagedDispatchKeepsTerminal502WhenNoFallbackRemains(t *testing.T) {
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
