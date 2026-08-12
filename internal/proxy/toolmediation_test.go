@@ -371,6 +371,59 @@ func TestManagedToolDuplicateTrackerCanonicalizesArguments(t *testing.T) {
 	}
 }
 
+func TestManagedToolDuplicateTrackerInvalidatesReadsAfterMutation(t *testing.T) {
+	agentCtx := &agentctx.AgentContext{Tools: &agentctx.ToolManifest{Tools: []agentctx.ToolManifestEntry{
+		{
+			Name:      "trading-api.get_trigger",
+			Execution: agentctx.ToolExecution{Service: "trading-api", Method: http.MethodGet},
+		},
+		{
+			Name:      "trading-api.update_trigger",
+			Execution: agentctx.ToolExecution{Service: "trading-api", Method: http.MethodPatch},
+		},
+	}}}
+	read := openAIToolCall{
+		Name:         "trading-api.get_trigger",
+		Arguments:    map[string]any{"trigger_id": float64(732)},
+		ArgumentsRaw: json.RawMessage(`{"trigger_id":732}`),
+	}
+	write := openAIToolCall{
+		Name:         "trading-api.update_trigger",
+		Arguments:    map[string]any{"trigger_id": float64(732), "label": "repaired"},
+		ArgumentsRaw: json.RawMessage(`{"trigger_id":732,"label":"repaired"}`),
+	}
+	tracker := newManagedToolDuplicateTracker()
+
+	if duplicate := tracker.ObserveOpenAI(agentCtx, read, 1); duplicate != nil {
+		t.Fatalf("first read should execute: %+v", duplicate)
+	}
+	oldResult := []byte(`{"id":732,"label":"original"}`)
+	tracker.StoreOpenAIResult(agentCtx, read, 1, managedToolOutcome{
+		RawJSON: oldResult,
+		Trace:   sessionhistory.ToolCallTrace{Status: "ok", StatusCode: http.StatusOK},
+	})
+	if duplicate := tracker.ObserveOpenAI(agentCtx, write, 2); duplicate != nil {
+		t.Fatalf("first mutation should execute: %+v", duplicate)
+	}
+	tracker.StoreOpenAIResult(agentCtx, write, 2, managedToolOutcome{
+		RawJSON: []byte(`{"id":732,"label":"repaired"}`),
+		Trace:   sessionhistory.ToolCallTrace{Status: "ok", StatusCode: http.StatusOK},
+	})
+
+	if duplicate := tracker.ObserveOpenAI(agentCtx, read, 3); duplicate != nil {
+		t.Fatalf("read after mutation must execute instead of replaying stale state: %+v", duplicate)
+	}
+	newResult := []byte(`{"id":732,"label":"repaired"}`)
+	tracker.StoreOpenAIResult(agentCtx, read, 3, managedToolOutcome{
+		RawJSON: newResult,
+		Trace:   sessionhistory.ToolCallTrace{Status: "ok", StatusCode: http.StatusOK},
+	})
+	duplicate := tracker.ObserveOpenAI(agentCtx, read, 4)
+	if duplicate == nil || !bytes.Equal(duplicate.CachedResult, newResult) {
+		t.Fatalf("subsequent duplicate should replay the post-mutation read: %+v", duplicate)
+	}
+}
+
 func TestManagedToolDuplicateTrackerRetriesFailuresBeforeSuppressing(t *testing.T) {
 	agentCtx := &agentctx.AgentContext{Tools: managedToolManifest()}
 	tracker := newManagedToolDuplicateTracker()

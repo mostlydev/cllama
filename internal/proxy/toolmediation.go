@@ -135,6 +135,7 @@ type managedToolDuplicateTracker struct {
 type managedToolSeen struct {
 	Round        int
 	Count        int
+	Method       string
 	Result       []byte
 	Status       string
 	StatusCode   int
@@ -1268,7 +1269,7 @@ func (t *managedToolDuplicateTracker) StoreOpenAIResult(agentCtx *agentctx.Agent
 	if !ok {
 		return
 	}
-	t.store(resolved.CanonicalName, call.ArgumentsRaw, call.Arguments, round, outcome)
+	t.store(resolved.CanonicalName, resolved.Manifest.Execution.Method, call.ArgumentsRaw, call.Arguments, round, outcome)
 }
 
 func (t *managedToolDuplicateTracker) ObserveAnthropic(agentCtx *agentctx.AgentContext, call anthropicToolUse, round int) *managedToolDuplicate {
@@ -1290,7 +1291,7 @@ func (t *managedToolDuplicateTracker) StoreAnthropicResult(agentCtx *agentctx.Ag
 	if !ok {
 		return
 	}
-	t.store(resolved.CanonicalName, call.ArgumentsRaw, call.Arguments, round, outcome)
+	t.store(resolved.CanonicalName, resolved.Manifest.Execution.Method, call.ArgumentsRaw, call.Arguments, round, outcome)
 }
 
 func (t *managedToolDuplicateTracker) observe(canonicalName, service, method string, rawArgs json.RawMessage, args map[string]any, round int) *managedToolDuplicate {
@@ -1304,7 +1305,7 @@ func (t *managedToolDuplicateTracker) observe(canonicalName, service, method str
 	}
 	seen, ok := t.seen[signature]
 	if !ok {
-		t.seen[signature] = managedToolSeen{Round: round, Count: 1}
+		t.seen[signature] = managedToolSeen{Round: round, Count: 1, Method: strings.ToUpper(strings.TrimSpace(method))}
 		return nil
 	}
 	seen.Count++
@@ -1328,7 +1329,13 @@ func (t *managedToolDuplicateTracker) observe(canonicalName, service, method str
 	}
 }
 
-func (t *managedToolDuplicateTracker) store(canonicalName string, rawArgs json.RawMessage, args map[string]any, round int, outcome managedToolOutcome) {
+func (t *managedToolDuplicateTracker) store(canonicalName, method string, rawArgs json.RawMessage, args map[string]any, round int, outcome managedToolOutcome) {
+	if managedToolMethodMayMutate(method) {
+		_, failed := managedToolFailureClass(outcome)
+		if !failed || managedToolFailureMayHaveMutated(method, outcome.Trace.StatusCode) {
+			t.invalidateCachedReads()
+		}
+	}
 	signature, _, ok := managedToolDuplicateSignature(canonicalName, rawArgs, args)
 	if !ok {
 		return
@@ -1337,6 +1344,7 @@ func (t *managedToolDuplicateTracker) store(canonicalName string, rawArgs json.R
 	if !ok {
 		seen = managedToolSeen{Round: round, Count: 1}
 	}
+	seen.Method = strings.ToUpper(strings.TrimSpace(method))
 	seen.Result = append([]byte(nil), outcome.RawJSON...)
 	seen.Status = outcome.Trace.Status
 	seen.StatusCode = outcome.Trace.StatusCode
@@ -1355,6 +1363,19 @@ func (t *managedToolDuplicateTracker) store(canonicalName string, rawArgs json.R
 		seen.FailureCount = 0
 	}
 	t.seen[signature] = seen
+}
+
+func (t *managedToolDuplicateTracker) invalidateCachedReads() {
+	if t == nil {
+		return
+	}
+	for signature, seen := range t.seen {
+		if !managedToolMethodMayMutate(seen.Method) {
+			delete(t.seen, signature)
+		}
+	}
+	t.lastSignature = ""
+	t.duplicateStreak = 0
 }
 
 func managedToolFailureClass(outcome managedToolOutcome) (string, bool) {
@@ -1391,6 +1412,15 @@ func managedToolFailureMayHaveMutated(method string, statusCode int) bool {
 		return false
 	}
 	return statusCode == 0 || statusCode == http.StatusRequestTimeout || statusCode >= http.StatusInternalServerError
+}
+
+func managedToolMethodMayMutate(method string) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
 }
 
 func managedToolDuplicateSignature(canonicalName string, rawArgs json.RawMessage, args map[string]any) (string, json.RawMessage, bool) {
