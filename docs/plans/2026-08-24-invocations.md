@@ -84,8 +84,9 @@ Add a stdlib-only public wire package and client:
 - one memory relationship plus named `view`;
 - inline compiled rules plus digest;
 - model policy, budget, channel allowlist, and delegation ceiling;
-- trusted-issuer-only `policy_exempt` for the policy evaluator's own LLM
-  invocation, preserving ADR-025 recursion prevention;
+- `policy_exempt` for the policy evaluator's own LLM Invocation only when the
+  current bundle's controller grant explicitly authorizes it, preserving
+  ADR-025 recursion prevention;
 - requested expiry.
 
 `CreateInvocationResponse` returns only the server-assigned invocation ID,
@@ -135,20 +136,21 @@ Add these routes to `cmd/cllama/main.go` through
 
 This is another surface on the existing binary, not another service.
 
-The reference binary supports two creation authorities behind one
+The reference binary supports two creation paths behind one
 `InvocationAuthorizer` interface:
 
 1. a trusted issuer credential, configured for a local launcher, one central
    human subject, or a pod controller, that may create only its configured
    organizations, subjects, pods, and roles; and
-2. a parent invocation bearer that may create a child only when every resolved
-   capability is within its explicit delegation ceiling.
+2. a parent Invocation bearer, presented alongside an otherwise authorized
+   launcher or controller issuer, that may create a child only when every
+   resolved capability is within its explicit delegation ceiling.
 
 Issuer scopes are explicit rather than an ambient superuser flag. A
 loadout/issuer admin credential cannot create an Invocation or call the data
 plane; a central personal issuer cannot submit capability inputs; and a local
-launcher or pod-controller issuer cannot mutate central bundles unless it was
-separately provisioned with that admin scope.
+launcher or pod-controller issuer cannot mutate bundles. Admin scope is always
+a distinct credential.
 
 The authorizer returns the authorized, normalized Invocation inputs; the
 control handler never persists the raw request first. Every
@@ -166,17 +168,22 @@ A standalone pod or development launcher may publish an atomic bundle with
 explicit `pod-local` or `local` provenance and then use the same selection
 path. A pod-local bundle contains explicit flat single-source role entries;
 there is no inheritance, MGL contract composition, or inferred dependency
-closure. V1 has no separate complete-input create authority. Parent creation
-resolves any selected child role from the same current bundle, starts from the
-resolved parent Invocation, and applies subset checks.
+closure. V1 has no separate complete-input create authority. For a member
+child, parent creation requires both the controller issuer and the parent
+Invocation bearer. It resolves the selected child role from the same current
+bundle, checks that role against the controller's current `controllers` grant,
+starts from the resolved parent Invocation, and applies subset checks. The
+controller credential proves pod scope; the parent bearer proves the
+delegation ceiling.
 
 ### Server-owned organization loadouts
 
 Central mode uses one atomic, versioned bundle per organization rather than
-piecemeal role records. An admin-scoped trusted issuer publishes the complete
-bundle through `PUT /control/v1/loadouts/{organization}`. It contains the
+piecemeal role records. The deployment's bootstrap admin credential publishes
+the complete bundle through `PUT /control/v1/loadouts/{organization}`. It contains the
 person-subject-to-role `members` map, a `controllers` map from stable controller
-ID to member subject namespace and allowed roles, organization context inputs,
+ID to member subject namespace, allowed roles, and the narrowly constrained
+optional evaluator-exemption flag, organization context inputs,
 and every named,
 already-flattened effective role's contract modules, skills, tools, feeds,
 memory view, rules, model policy, budget, channels, delegation ceiling, and
@@ -200,14 +207,24 @@ bundle; every create rechecks the current `controllers` entry. Removing or
 narrowing the entry affects future creates without rotating the token. The pod
 cannot self-select its namespace or role scope.
 
+An internal policy evaluator uses the same controller issuer kind rather than
+a third authentication path. Its current bundle entry has an isolated
+`policy-evaluator/` member namespace, allows only the internal
+`policy-evaluator` role, and explicitly sets `policy_exempt: true`. That flag is
+valid only for this exact role shape. Issuer administration cannot add or
+override it; removing or narrowing the bundle entry disables future evaluator
+Invocation creation.
+
 Role composition is an organization-control-plane concern. cllama does not
-evaluate role inheritance, attributes, labels, or conditions. It accepts only
-declared flat role entries and verifies canonical digests, unique IDs, bounded
-bodies, complete skill/tool dependency closure, credential-reference shape,
-and the other v1 limits. Unknown dependencies, a dependency cycle encoded in
-the index, or a role entry whose claimed source digests do not match—including
-a composite whose recorded parent-revision digests are stale—fails bundle
-publication atomically.
+evaluate role inheritance, attributes, labels, conditions, or whether a parent
+revision is current in the canonical control plane. It accepts only declared
+flat role entries and verifies canonical digests, unique IDs, bounded bodies,
+complete skill/tool dependency closure, credential-reference shape, the
+presence and shape of composite parent-revision digests, and the other v1
+limits. Unknown dependencies, a dependency cycle encoded in the index, or an
+internally inconsistent source digest fails bundle publication atomically.
+my-cli alone raises `role_revision_stale` by comparing those recorded parent
+digests with current canonical revisions before publication.
 
 List and get return redacted metadata, entry digests, and provenance. A
 central-human create resolves the token-bound subject against `members`,
@@ -292,8 +309,10 @@ The late seam then appends, in order:
 5. bounded session/Flux-task startup context; and
 6. dynamic memory, context blocks, feeds, channel deltas, and time.
 
-Purpose is selection metadata plus optional caller-supplied bounded late text;
-there are no purpose modules looked up from the bundle. Labels are propagated
+Each role entry grants exactly one named memory view. Purpose is bounded late
+query/narrowing metadata within that view plus optional caller-supplied text;
+it cannot select another view, and there are no purpose modules looked up from
+the bundle. Labels are propagated
 only as late metadata to already-granted feeds, memory, routing, and audit; they
 do not select modules or grants. OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages
 paths use the same normalized projection and record module provenance and
@@ -357,10 +376,13 @@ grants and their authoritative ledger; accounting, mail, source-control,
 payment, and other domain services own their effects. The effect-owning service
 defines the canonical proposal schema and digest; Flux stores that opaque ID
 and digest. The effect owner or its isolated executor issues a signed,
-audience-bound, expiring, single-use release token after approval. The service
+audience-bound, expiring, single-use release token only after reading the Flux
+approval record with its own credential and verifying that the approved opaque
+proposal digest equals its canonical digest. The service
 validates issuer, signature, audience, digest, expiry, and nonce and consumes
-the token atomically. To
-cllama they are ordinary managed tools. cllama authenticates the Invocation,
+the token atomically. Flux Gate ceremonies apply to JIT access grants, not
+effect-release signing. To cllama these are ordinary managed tools. cllama
+authenticates the Invocation,
 enforces the granted operation and identity binding, records mediation, and
 does not become the approval or effect system of record.
 
@@ -404,13 +426,15 @@ does not become the approval or effect system of record.
   late, no per-turn timestamps in the stable prefix.
 - Parent creation is subset-only across role grants, tools, model policy,
   memory scope/view, budget, channels, TTL, and further delegation.
-- `policy_exempt` can be set only by a trusted issuer, is inherited as false by
+- `policy_exempt` can be set only by a controller issuer whose current bundle
+  grant has the exact internal evaluator shape above, is inherited as false by
   ordinary children, and bypasses policy callbacks only; credential
   starvation, model policy, budget, audit, and all other enforcement remain.
 - A policy evaluator uses a separately published internal
   `policy-evaluator` role entry with no business tools or memory, an explicit
-  model/budget, and a trusted evaluator issuer permitted to set
-  `policy_exempt`; it cannot synthesize a caller-authored loadout.
+  model/budget, and a controller issuer bound to that current bundle entry; it
+  cannot synthesize a caller-authored loadout or gain exemption from issuer
+  administration alone.
 - Central loadout bundles contain only credential aliases; raw provider/tool
   secrets remain in deployment configuration and never enter a bundle,
   Invocation, launcher response, or workload.
@@ -441,12 +465,18 @@ Add focused tests at the ownership boundary:
 - control separation: admin credentials cannot create; launcher/controller
   issuers cannot publish; urgent filtered bulk revoke affects exactly the
   selected organization/bundle/role-entry digest;
+- evaluator authorization: only the current exact `policy-evaluator`
+  controller grant permits `policy_exempt`; admin flags, personal issuers,
+  ordinary controller entries, and child delegation cannot enable it;
 - role-entry validation: exact contract/source digests, complete nested skill
   and tool closure, missing/cyclic dependency rejection, and rejection of any
   stable module or grant on an organization-managed selection create;
 - scoped issuer: digest-only token storage, immutable subject binding,
   cross-subject/cross-role denial, HTTPS requirement for remote use, rotation,
   revocation, and absence from harness environment and audit logs;
+- child create: parent bearer plus launcher/controller issuer are both
+  required; a member child role must fit both the parent delegation ceiling and
+  the controller's current bundle grant;
 - data plane: invalid, expired, and revoked bearers make zero downstream calls;
 - projection: exact stable module order and late-context placement for OpenAI
   Chat Completions, OpenAI Responses, and Anthropic Messages;
@@ -522,7 +552,7 @@ task reference without stable-prefix churn.
 
 ### `TestSpikeScopedCentralIssuer`
 
-Run cllama behind a TLS test server with a bootstrap admin issuer. Use it to
+Run cllama behind a TLS test server with a bootstrap admin credential. Use it to
 create two per-person issuer records and one controller issuer, all bound to
 subjects/controller IDs already present in the current bundle, and prove raw
 tokens are returned once and redacted thereafter. Prove the admin can
@@ -541,6 +571,12 @@ bundle digest still governs new creates.
 Prove controller namespace/role denial, removal from the current bundle,
 attempted self-scoping, and use of any issuer for bundle publication all fail
 closed.
+
+The bootstrap admin is the deployment's single admin-surface credential class:
+it may publish bundles and administer issuers but is never valid for Invocation
+creation or the data plane. A separately scoped controller entry for the
+internal evaluator proves that only the bundle-authorized evaluator can create
+`policy_exempt` Invocations.
 
 Add CI commands for both the ordinary suite and the hermetic spike target. The
 cllama release is blocked unless all seven pass.
