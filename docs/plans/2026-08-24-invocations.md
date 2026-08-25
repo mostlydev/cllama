@@ -136,8 +136,9 @@ Add these routes to `cmd/cllama/main.go` through
   provenance without any secret, with the same credential scope as list;
 - `DELETE /control/v1/invocations/{id}` — revoke idempotently;
 - `POST /control/v1/invocations/revoke` — admin-only bulk revocation filtered
-  by organization plus role-entry or bundle digest, for urgent contract/grant
-  changes; returns redacted IDs and count.
+  by organization plus one or more of subject, role-entry digest, or bundle
+  digest, for urgent membership/contract/grant changes; returns redacted IDs
+  and count.
 
 This is another surface on the existing binary, not another service.
 
@@ -489,7 +490,7 @@ Add focused tests at the ownership boundary:
   before record creation;
 - control separation: admin credentials cannot create; launcher/controller
   issuers cannot publish; urgent filtered bulk revoke affects exactly the
-  selected organization/bundle/role-entry digest;
+  selected organization/subject/bundle/role-entry digest;
 - evaluator authorization: only the current exact `policy-evaluator`
   controller grant permits `policy_exempt`; admin flags, personal issuers,
   ordinary controller entries, and child delegation cannot enable it;
@@ -610,7 +611,8 @@ Prove controller namespace/role denial, removal from the current bundle,
 attempted self-scoping, and use of any issuer for bundle publication all fail
 closed. Prove a personal issuer cannot list/get another subject, a controller
 cannot list/get outside its organization or member namespace, and only the
-bootstrap admin can inspect across those scopes.
+bootstrap admin can inspect across those scopes. Subject-filtered bulk revoke
+affects exactly that person's live Invocations.
 
 The bootstrap admin is the deployment's single admin-surface credential class:
 it may publish bundles and administer issuers but is never valid for Invocation
