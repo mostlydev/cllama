@@ -195,7 +195,8 @@ ID to member subject namespace, allowed roles, an optional declared
 exemption flag, organization context inputs,
 and every named,
 already-flattened effective role's contract modules, skills, tools, feeds,
-memory view, rules, model policy, budget, channels, delegation ceiling, and
+memory view, rules, model policy, budget, channels, `max_invocation_ttl`,
+delegation ceiling, and
 allowed harness protocols. Each role entry carries its organization-contract,
 effective-role-contract, source-role, and skill-body digests. It contains no
 credential.
@@ -206,9 +207,11 @@ configured `server://<organization>/<name>` aliases to process environment or
 deployment secret-store values; other resolvers implement the same narrow
 interface.
 The same rule applies to controller feed entries: central `base_url` must be an
-administrator-published HTTPS origin and `auth_ref` a resolvable
+administrator-published HTTPS origin containing scheme, host, and optional port
+only—no userinfo, path, query, or fragment—and `auth_ref` a resolvable
 organization-scoped server alias. cllama appends only the fixed
-`/feeds/pod-members` path and sends the resolved ADR-013 feed credential; the
+`/feeds/pod-members` path, disables redirects, pins the request to that origin,
+and sends the resolved ADR-013 feed credential; the
 raw credential never enters the bundle, Invocation, controller request, or
 workload. Standalone mode may use its private network origin and local alias.
 The handler validates the entire bundle before atomically replacing the current
@@ -372,7 +375,12 @@ not invalidate the stable role prefix.
   an Invocation is stored.
 - A managed tool may bind to a deployment-owned standing role-service alias or
   to a short-lived subject grant/session supplied by a trusted local broker or
-  Flux Gate runtime integration. A person on a local sidecar may use their own
+  Flux Gate runtime integration. At execution time the injected
+  `ToolPrincipalResolver.Resolve(InvocationIdentity, tool_id, operation,
+  task_ref)` seam may obtain a short-lived Flux Gate binding only for the
+  already-granted tool and operation; it returns the credential directly to the
+  tool executor, cannot widen the loadout, and stores no grant state. A person
+  on a local sidecar may use their own
   OS-keychain/1Password reference. A member cannot request a person binding,
   central cllama stores no standing per-person portal credential, and no secret
   or browser session reaches the harness.
@@ -486,8 +494,10 @@ Add focused tests at the ownership boundary:
   controller grant permits `policy_exempt`; admin flags, personal issuers,
   ordinary controller entries, and child delegation cannot enable it;
 - role-entry validation: exact contract/source digests, complete nested skill
-  and tool closure, missing/cyclic dependency rejection, and rejection of any
-  stable module or grant on an organization-managed selection create;
+  and tool closure, missing/cyclic dependency rejection, positive bounded
+  `max_invocation_ttl`, requested-expiry denial above that ceiling, and
+  rejection of any stable module or grant on an organization-managed selection
+  create;
 - scoped issuer: digest-only token storage, immutable subject binding,
   cross-subject/cross-role denial, HTTPS requirement for remote use, rotation,
   revocation, absence from harness environment and audit logs, and list/get
@@ -506,7 +516,11 @@ Add focused tests at the ownership boundary:
 - membership feed: zero TTL forces a fetch on the next turn and the feed cache
   never shares entries across Invocations; central mode accepts only the
   current controller grant's HTTPS origin and credential alias, and rejects
-  caller-supplied, cross-controller, or non-feed endpoints before fetch;
+  caller-supplied, cross-controller, or non-feed endpoints before fetch; URL
+  userinfo/path/query/fragment and redirects fail with zero follow-on request;
+- tool principal resolution: a short-lived Flux Gate grant resolves only after
+  Invocation/tool/operation/task binding, reaches only the tool executor, and
+  cannot widen the role or persist in cllama;
 - legacy parity: typed semantic comparison of effective requests, not byte
   equality with old generated files;
 - client/fixture conformance: both valid and intentionally invalid v1 fixtures
@@ -570,7 +584,9 @@ secret exposure, missing, mismatched, forged, expired, replayed, and
 wrong-audience release-token denial, and resume in a new Invocation from a Flux
 task reference without stable-prefix churn. From central cllama, fetch the
 member's authenticated `pod-members` endpoint through only the
-bundle-declared controller route and reject an attacker-supplied URL.
+bundle-declared controller route and reject an attacker-supplied URL. A
+redirecting feed returns a fetch failure and receives no follow-on request; URL
+userinfo, path, query, and fragment fail bundle publication.
 
 ### `TestSpikeScopedCentralIssuer`
 
