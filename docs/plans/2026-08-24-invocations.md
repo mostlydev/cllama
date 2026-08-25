@@ -73,8 +73,9 @@ Add a stdlib-only public wire package and client:
   `openai-responses`, and `anthropic-messages`;
 - optional runtime identity: pod, service, ordinal, labels, handles, and image
   digest;
-- ordered context inputs by kind: organization contract, role, purpose/task,
-  and invocation-local modules;
+- for bundle publication, ordered organization/effective-role contract inputs;
+  for selection create, only bounded purpose/task and invocation-local late
+  inputs;
 - skill index entries with optional skill/tool requirements and bounded
   instructional bodies;
 - managed tool specifications with deployment-owned, identity-aware principal
@@ -116,8 +117,9 @@ Add these routes to `cmd/cllama/main.go` through
   list/inspection with digests;
 - `DELETE /control/v1/loadouts/{organization}` — admin-only removal that
   disables future central-human creates for the organization;
-- `POST /control/v1/issuers` — admin-only creation of a subject/organization
-  scoped personal issuer, returning its raw token once;
+- `POST /control/v1/issuers` — admin-only creation of a
+  person/organization-scoped launcher issuer or an
+  organization/controller-scoped pod issuer, returning its raw token once;
 - `GET /control/v1/issuers[/{id}]` — admin-only redacted issuer inspection;
 - `DELETE /control/v1/issuers/{id}` — admin-only idempotent revocation;
 - `POST /control/v1/invocations` — authorize, validate, project, persist, and
@@ -126,7 +128,10 @@ Add these routes to `cmd/cllama/main.go` through
   state;
 - `GET /control/v1/invocations/{id}` — inspect the immutable projection and
   provenance without any secret;
-- `DELETE /control/v1/invocations/{id}` — revoke idempotently.
+- `DELETE /control/v1/invocations/{id}` — revoke idempotently;
+- `POST /control/v1/invocations/revoke` — admin-only bulk revocation filtered
+  by organization plus role-entry or bundle digest, for urgent contract/grant
+  changes; returns redacted IDs and count.
 
 This is another surface on the existing binary, not another service.
 
@@ -149,23 +154,30 @@ The authorizer returns the authorized, normalized Invocation inputs; the
 control handler never persists the raw request first. Every
 organization-managed my-cli or Clawdapus create resolves the server-owned role
 entry from the current organization bundle. A central human authenticator
-supplies its bound person subject; a pod-controller issuer may assert only a
-member subject in its configured pod namespace and one of its scoped roles.
+supplies its bound person subject and is rechecked against `members`. A
+pod-controller issuer supplies its bound controller ID and may assert only a
+member subject in the corresponding bundle-declared namespace and one of that
+controller grant's current roles.
 Either may add only the bounded selection and late inputs described above.
 Thus `mayAssume` is not merely a role boolean followed by acceptance of
 caller-authored tools or context.
 
 A standalone pod or development launcher may publish an atomic bundle with
 explicit `pod-local` or `local` provenance and then use the same selection
-path. V1 has no separate complete-input create authority. Parent creation still
-starts from the resolved parent Invocation and applies subset checks.
+path. A pod-local bundle contains explicit flat single-source role entries;
+there is no inheritance, MGL contract composition, or inferred dependency
+closure. V1 has no separate complete-input create authority. Parent creation
+resolves any selected child role from the same current bundle, starts from the
+resolved parent Invocation, and applies subset checks.
 
 ### Server-owned organization loadouts
 
 Central mode uses one atomic, versioned bundle per organization rather than
 piecemeal role records. An admin-scoped trusted issuer publishes the complete
 bundle through `PUT /control/v1/loadouts/{organization}`. It contains the
-subject-to-role `members` map, organization context inputs, and every named,
+person-subject-to-role `members` map, a `controllers` map from stable controller
+ID to member subject namespace and allowed roles, organization context inputs,
+and every named,
 already-flattened effective role's contract modules, skills, tools, feeds,
 memory view, rules, model policy, budget, channels, delegation ceiling, and
 allowed harness protocols. Each role entry carries its organization-contract,
@@ -181,13 +193,21 @@ The handler validates the entire bundle before atomically replacing the current
 digest, so a caller can never observe mixed organization/role generations and
 removed roles or members do not remain as stale grants.
 
+The bundle is also the sole role-authorization source for
+organization-managed pods. Admin issuer creation binds a controller token to
+an organization and controller ID only after that ID exists in the current
+bundle; every create rechecks the current `controllers` entry. Removing or
+narrowing the entry affects future creates without rotating the token. The pod
+cannot self-select its namespace or role scope.
+
 Role composition is an organization-control-plane concern. cllama does not
 evaluate role inheritance, attributes, labels, or conditions. It accepts only
 declared flat role entries and verifies canonical digests, unique IDs, bounded
 bodies, complete skill/tool dependency closure, credential-reference shape,
 and the other v1 limits. Unknown dependencies, a dependency cycle encoded in
-the index, or a role entry whose claimed source digests do not match fails
-bundle publication atomically.
+the index, or a role entry whose claimed source digests do not match—including
+a composite whose recorded parent-revision digests are stale—fails bundle
+publication atomically.
 
 List and get return redacted metadata, entry digests, and provenance. A
 central-human create resolves the token-bound subject against `members`,
@@ -201,8 +221,10 @@ remain immutable and are governed by normal expiry/revocation.
 
 The reference central-human mechanism is a random per-person issuer token sent
 only over HTTPS. The server stores its digest and maps it to one immutable
-person subject plus organization; current role authorization comes from the
-published bundle, and the client cannot choose a different subject. my-cli
+person subject plus organization. Issuer creation accepts only the exact
+subject ID already present in the current bundle; this credential binding is
+not a person directory. Current role authorization comes from the published
+bundle, and the client cannot choose a different subject. my-cli
 stores the raw issuer token through an OS
 keychain/1Password-style `auth_ref`, never in the organization manifest or
 harness environment. A deployment supplies one bootstrap admin credential via
@@ -257,18 +279,23 @@ services that need them. Never log the bearer secret.
 
 ### Final context assembly
 
-cllama, not a launcher or harness adapter, assembles the effective request in
-one fixed order:
+cllama, not a launcher or harness adapter, assembles the stable
+provider-cacheable prefix in one fixed order:
 
 1. organization contract;
 2. flattened effective-role contract modules;
-3. purpose/task modules;
-4. invocation metadata and skill index;
-5. bounded dynamic memory, context blocks, feeds, channel deltas, and time at
-   the existing late-context seam.
+3. role skill index.
 
-Stable modules remain in the provider-cacheable prefix. Volatile context
-remains late. OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages
+The late seam then appends, in order:
+
+4. bounded purpose/task text and Invocation metadata;
+5. bounded session/Flux-task startup context; and
+6. dynamic memory, context blocks, feeds, channel deltas, and time.
+
+Purpose is selection metadata plus optional caller-supplied bounded late text;
+there are no purpose modules looked up from the bundle. Labels are propagated
+only as late metadata to already-granted feeds, memory, routing, and audit; they
+do not select modules or grants. OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages
 paths use the same normalized projection and record module provenance and
 digests in context snapshots.
 
@@ -320,14 +347,19 @@ not invalidate the stable role prefix.
 
 cllama neither orchestrates business work nor pauses a mediated tool loop for
 human approval. Flux owns durable tasks, blockers, wakes, checkpoints, and
-fingerprinted approval requests. A Flux wake is delivered to a launcher or pod
-controller, which creates a new selection-based Invocation with the Flux task
-reference in the late purpose/task layer.
+fingerprinted approval requests. A controller-side Flux adapter may claim a
+wake and then create a new selection-based Invocation with the Flux task
+reference in the late purpose/task layer; a human explicitly invokes their
+launcher for a queued Flux task. cllama has no wake receiver.
 
 Flux does not perform privileged effects. Flux Gate owns just-in-time access
 grants and their authoritative ledger; accounting, mail, source-control,
-payment, and other domain services own their effects. Those services must
-validate the immutable approval/release receipt for the exact proposal. To
+payment, and other domain services own their effects. The effect-owning service
+defines the canonical proposal schema and digest; Flux stores that opaque ID
+and digest. The effect owner or its isolated executor issues a signed,
+audience-bound, expiring, single-use release token after approval. The service
+validates issuer, signature, audience, digest, expiry, and nonce and consumes
+the token atomically. To
 cllama they are ordinary managed tools. cllama authenticates the Invocation,
 enforces the granted operation and identity binding, records mediation, and
 does not become the approval or effect system of record.
@@ -375,6 +407,10 @@ does not become the approval or effect system of record.
 - `policy_exempt` can be set only by a trusted issuer, is inherited as false by
   ordinary children, and bypasses policy callbacks only; credential
   starvation, model policy, budget, audit, and all other enforcement remain.
+- A policy evaluator uses a separately published internal
+  `policy-evaluator` role entry with no business tools or memory, an explicit
+  model/budget, and a trusted evaluator issuer permitted to set
+  `policy_exempt`; it cannot synthesize a caller-authored loadout.
 - Central loadout bundles contain only credential aliases; raw provider/tool
   secrets remain in deployment configuration and never enter a bundle,
   Invocation, launcher response, or workload.
@@ -392,8 +428,9 @@ Add focused tests at the ownership boundary:
 - store: entropy, digest-only persistence, atomic recovery, expiry,
   revocation, duplicate-ID rejection, concurrent resolution, and no secret in
   list/get/log output;
-- control: issuer authentication, bootstrap-admin and admin-only personal
-  issuer create/redacted-read/revoke, one-time raw token return, admin-only
+- control: issuer authentication, bootstrap-admin and admin-only person and
+  controller issuer create/redacted-read/revoke, current-bundle existence and
+  namespace/role-scope checks, one-time raw token return, admin-only
   atomic bundle put/list/get/delete, complete-bundle validation,
   stale-role/member removal, subject/role denial,
   `loadout_missing`, schema/version and TTL limits, central server-owned
@@ -401,6 +438,9 @@ Add focused tests at the ownership boundary:
   caller-authored capabilities on that path, raw/unknown/cross-organization
   credential-reference rejection, parent subset success, and escalation denial
   before record creation;
+- control separation: admin credentials cannot create; launcher/controller
+  issuers cannot publish; urgent filtered bulk revoke affects exactly the
+  selected organization/bundle/role-entry digest;
 - role-entry validation: exact contract/source digests, complete nested skill
   and tool closure, missing/cyclic dependency rejection, and rejection of any
   stable module or grant on an organization-managed selection create;
@@ -468,20 +508,25 @@ layout as the new design.
 
 ### `TestSpikeRoleOnboarding`
 
-Publish one bundle containing a declared `billing-reconciliation` role with
-organization and role contract revisions, nested skill dependencies, fake
+Use the canonical billing bundle fixture owned by
+`pkg/invocation/testdata/conformance/v1/`. Publish it with a declared
+`billing-reconciliation` role and controller grant, organization and role
+contract revisions, nested skill dependencies, fake
 accounting and browser-broker tools, Flux/Flux Gate tools, and a
-receipt-validating fake send service. Create one person and one member
+release-token-validating fake send service. Create one person and one member
 Invocation by selection. Assert identical stable role/contract/skill/tool
 digests, distinct runtime envelopes and principal bindings, no browser/session
-secret exposure, missing or mismatched receipt denial, and resume in a new
-Invocation from a Flux task reference without stable-prefix churn.
+secret exposure, missing, mismatched, forged, expired, replayed, and
+wrong-audience release-token denial, and resume in a new Invocation from a Flux
+task reference without stable-prefix churn.
 
 ### `TestSpikeScopedCentralIssuer`
 
 Run cllama behind a TLS test server with a bootstrap admin issuer. Use it to
-create two per-person issuer records and prove raw tokens are returned once and
-redacted thereafter. Prove the admin can atomically publish and replace a complete
+create two per-person issuer records and one controller issuer, all bound to
+subjects/controller IDs already present in the current bundle, and prove raw
+tokens are returned once and redacted thereafter. Prove the admin can
+atomically publish and replace a complete
 organization bundle; personal issuers cannot publish or inspect it; an absent
 bundle or role returns `loadout_missing`; each personal token is bound to its
 subject; the published `members` map governs permitted roles; removed
@@ -493,6 +538,9 @@ takes effect on the next create; and no raw admin/personal issuer or
 provider/tool token reaches a workload, list/get response, store record, or
 log. Restart the real process after publication and prove the same canonical
 bundle digest still governs new creates.
+Prove controller namespace/role denial, removal from the current bundle,
+attempted self-scoping, and use of any issuer for bundle publication all fail
+closed.
 
 Add CI commands for both the ordinary suite and the hermetic spike target. The
 cllama release is blocked unless all seven pass.
