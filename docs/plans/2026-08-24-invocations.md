@@ -60,7 +60,8 @@ Add a stdlib-only public wire package and client:
 - stable `subject {kind, id}` where v1 kinds are `person` and `member`;
 - `organization`, `role`, and optional `purpose`;
 - optional `parent_invocation_id`;
-- `harness {name, protocol}`;
+- `harness {name, protocol}` where v1 protocols are `openai-chat`,
+  `openai-responses`, and `anthropic-messages`;
 - optional runtime identity: pod, service, ordinal, labels, handles, and image
   digest;
 - ordered context inputs by kind: organization contract, role, purpose/task,
@@ -71,6 +72,8 @@ Add a stdlib-only public wire package and client:
 - one memory relationship plus named `view`;
 - inline compiled rules plus digest;
 - model policy, budget, channel allowlist, and delegation ceiling;
+- trusted-issuer-only `policy_exempt` for the policy evaluator's own LLM
+  invocation, preserving ADR-025 recursion prevention;
 - requested expiry.
 
 `CreateInvocationResponse` returns only the server-assigned invocation ID,
@@ -156,9 +159,9 @@ one fixed order:
    the existing late-context seam.
 
 Stable modules remain in the provider-cacheable prefix. Volatile context
-remains late. Both OpenAI Responses and Anthropic Messages paths use the same
-normalized projection and record module provenance and digests in context
-snapshots.
+remains late. OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages
+paths use the same normalized projection and record module provenance and
+digests in context snapshots.
 
 Instructional skills are presented as a granted index plus the existing
 managed `load_skill` operation. Ungranted names are indistinguishable from
@@ -217,6 +220,9 @@ proxy authority.
   late, no per-turn timestamps in the stable prefix.
 - Parent creation is subset-only across role grants, tools, model policy,
   memory scope/view, budget, channels, TTL, and further delegation.
+- `policy_exempt` can be set only by a trusted issuer, is inherited as false by
+  ordinary children, and bypasses policy callbacks only; credential
+  starvation, model policy, budget, audit, and all other enforcement remain.
 - The legacy directory adapter and an equivalent Invocation must produce
   semantically equivalent effective upstream requests during migration.
 
@@ -232,7 +238,7 @@ Add focused tests at the ownership boundary:
   creation;
 - data plane: invalid, expired, and revoked bearers make zero downstream calls;
 - projection: exact stable module order and late-context placement for OpenAI
-  Responses and Anthropic Messages;
+  Chat Completions, OpenAI Responses, and Anthropic Messages;
 - isolation: concurrent invocations for one subject with different roles and
   views never share feed cache, context, tools, continuity, snapshots, budget,
   or history;
@@ -253,9 +259,9 @@ never substitute for deterministic acceptance coverage.
 
 ### `TestSpikeDynamicInvocationBinary`
 
-Start a real cllama binary, fake OpenAI Responses and Anthropic providers, fake
+Start a real cllama binary, fake OpenAI Chat/Responses and Anthropic providers, fake
 memory, fake feed, and fake managed-tool endpoints. Create one invocation,
-exercise both ingress protocols, and assert exact stable and late context,
+exercise all three ingress protocols, and assert exact stable and late context,
 allowed skill/tool/model behavior, memory view/provenance, audit fields, and
 provider credential substitution. Revoke it and prove the same bearer returns
 403 `invocation_revoked` with zero downstream calls. Inspect store and logs to
