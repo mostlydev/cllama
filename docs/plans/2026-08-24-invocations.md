@@ -80,7 +80,10 @@ Add a stdlib-only public wire package and client:
   instructional bodies;
 - managed tool specifications with deployment-owned, identity-aware principal
   binding references;
-- feeds and context blocks;
+- for bundle publication, feeds and context blocks; a selection create cannot
+  supply an endpoint, memory relationship, or tool target, and a controller may
+  request only the reserved `pod-members` subscription resolved from its
+  current bundle grant;
 - one memory relationship plus named `view`;
 - inline compiled rules plus digest;
 - model policy, budget, channel allowlist, and delegation ceiling;
@@ -125,10 +128,12 @@ Add these routes to `cmd/cllama/main.go` through
 - `DELETE /control/v1/issuers/{id}` — admin-only idempotent revocation;
 - `POST /control/v1/invocations` — authorize, validate, project, persist, and
   return a bearer once;
-- `GET /control/v1/invocations` — operator list with redacted metadata and
-  state;
+- `GET /control/v1/invocations` — credential-scoped list with redacted metadata
+  and state: bootstrap admin sees all, a controller issuer sees only its
+  organization and bundle-declared member namespace, and a personal issuer
+  sees only its bound subject;
 - `GET /control/v1/invocations/{id}` — inspect the immutable projection and
-  provenance without any secret;
+  provenance without any secret, with the same credential scope as list;
 - `DELETE /control/v1/invocations/{id}` — revoke idempotently;
 - `POST /control/v1/invocations/revoke` — admin-only bulk revocation filtered
   by organization plus role-entry or bundle digest, for urgent contract/grant
@@ -160,7 +165,10 @@ supplies its bound person subject and is rechecked against `members`. A
 pod-controller issuer supplies its bound controller ID and may assert only a
 member subject in the corresponding bundle-declared namespace and one of that
 controller grant's current roles.
-Either may add only the bounded selection and late inputs described above.
+Either may add only the bounded selection and late inputs described above. A
+controller may enable the reserved `pod-members` feed, but cllama resolves its
+URL and credential alias from that controller's current bundle entry; no
+selection request can name or override a feed, memory, or tool endpoint.
 Thus `mayAssume` is not merely a role boolean followed by acceptance of
 caller-authored tools or context.
 
@@ -182,8 +190,9 @@ Central mode uses one atomic, versioned bundle per organization rather than
 piecemeal role records. The deployment's bootstrap admin credential publishes
 the complete bundle through `PUT /control/v1/loadouts/{organization}`. It contains the
 person-subject-to-role `members` map, a `controllers` map from stable controller
-ID to member subject namespace, allowed roles, and the narrowly constrained
-optional evaluator-exemption flag, organization context inputs,
+ID to member subject namespace, allowed roles, an optional declared
+`pod_members_feed {base_url, auth_ref}`, and the narrowly constrained evaluator
+exemption flag, organization context inputs,
 and every named,
 already-flattened effective role's contract modules, skills, tools, feeds,
 memory view, rules, model policy, budget, channels, delegation ceiling, and
@@ -196,6 +205,12 @@ and never accepts a raw secret in the bundle. The reference resolver maps
 configured `server://<organization>/<name>` aliases to process environment or
 deployment secret-store values; other resolvers implement the same narrow
 interface.
+The same rule applies to controller feed entries: central `base_url` must be an
+administrator-published HTTPS origin and `auth_ref` a resolvable
+organization-scoped server alias. cllama appends only the fixed
+`/feeds/pod-members` path and sends the resolved ADR-013 feed credential; the
+raw credential never enters the bundle, Invocation, controller request, or
+workload. Standalone mode may use its private network origin and local alias.
 The handler validates the entire bundle before atomically replacing the current
 digest, so a caller can never observe mixed organization/role generations and
 removed roles or members do not remain as stale grants.
@@ -338,9 +353,11 @@ not invalidate the stable role prefix.
 - Feeds are stored as typed invocation entries; `fetchFeeds` no longer reads a
   manifest from `ContextDir`. Cache keys begin with invocation ID.
 - `pod-members` is an ordinary authenticated feed subscription with zero cache
-  TTL. cllama fetches it on every requesting turn and does not become the
-  membership database; Clawdapus owns the current-state payload and its
-  conformance fixture.
+  TTL. For a controller-created Invocation cllama resolves the route only from
+  that controller's current bundle grant and fetches it on every requesting
+  turn. It does not become the membership database; Clawdapus owns the
+  current-state payload and its conformance fixture. Caller-supplied URLs are
+  rejected.
 - Memory recall/retain adds invocation ID, stable subject, role, purpose/view,
   and pod provenance. One configured memory relationship remains the rule.
 - Rules use one inline `RulesManifest {version, rules, artifact_sha256}`. Each
@@ -473,7 +490,8 @@ Add focused tests at the ownership boundary:
   stable module or grant on an organization-managed selection create;
 - scoped issuer: digest-only token storage, immutable subject binding,
   cross-subject/cross-role denial, HTTPS requirement for remote use, rotation,
-  revocation, and absence from harness environment and audit logs;
+  revocation, absence from harness environment and audit logs, and list/get
+  isolation across subjects, controller namespaces, pods, and organizations;
 - child create: parent bearer plus launcher/controller issuer are both
   required; a member child role must fit both the parent delegation ceiling and
   the controller's current bundle grant;
@@ -486,7 +504,9 @@ Add focused tests at the ownership boundary:
 - propagation: memory, feeds, tools, policy, audit, and compatibility headers
   receive the intended stable and ephemeral identities;
 - membership feed: zero TTL forces a fetch on the next turn and the feed cache
-  never shares entries across Invocations;
+  never shares entries across Invocations; central mode accepts only the
+  current controller grant's HTTPS origin and credential alias, and rejects
+  caller-supplied, cross-controller, or non-feed endpoints before fetch;
 - legacy parity: typed semantic comparison of effective requests, not byte
   equality with old generated files;
 - client/fixture conformance: both valid and intentionally invalid v1 fixtures
@@ -548,7 +568,9 @@ Invocation by selection. Assert identical stable role/contract/skill/tool
 digests, distinct runtime envelopes and principal bindings, no browser/session
 secret exposure, missing, mismatched, forged, expired, replayed, and
 wrong-audience release-token denial, and resume in a new Invocation from a Flux
-task reference without stable-prefix churn.
+task reference without stable-prefix churn. From central cllama, fetch the
+member's authenticated `pod-members` endpoint through only the
+bundle-declared controller route and reject an attacker-supplied URL.
 
 ### `TestSpikeScopedCentralIssuer`
 
@@ -570,7 +592,9 @@ log. Restart the real process after publication and prove the same canonical
 bundle digest still governs new creates.
 Prove controller namespace/role denial, removal from the current bundle,
 attempted self-scoping, and use of any issuer for bundle publication all fail
-closed.
+closed. Prove a personal issuer cannot list/get another subject, a controller
+cannot list/get outside its organization or member namespace, and only the
+bootstrap admin can inspect across those scopes.
 
 The bootstrap admin is the deployment's single admin-surface credential class:
 it may publish bundles and administer issuers but is never valid for Invocation
