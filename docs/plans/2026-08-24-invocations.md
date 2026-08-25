@@ -108,6 +108,14 @@ The reference binary supports two creation authorities behind one
 2. a parent invocation bearer that may create a child only when every resolved
    capability is within its explicit delegation ceiling.
 
+The authorizer returns the authorized, normalized Invocation inputs; the
+control handler never persists the raw request first. A locally trusted my-cli
+issuer or pod-scoped Clawdapus controller may supply complete inputs within its
+configured organization/pod/subject/role scope. A central human authenticator
+may instead accept only organization, role, purpose, and harness selection and
+resolve the server-owned loadout itself. Thus `mayAssume` is not merely a role
+boolean followed by acceptance of caller-authored tools or context.
+
 An ordinary data-plane bearer cannot create an unrelated invocation. A central
 deployment can replace the reference issuer check with its human authenticator
 and server-side `mayAssume(subject, role)` logic through the same interface. V1
@@ -173,10 +181,15 @@ proxy authority.
 
 - Feeds are stored as typed invocation entries; `fetchFeeds` no longer reads a
   manifest from `ContextDir`. Cache keys begin with invocation ID.
+- `pod-members` is an ordinary authenticated feed subscription with zero cache
+  TTL. cllama fetches it on every requesting turn and does not become the
+  membership database; Clawdapus owns the current-state payload and its
+  conformance fixture.
 - Memory recall/retain adds invocation ID, stable subject, role, purpose/view,
   and pod provenance. One configured memory relationship remains the rule.
-- Rules are inline compiled items plus digest. A path is accepted only through
-  the legacy adapter.
+- Rules use one inline `RulesManifest {version, rules, artifact_sha256}`. Each
+  entry keeps the existing `{id, mode, text, source, content_sha256}` shape. A
+  path is accepted only through the legacy adapter.
 - Managed tools, model policy/failover, budget, channels, response gates, and
   policy-evaluator hooks receive `InvocationIdentity` rather than a bare agent
   string.
@@ -234,8 +247,9 @@ Add focused tests at the ownership boundary:
   revocation, duplicate-ID rejection, concurrent resolution, and no secret in
   list/get/log output;
 - control: issuer authentication, subject/role denial, schema/version limits,
-  TTL limits, parent subset success, and escalation denial before record
-  creation;
+  TTL limits, central server-owned loadout resolution, rejection of
+  caller-authored capabilities on that path, parent subset success, and
+  escalation denial before record creation;
 - data plane: invalid, expired, and revoked bearers make zero downstream calls;
 - projection: exact stable module order and late-context placement for OpenAI
   Chat Completions, OpenAI Responses, and Anthropic Messages;
@@ -244,6 +258,8 @@ Add focused tests at the ownership boundary:
   or history;
 - propagation: memory, feeds, tools, policy, audit, and compatibility headers
   receive the intended stable and ephemeral identities;
+- membership feed: zero TTL forces a fetch on the next turn and the feed cache
+  never shares entries across Invocations;
 - legacy parity: typed semantic comparison of effective requests, not byte
   equality with old generated files;
 - client/fixture conformance: both valid and intentionally invalid v1 fixtures
