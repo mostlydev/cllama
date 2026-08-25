@@ -2,7 +2,9 @@
 
 **Status:** Proposed
 **Date:** 2026-08-24
-**Cross-repository order:** cllama, then my-cli, then Clawdapus, then optional MGL adapter
+**Cross-repository dependency:** cllama freezes and tags the contract first;
+my-cli and Clawdapus can then consume it independently; the optional MGL
+adapter follows the frozen rule and policy shapes
 
 ## Outcome
 
@@ -348,9 +350,9 @@ cllama release is blocked unless all six pass.
    coverage.
 6. Land and enable all hermetic binary spikes in CI. Publish a tagged cllama
    release only after the v1 contract is frozen by those fixtures.
-7. my-cli consumes the tag for human harness launch/revoke. Clawdapus consumes
-   the tag after my-cli, uses two-phase proxy bootstrap, and bumps its submodule
-   only to the released tag.
+7. my-cli consumes the tag for human harness launch/revoke. Independently,
+   Clawdapus consumes the same tag, uses two-phase proxy bootstrap, and bumps
+   its submodule only to the released tag.
 8. Remove the legacy directory adapter only after both clients and Claude Code,
    Codex, OpenClaw, Hermes, Nanobot, and Picoclaw pass the cross-repository
    delivery matrix.
