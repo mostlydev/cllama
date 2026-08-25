@@ -94,6 +94,16 @@ it.
 Add these routes to `cmd/cllama/main.go` through
 `internal/control/handler.go`:
 
+- `PUT /control/v1/loadouts/{organization}` — admin-only atomic replacement
+  of one organization's complete membership and role-loadout bundle;
+- `GET /control/v1/loadouts[/{organization}]` — admin-only redacted bundle
+  list/inspection with digests;
+- `DELETE /control/v1/loadouts/{organization}` — admin-only removal that
+  disables future central-human creates for the organization;
+- `POST /control/v1/issuers` — admin-only creation of a subject/organization
+  scoped personal issuer, returning its raw token once;
+- `GET /control/v1/issuers[/{id}]` — admin-only redacted issuer inspection;
+- `DELETE /control/v1/issuers/{id}` — admin-only idempotent revocation;
 - `POST /control/v1/invocations` — authorize, validate, project, persist, and
   return a bearer once;
 - `GET /control/v1/invocations` — operator list with redacted metadata and
@@ -113,20 +123,61 @@ The reference binary supports two creation authorities behind one
 2. a parent invocation bearer that may create a child only when every resolved
    capability is within its explicit delegation ceiling.
 
+Issuer scopes are explicit rather than an ambient superuser flag. A
+loadout/issuer admin credential cannot create an Invocation or call the data
+plane; a central personal issuer cannot submit capability inputs; and a local
+launcher or pod-controller issuer cannot mutate central bundles unless it was
+separately provisioned with that admin scope.
+
 The authorizer returns the authorized, normalized Invocation inputs; the
 control handler never persists the raw request first. A locally trusted my-cli
 issuer or pod-scoped Clawdapus controller may supply complete inputs within its
 configured organization/pod/subject/role scope. A central human authenticator
-may instead accept only organization, role, purpose, and harness selection and
-resolve the server-owned loadout itself. Thus `mayAssume` is not merely a role
-boolean followed by acceptance of caller-authored tools or context.
+accepts only organization, role, purpose, and harness selection and resolves
+membership plus the server-owned loadout from the current organization bundle.
+Thus `mayAssume` is not merely a role boolean followed by acceptance of
+caller-authored tools or context.
+
+### Server-owned organization loadouts
+
+Central mode uses one atomic, versioned bundle per organization rather than
+piecemeal role records. An admin-scoped trusted issuer publishes the complete
+bundle through `PUT /control/v1/loadouts/{organization}`. It contains the
+subject-to-role `members` map, organization context inputs, and every named
+role's skills, tools, feeds, memory view, rules, model policy, budget, channels,
+delegation ceiling, and allowed harness protocols. It contains no credential.
+Tool/provider entries may name deployment-owned logical credential references;
+the server validates their organization scope and resolvability before commit
+and never accepts a raw secret in the bundle. The reference resolver maps
+configured `server://<organization>/<name>` aliases to process environment or
+deployment secret-store values; other resolvers implement the same narrow
+interface.
+The handler validates the entire bundle before atomically replacing the current
+digest, so a caller can never observe mixed organization/role generations and
+removed roles or members do not remain as stale grants.
+
+List and get return redacted metadata, entry digests, and provenance. A
+central-human create resolves the token-bound subject against `members`,
+selects the requested role from the current bundle, records both the bundle
+digest and role-entry digest in the immutable Invocation, and then applies the
+optional narrowing purpose. Missing organization/role state fails closed as
+`loadout_missing`; a missing subject/role grant is `role_not_authorized`.
+Per-person issuers cannot publish, inspect, or delete loadouts. Deleting or
+replacing a bundle affects future creates only; already-issued Invocations
+remain immutable and are governed by normal expiry/revocation.
 
 The reference central-human mechanism is a random per-person issuer token sent
 only over HTTPS. The server stores its digest and maps it to one immutable
-person subject plus organization and role bounds; the client cannot choose a
-different subject. my-cli stores the raw issuer token through an OS
+person subject plus organization; current role authorization comes from the
+published bundle, and the client cannot choose a different subject. my-cli
+stores the raw issuer token through an OS
 keychain/1Password-style `auth_ref`, never in the organization manifest or
-harness environment. Revocation takes effect on the next control request.
+harness environment. A deployment supplies one bootstrap admin credential via
+its secret mechanism; that credential provisions, inspects, rotates, and
+revokes personal issuers through the routes above and is never valid on the
+data plane. Revocation takes effect on the next control request. This makes the
+reference central flow operable without adding an identity service; OIDC or
+mTLS may later replace the issuer store.
 
 An ordinary data-plane bearer cannot create an unrelated invocation. A central
 deployment may replace the reference token check with OIDC, mTLS, or another
@@ -143,6 +194,11 @@ Add `internal/invocation/{store,token,directory_store}.go`:
 - one atomically replaced JSON record per invocation;
 - restart recovery, deterministic expiry, and idempotent revocation;
 - in-memory implementation for tests.
+
+Add the same small in-memory and atomic-directory implementations for the
+organization-loadout store. Bundle replacement is validate-then-rename, stores
+only canonical bytes and digests, and is private control-plane state. It is not
+a workload mount or a new service.
 
 Filesystem storage is private cllama persistence. It is never mounted into a
 workload and is not a second context transport. A later storage backend can
@@ -205,6 +261,10 @@ proxy authority.
 - Managed tools, model policy/failover, budget, channels, response gates, and
   policy-evaluator hooks receive `InvocationIdentity` rather than a bare agent
   string.
+- Provider and managed-tool credential references resolve only inside cllama
+  through the deployment-owned resolver. Unknown, cross-organization, or raw
+  credential values fail bundle publication or trusted create before an
+  Invocation is stored.
 - Audit and session history add invocation ID, subject ID, role, purpose, and
   projection digest.
 
@@ -248,6 +308,9 @@ proxy authority.
 - `policy_exempt` can be set only by a trusted issuer, is inherited as false by
   ordinary children, and bypasses policy callbacks only; credential
   starvation, model policy, budget, audit, and all other enforcement remain.
+- Central loadout bundles contain only credential aliases; raw provider/tool
+  secrets remain in deployment configuration and never enter a bundle,
+  Invocation, launcher response, or workload.
 - The legacy directory adapter and an equivalent Invocation must produce
   semantically equivalent effective upstream requests during migration.
 
@@ -258,10 +321,15 @@ Add focused tests at the ownership boundary:
 - store: entropy, digest-only persistence, atomic recovery, expiry,
   revocation, duplicate-ID rejection, concurrent resolution, and no secret in
   list/get/log output;
-- control: issuer authentication, subject/role denial, schema/version limits,
-  TTL limits, central server-owned loadout resolution, rejection of
-  caller-authored capabilities on that path, parent subset success, and
-  escalation denial before record creation;
+- control: issuer authentication, bootstrap-admin and admin-only personal
+  issuer create/redacted-read/revoke, one-time raw token return, admin-only
+  atomic bundle put/list/get/delete, complete-bundle validation,
+  stale-role/member removal, subject/role denial,
+  `loadout_missing`, schema/version and TTL limits, central server-owned
+  loadout resolution, recorded bundle/role digests, rejection of
+  caller-authored capabilities on that path, raw/unknown/cross-organization
+  credential-reference rejection, parent subset success, and escalation denial
+  before record creation;
 - scoped issuer: digest-only token storage, immutable subject binding,
   cross-subject/cross-role denial, HTTPS requirement for remote use, rotation,
   revocation, and absence from harness environment and audit logs;
@@ -326,22 +394,31 @@ layout as the new design.
 
 ### `TestSpikeScopedCentralIssuer`
 
-Run cllama behind a TLS test server with two per-person issuer tokens and
-server-owned role loadouts. Prove each token is bound to its subject, permitted
-role selection succeeds, cross-subject/cross-role and caller-authored
-capability fields fail before persistence, revocation takes effect on the next
-create, and neither raw issuer token reaches a workload, list/get response,
-store record, or log.
+Run cllama behind a TLS test server with a bootstrap admin issuer. Use it to
+create two per-person issuer records and prove raw tokens are returned once and
+redacted thereafter. Prove the admin can atomically publish and replace a complete
+organization bundle; personal issuers cannot publish or inspect it; an absent
+bundle or role returns `loadout_missing`; each personal token is bound to its
+subject; the published `members` map governs permitted roles; removed
+members/roles lose future-create authority; caller-authored capability fields
+and raw/unknown/cross-organization credential references fail before
+persistence; a valid `server://` alias resolves only at request execution; the
+Invocation records the selected bundle and role digests; issuer revocation
+takes effect on the next create; and no raw admin/personal issuer or
+provider/tool token reaches a workload, list/get response, store record, or
+log. Restart the real process after publication and prove the same canonical
+bundle digest still governs new creates.
 
 Add CI commands for both the ordinary suite and the hermetic spike target. The
 cllama release is blocked unless all six pass.
 
 ## 6. Implementation and release sequence
 
-1. Land the public v1 types, redacted error model, conformance fixtures, and
-   stdlib client.
-2. Land the in-memory and atomic-directory stores, token hashing, control
-   authorizer, and create/list/get/delete endpoints.
+1. Land the public v1 types, issuer and organization-loadout bundle types, redacted error
+   model, conformance fixtures, and stdlib client.
+2. Land the in-memory and atomic-directory Invocation/loadout/issuer stores,
+   token hashing, control authorizer, admin-scoped issuer and bundle endpoints,
+   and Invocation create/list/get/delete endpoints.
 3. Resolve `InvocationIdentity` in the proxy and convert stable context
    assembly for all three ingress formats.
 4. Convert feeds, memory, tools, policy, budgets, snapshots, history, and audit
