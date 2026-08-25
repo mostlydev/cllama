@@ -57,7 +57,9 @@ Add a stdlib-only public wire package and client:
 `CreateInvocationRequest` carries:
 
 - `version`;
-- stable `subject {kind, id}` where v1 kinds are `person` and `member`;
+- stable `subject {kind, id}` where v1 kinds are `person` and `member`; it is
+  required in the stored Invocation but may be omitted from a central-human
+  create request when the authorizer supplies it;
 - `organization`, `role`, and optional `purpose`;
 - optional `parent_invocation_id`;
 - `harness {name, protocol}` where v1 protocols are `openai-chat`,
@@ -103,8 +105,9 @@ This is another surface on the existing binary, not another service.
 The reference binary supports two creation authorities behind one
 `InvocationAuthorizer` interface:
 
-1. a trusted issuer credential, configured locally or scoped to a pod, that
-   may create only its configured organizations, subjects, and roles; and
+1. a trusted issuer credential, configured for a local launcher, one central
+   human subject, or a pod controller, that may create only its configured
+   organizations, subjects, pods, and roles; and
 2. a parent invocation bearer that may create a child only when every resolved
    capability is within its explicit delegation ceiling.
 
@@ -116,11 +119,18 @@ may instead accept only organization, role, purpose, and harness selection and
 resolve the server-owned loadout itself. Thus `mayAssume` is not merely a role
 boolean followed by acceptance of caller-authored tools or context.
 
+The reference central-human mechanism is a random per-person issuer token sent
+only over HTTPS. The server stores its digest and maps it to one immutable
+person subject plus organization and role bounds; the client cannot choose a
+different subject. my-cli stores the raw issuer token through an OS
+keychain/1Password-style `auth_ref`, never in the organization manifest or
+harness environment. Revocation takes effect on the next control request.
+
 An ordinary data-plane bearer cannot create an unrelated invocation. A central
-deployment can replace the reference issuer check with its human authenticator
-and server-side `mayAssume(subject, role)` logic through the same interface. V1
-does not add launcher public-key distribution, workload PKI, OIDC, or a generic
-ABAC service.
+deployment may replace the reference token check with OIDC, mTLS, or another
+human authenticator while retaining server-side `mayAssume(subject, role)`
+through the same interface. V1 does not require launcher public-key
+distribution, workload PKI, OIDC, or a generic ABAC service.
 
 ### Invocation store
 
@@ -250,6 +260,9 @@ Add focused tests at the ownership boundary:
   TTL limits, central server-owned loadout resolution, rejection of
   caller-authored capabilities on that path, parent subset success, and
   escalation denial before record creation;
+- scoped issuer: digest-only token storage, immutable subject binding,
+  cross-subject/cross-role denial, HTTPS requirement for remote use, rotation,
+  revocation, and absence from harness environment and audit logs;
 - data plane: invalid, expired, and revoked bearers make zero downstream calls;
 - projection: exact stable module order and late-context placement for OpenAI
   Chat Completions, OpenAI Responses, and Anthropic Messages;
@@ -309,8 +322,17 @@ both provider formats, and compare normalized provider-visible requests and
 capability decisions. This protects migration without preserving the old file
 layout as the new design.
 
+### `TestSpikeScopedCentralIssuer`
+
+Run cllama behind a TLS test server with two per-person issuer tokens and
+server-owned role loadouts. Prove each token is bound to its subject, permitted
+role selection succeeds, cross-subject/cross-role and caller-authored
+capability fields fail before persistence, revocation takes effect on the next
+create, and neither raw issuer token reaches a workload, list/get response,
+store record, or log.
+
 Add CI commands for both the ordinary suite and the hermetic spike target. The
-cllama release is blocked unless all five pass.
+cllama release is blocked unless all six pass.
 
 ## 6. Implementation and release sequence
 
@@ -319,7 +341,7 @@ cllama release is blocked unless all five pass.
 2. Land the in-memory and atomic-directory stores, token hashing, control
    authorizer, and create/list/get/delete endpoints.
 3. Resolve `InvocationIdentity` in the proxy and convert stable context
-   assembly for both ingress formats.
+   assembly for all three ingress formats.
 4. Convert feeds, memory, tools, policy, budgets, snapshots, history, and audit
    one plane at a time; keep all existing tests green at each step.
 5. Put the old `agentctx` tree behind the legacy adapter and add semantic parity
@@ -335,8 +357,9 @@ cllama release is blocked unless all five pass.
 
 ## Deferred decisions
 
-- Production human authentication (OIDC, mTLS, or another adapter) belongs to a
-  deployment-specific `InvocationAuthorizer`; v1 does not select one globally.
+- OIDC, mTLS, or another production human authenticator may replace the
+  reference scoped issuer token through `InvocationAuthorizer`; none is needed
+  to make the central v1 story functional.
 - Storage beyond the reference atomic directory store is an implementation of
   `Store`, not a protocol change.
 - Subscription credential mediation requires an explicit vendor-supported
