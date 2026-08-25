@@ -19,7 +19,7 @@ directory loader remains temporarily as a compatibility adapter.
 
 ## Operator and harness contract
 
-The complete system must satisfy seven cross-repository stories:
+The complete system must satisfy eight cross-repository stories:
 
 1. `my ai --role <role> --purpose <purpose> <harness>` starts Claude Code or
    Codex through cllama with a new, short-lived invocation and revokes it on
@@ -38,8 +38,13 @@ The complete system must satisfy seven cross-repository stories:
 7. The same launch contract works against a local sidecar or centrally managed
    HTTPS proxy and fails closed when authorization, proxy reachability, or
    harness compatibility fails.
+8. A human-operated harness and an organization-managed claw selecting the
+   same declared role resolve the same role-entry and contract digests,
+   instructional skill closure, managed business-tool schemas, memory policy,
+   and rules. Subject-specific runtime envelopes and external principals remain
+   explicit and do not change the role package.
 
-cllama owns the final effective request for all seven stories. Launchers supply
+cllama owns the final effective request for all eight stories. Launchers supply
 authenticated, normalized inputs; they do not render the provider-visible
 system prompt.
 
@@ -70,8 +75,10 @@ Add a stdlib-only public wire package and client:
   digest;
 - ordered context inputs by kind: organization contract, role, purpose/task,
   and invocation-local modules;
-- skill index entries and bounded instructional bodies;
-- managed tool specifications;
+- skill index entries with optional skill/tool requirements and bounded
+  instructional bodies;
+- managed tool specifications with deployment-owned, identity-aware principal
+  binding references;
 - feeds and context blocks;
 - one memory relationship plus named `view`;
 - inline compiled rules plus digest;
@@ -88,6 +95,15 @@ Purpose is context, not authority. It may narrow a role but never adds tools,
 models, memory scope, budget, channels, or delegation. Role remains a loadout;
 the authenticated issuer authorization decides whether a subject may assume
 it.
+
+For organization-managed creates, the request is a selection plus bounded late
+inputs: organization, effective role, purpose, harness, requested expiry,
+subject/runtime identity where the issuer is allowed to assert it, and
+invocation-local session or work references. It cannot carry organization or
+role modules, skills, tools, rules, memory policy, models, budgets, channels,
+or delegation. Those resolve from the current bundle. A Flux task identifier,
+session startup note, or label may appear only in the non-authoritative late
+layer and never changes the stable role entry.
 
 ### Control API in the existing cllama process
 
@@ -130,22 +146,31 @@ launcher or pod-controller issuer cannot mutate central bundles unless it was
 separately provisioned with that admin scope.
 
 The authorizer returns the authorized, normalized Invocation inputs; the
-control handler never persists the raw request first. A locally trusted my-cli
-issuer or pod-scoped Clawdapus controller may supply complete inputs within its
-configured organization/pod/subject/role scope. A central human authenticator
-accepts only organization, role, purpose, and harness selection and resolves
-membership plus the server-owned loadout from the current organization bundle.
+control handler never persists the raw request first. Every
+organization-managed my-cli or Clawdapus create resolves the server-owned role
+entry from the current organization bundle. A central human authenticator
+supplies its bound person subject; a pod-controller issuer may assert only a
+member subject in its configured pod namespace and one of its scoped roles.
+Either may add only the bounded selection and late inputs described above.
 Thus `mayAssume` is not merely a role boolean followed by acceptance of
 caller-authored tools or context.
+
+A standalone pod or development launcher may publish an atomic bundle with
+explicit `pod-local` or `local` provenance and then use the same selection
+path. V1 has no separate complete-input create authority. Parent creation still
+starts from the resolved parent Invocation and applies subset checks.
 
 ### Server-owned organization loadouts
 
 Central mode uses one atomic, versioned bundle per organization rather than
 piecemeal role records. An admin-scoped trusted issuer publishes the complete
 bundle through `PUT /control/v1/loadouts/{organization}`. It contains the
-subject-to-role `members` map, organization context inputs, and every named
-role's skills, tools, feeds, memory view, rules, model policy, budget, channels,
-delegation ceiling, and allowed harness protocols. It contains no credential.
+subject-to-role `members` map, organization context inputs, and every named,
+already-flattened effective role's contract modules, skills, tools, feeds,
+memory view, rules, model policy, budget, channels, delegation ceiling, and
+allowed harness protocols. Each role entry carries its organization-contract,
+effective-role-contract, source-role, and skill-body digests. It contains no
+credential.
 Tool/provider entries may name deployment-owned logical credential references;
 the server validates their organization scope and resolvability before commit
 and never accepts a raw secret in the bundle. The reference resolver maps
@@ -155,6 +180,14 @@ interface.
 The handler validates the entire bundle before atomically replacing the current
 digest, so a caller can never observe mixed organization/role generations and
 removed roles or members do not remain as stale grants.
+
+Role composition is an organization-control-plane concern. cllama does not
+evaluate role inheritance, attributes, labels, or conditions. It accepts only
+declared flat role entries and verifies canonical digests, unique IDs, bounded
+bodies, complete skill/tool dependency closure, credential-reference shape,
+and the other v1 limits. Unknown dependencies, a dependency cycle encoded in
+the index, or a role entry whose claimed source digests do not match fails
+bundle publication atomically.
 
 List and get return redacted metadata, entry digests, and provenance. A
 central-human create resolves the token-bound subject against `members`,
@@ -228,7 +261,7 @@ cllama, not a launcher or harness adapter, assembles the effective request in
 one fixed order:
 
 1. organization contract;
-2. role modules;
+2. flattened effective-role contract modules;
 3. purpose/task modules;
 4. invocation metadata and skill index;
 5. bounded dynamic memory, context blocks, feeds, channel deltas, and time at
@@ -241,9 +274,18 @@ digests in context snapshots.
 
 Instructional skills are presented as a granted index plus the existing
 managed `load_skill` operation. Ungranted names are indistinguishable from
-missing names. Executable operations remain managed tools. Files/assets needed
-by a workload are launcher materialization concerns and are never ambient
-proxy authority.
+missing names. Index `requires` metadata is informational at request time; the
+bundle publisher computes the closure and cllama validates it before accepting
+the bundle. Executable operations remain managed tools. Files/assets needed by
+a workload are launcher materialization concerns and are never ambient proxy
+authority.
+
+There is no runtime role preprocessor or context DAG. The organization control
+plane publishes only declared effective roles. Stable projection/cache keys
+include bundle, role-entry, organization-contract, effective-role-contract,
+and harness/protocol digests. Purpose, Flux task/session startup context,
+labels, dynamic memory, feeds, and time remain late so a new assignment does
+not invalidate the stable role prefix.
 
 ### Existing capability planes
 
@@ -261,12 +303,34 @@ proxy authority.
 - Managed tools, model policy/failover, budget, channels, response gates, and
   policy-evaluator hooks receive `InvocationIdentity` rather than a bare agent
   string.
-- Provider and managed-tool credential references resolve only inside cllama
-  through the deployment-owned resolver. Unknown, cross-organization, or raw
-  credential values fail bundle publication or trusted create before an
-  Invocation is stored.
+- Provider and managed-tool credential references resolve only through the
+  deployment-owned proxy/tool-broker boundary. Unknown, cross-organization, or
+  raw credential values fail bundle publication or selection resolution before
+  an Invocation is stored.
+- A managed tool may bind to a deployment-owned standing role-service alias or
+  to a short-lived subject grant/session supplied by a trusted local broker or
+  Flux Gate runtime integration. A person on a local sidecar may use their own
+  OS-keychain/1Password reference. A member cannot request a person binding,
+  central cllama stores no standing per-person portal credential, and no secret
+  or browser session reaches the harness.
 - Audit and session history add invocation ID, subject ID, role, purpose, and
   projection digest.
+
+### Durable work and external effects
+
+cllama neither orchestrates business work nor pauses a mediated tool loop for
+human approval. Flux owns durable tasks, blockers, wakes, checkpoints, and
+fingerprinted approval requests. A Flux wake is delivered to a launcher or pod
+controller, which creates a new selection-based Invocation with the Flux task
+reference in the late purpose/task layer.
+
+Flux does not perform privileged effects. Flux Gate owns just-in-time access
+grants and their authoritative ledger; accounting, mail, source-control,
+payment, and other domain services own their effects. Those services must
+validate the immutable approval/release receipt for the exact proposal. To
+cllama they are ordinary managed tools. cllama authenticates the Invocation,
+enforces the granted operation and identity binding, records mediation, and
+does not become the approval or effect system of record.
 
 ## 2. Delete or demote
 
@@ -284,6 +348,9 @@ proxy authority.
 - Do not add context generations or symlinks, a second projection compiler,
   a configuration service, CSR/PKI, peer key exchange, an event bus, a generic
   pipeline DAG, or a separate authorization service.
+- Do not add free-form role union, attribute-driven authority, label-conditioned
+  stable modules, a second `access[]` capability plane, a durable-work ledger,
+  or approval pause/resume to cllama.
 - Do not mediate ChatGPT or Claude subscription OAuth tokens in v1. Documented
   harness gateway/custom-provider modes receive only the cllama invocation
   bearer; cllama uses supported provider/API credentials. A vendor-supported
@@ -311,6 +378,10 @@ proxy authority.
 - Central loadout bundles contain only credential aliases; raw provider/tool
   secrets remain in deployment configuration and never enter a bundle,
   Invocation, launcher response, or workload.
+- cllama's bundle store is a runtime publication, not the canonical directive,
+  role, membership, or work store. `ContractRevision` (one scope), bundle (one
+  organization), and Invocation projection (one launch) are digest-linked and
+  do not overwrite one another.
 - The legacy directory adapter and an equivalent Invocation must produce
   semantically equivalent effective upstream requests during migration.
 
@@ -330,6 +401,9 @@ Add focused tests at the ownership boundary:
   caller-authored capabilities on that path, raw/unknown/cross-organization
   credential-reference rejection, parent subset success, and escalation denial
   before record creation;
+- role-entry validation: exact contract/source digests, complete nested skill
+  and tool closure, missing/cyclic dependency rejection, and rejection of any
+  stable module or grant on an organization-managed selection create;
 - scoped issuer: digest-only token storage, immutable subject binding,
   cross-subject/cross-role denial, HTTPS requirement for remote use, rotation,
   revocation, and absence from harness environment and audit logs;
@@ -392,6 +466,17 @@ both provider formats, and compare normalized provider-visible requests and
 capability decisions. This protects migration without preserving the old file
 layout as the new design.
 
+### `TestSpikeRoleOnboarding`
+
+Publish one bundle containing a declared `billing-reconciliation` role with
+organization and role contract revisions, nested skill dependencies, fake
+accounting and browser-broker tools, Flux/Flux Gate tools, and a
+receipt-validating fake send service. Create one person and one member
+Invocation by selection. Assert identical stable role/contract/skill/tool
+digests, distinct runtime envelopes and principal bindings, no browser/session
+secret exposure, missing or mismatched receipt denial, and resume in a new
+Invocation from a Flux task reference without stable-prefix churn.
+
 ### `TestSpikeScopedCentralIssuer`
 
 Run cllama behind a TLS test server with a bootstrap admin issuer. Use it to
@@ -410,11 +495,13 @@ log. Restart the real process after publication and prove the same canonical
 bundle digest still governs new creates.
 
 Add CI commands for both the ordinary suite and the hermetic spike target. The
-cllama release is blocked unless all six pass.
+cllama release is blocked unless all seven pass.
 
 ## 6. Implementation and release sequence
 
-1. Land the public v1 types, issuer and organization-loadout bundle types, redacted error
+1. Land the public v1 types, issuer and organization-loadout bundle types,
+   selection/late-input boundary, contract/source digests, skill requirements,
+   identity-aware tool binding, redacted error
    model, conformance fixtures, and stdlib client.
 2. Land the in-memory and atomic-directory Invocation/loadout/issuer stores,
    token hashing, control authorizer, admin-scoped issuer and bundle endpoints,
