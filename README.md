@@ -410,7 +410,8 @@ Standalone operation is fully supported. Set up the context directory, write a `
 
 An operator can fence an ephemeral agent identity with
 `POST /internal/agents/{agentID}/revoke`, authenticated with the operator's
-`CLLAMA_UI_TOKEN` bearer token on the API listener (8080). Worker bearer tokens
+`CLLAMA_UI_TOKEN` bearer token on either the API listener (8080) or the published UI listener
+(8081). Both listeners share the same fence. Worker bearer tokens
 cannot use this endpoint. Send `{"generation": 1}` with a positive orchestrator
 run generation. A successful response is
 `{"agent_id":"worker-1","generation":1,"state":"revoked"}`. Repeating the
@@ -450,3 +451,7 @@ Provision a separate proxy with new identities before reaching this bound. Each
 request admission checks ledger file identity/size/mtime; full contents load only
 at startup. A trusted host capable of replacing storage and falsifying its file
 metadata is outside this boundary.
+
+After revocation, the full live-context snapshot and capture history are removed
+once the last authenticated handler for that identity exits. Audit/session-history
+retention remains independent; revocation does not erase those durable records.

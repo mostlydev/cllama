@@ -349,3 +349,44 @@ func (r *revocationStreamRecorder) Write(p []byte) (int, error) {
 }
 
 func (r *revocationStreamRecorder) WriteString(s string) (int, error) { return r.Write([]byte(s)) }
+
+func TestRevocationCleansSnapshotAfterLateHandlerExit(t *testing.T) {
+	h := NewHandler(nil, stubContextLoaderWithTools("worker-1", "worker-1:secret", nil), nil, WithRevocationDir(t.TempDir()), WithAdminToken("operator"))
+	h.registry.Set("openai", &provider.Provider{Name: "openai", BaseURL: "http://127.0.0.1:1", APIKey: "key", Auth: "bearer"})
+	body := &revocationHeldBody{Reader: strings.NewReader(`{"model":"openai/model","messages":[]}`), entered: make(chan struct{}), release: make(chan struct{})}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Body = io.NopCloser(body)
+	req.Header.Set("Authorization", "Bearer worker-1:secret")
+	done := make(chan struct{})
+	go func() { h.ServeHTTP(httptest.NewRecorder(), req); close(done) }()
+	<-body.entered
+	h.snapshots.Put(ContextSnapshot{AgentID: "worker-1", System: "old"})
+	if got := revokeForTest(h, "worker-1", 1, "operator"); got.Code != 200 {
+		t.Fatalf("revoke: %d", got.Code)
+	}
+	// The authenticated handler is deliberately still inside Body.Read. It may
+	// capture context after revocation, so cleanup must also run on handler exit.
+	close(body.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not finish")
+	}
+	if _, ok := h.snapshots.Get("worker-1"); ok {
+		t.Fatal("revoked snapshot survived handler exit")
+	}
+	if len(h.snapshots.History("worker-1", 20)) != 0 {
+		t.Fatal("revoked snapshot history survived")
+	}
+}
+
+type revocationHeldBody struct {
+	io.Reader
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func (b *revocationHeldBody) Read(p []byte) (int, error) {
+	b.once.Do(func() { close(b.entered); <-b.release })
+	return b.Reader.Read(p)
+}

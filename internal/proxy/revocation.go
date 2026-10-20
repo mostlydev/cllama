@@ -338,6 +338,22 @@ func (h *Handler) HandleRevoke(w http.ResponseWriter, r *http.Request) {
 	admitted, refused := state.admitted, state.refused
 	h.revocations.mu.Unlock()
 	h.logger.LogRevocation(id, record.Generation, admitted, refused)
+	h.clearRevokedSnapshot(id)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(record)
+}
+
+// clearRevokedSnapshot runs both after the fence drains and after each handler
+// exits. Waiting for the last registered handler prevents a late context capture
+// from restoring a revoked ephemeral identity's full prompt in the snapshot store.
+func (h *Handler) clearRevokedSnapshot(id string) {
+	h.revocations.mu.Lock()
+	defer h.revocations.mu.Unlock()
+	if _, revoked := h.revocations.ledger.Agents[id]; !revoked {
+		return
+	}
+	if state := h.revocations.agents[id]; state != nil && len(state.requests) > 0 {
+		return
+	}
+	h.snapshots.Delete(id)
 }

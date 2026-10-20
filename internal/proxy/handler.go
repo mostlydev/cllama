@@ -638,7 +638,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	defer finishRequest()
+	defer func() { finishRequest(); h.clearRevokedSnapshot(agentID) }()
 	r = r.WithContext(requestCtx)
 	if h.policyEnabled(ctx) {
 		inBody, err := io.ReadAll(r.Body)
