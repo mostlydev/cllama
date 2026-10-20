@@ -405,3 +405,53 @@ Standalone operation is fully supported. Set up the context directory, write a `
 | **Model allowlisting** | Per-agent model ACLs from `metadata.json`. |
 | **Persistent cost state** | Survive restarts. Rebuild from audit logs or external store. |
 | **`cllama-policy`** | Bidirectional interception. Reads the behavioral contract. Makes allow/deny/amend decisions on live LLM traffic. The passthrough is the plumbing; the policy proxy is the brain. |
+
+### Irreversible agent revocation
+
+An operator can fence an ephemeral agent identity with
+`POST /internal/agents/{agentID}/revoke`, authenticated with the operator's
+`CLLAMA_UI_TOKEN` bearer token on either the API listener (8080) or the published UI listener
+(8081). Both listeners share the same fence. Worker bearer tokens
+cannot use this endpoint. Send `{"generation": 1}` with a positive orchestrator
+run generation. A successful response is
+`{"agent_id":"worker-1","generation":1,"state":"revoked"}`. Repeating the
+same generation succeeds; lower generations return 409. Higher generations
+remain revoked. A new attempt must use a new agent identity.
+
+Set `CLAW_REVOCATION_DIR` to a persistent, writable, proxy-owned directory.
+The existing governance override directory can remain read-only. Each directory
+has exactly one proxy writer; retain the entire directory across container and
+proxy restarts. Initializing a fresh directory creates an empty ledger. Removing
+that entire trusted-host storage is data loss and requires operator recovery,
+not a way to restore an agent. A missing initialized ledger, corrupt state, or
+storage disappearance detected on request admission closes admission and cancels
+active requests. With no directory configured, existing chat behavior continues
+and the revocation endpoint returns 503.
+
+Revocation closes a shared admission fence, cancels in-flight provider and tool
+request contexts, durably persists an irreversible tombstone, and drains admitted
+managed-tool dispatches before acknowledging `revoked`. Both OpenAI and Anthropic
+loops use the same fence over HTTP and MCP. The endpoint waits at most 30 seconds;
+a drain timeout or storage error returns 503 without acknowledging revocation.
+Retrying is safe. Already-dispatched remote effects may complete; revocation does
+not undo them. Proxy cancellation and local drainage cannot prove remote rollback.
+
+Public `tool_dispatch` audit events contain infrastructure-generated dispatch IDs
+and `admitted`, `refused`, `completed`, or `admitted_before_revoke` status, without
+arguments, results or credentials. Admission records permission to begin dispatch,
+not proof of a remote effect. `revocation` events include the generation and
+process-local admission/refusal counts. Retain audit output separately if those
+counts must be recovered across proxy restarts.
+
+The ledger is bounded to 16 MiB. At capacity, further revocations stay closed in
+memory but return 503 without a durable acknowledgement; unrelated agents remain
+available. The supervisor must stop the affected worker and retain its cancellation
+intent until durable revocation succeeds. Do not erase tombstones to free capacity.
+Provision a separate proxy with new identities before reaching this bound. Each
+request admission checks ledger file identity/size/mtime; full contents load only
+at startup. A trusted host capable of replacing storage and falsifying its file
+metadata is outside this boundary.
+
+After revocation, the full live-context snapshot and capture history are removed
+once the last authenticated handler for that identity exits. Audit/session-history
+retention remains independent; revocation does not erase those durable records.

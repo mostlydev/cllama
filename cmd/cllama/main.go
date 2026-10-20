@@ -74,14 +74,15 @@ func run(args []string, stdout, stderr io.Writer) error {
 		recorder = sessionhistory.New(cfg.SessionHistoryDir)
 	}
 
+	apiHandler, uiHandler := newHandlers(cfg, reg, logger, acc, pricing, recorder, snapshots)
 	apiServer := &http.Server{
 		Addr:              cfg.APIAddr,
-		Handler:           newAPIHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, recorder, cfg.ContextLedgerDir, cfg.GovernanceDir, cfg.UIToken, snapshots),
+		Handler:           apiHandler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	uiServer := &http.Server{
 		Addr:              cfg.UIAddr,
-		Handler:           newUIHandler(reg, acc, cfg.ContextRoot, cfg.UIToken, snapshots),
+		Handler:           uiHandler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -119,8 +120,16 @@ func run(args []string, stdout, stderr io.Writer) error {
 }
 
 func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder, contextLedgerDir string, governanceDir string, adminToken string, snapshots *proxy.ContextSnapshotStore) http.Handler {
-	mux := http.NewServeMux()
-	opts := []proxy.HandlerOption{proxy.WithCostTracking(acc, pricing), proxy.WithSnapshotStore(snapshots)}
+	return newAPIHandlerWithProxy(newProxyHandler(contextRoot, reg, logger, acc, pricing, podName, recorder, contextLedgerDir, governanceDir, adminToken, snapshots))
+}
+
+func newHandlers(cfg config, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, recorder *sessionhistory.Recorder, snapshots *proxy.ContextSnapshotStore) (http.Handler, http.Handler) {
+	shared := newProxyHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, recorder, cfg.ContextLedgerDir, cfg.GovernanceDir, cfg.UIToken, snapshots)
+	return newAPIHandlerWithProxy(shared), newUIHandler(reg, acc, cfg.ContextRoot, cfg.UIToken, snapshots, shared.HandleRevoke)
+}
+
+func newProxyHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder, contextLedgerDir string, governanceDir string, adminToken string, snapshots *proxy.ContextSnapshotStore) *proxy.Handler {
+	opts := []proxy.HandlerOption{proxy.WithCostTracking(acc, pricing), proxy.WithSnapshotStore(snapshots), proxy.WithRevocationDir(os.Getenv("CLAW_REVOCATION_DIR"))}
 	if podName != "" {
 		opts = append(opts, proxy.WithFeeds(podName))
 	}
@@ -137,6 +146,12 @@ func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.L
 	proxyHandler := proxy.NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
 		return agentctx.Load(contextRoot, agentID)
 	}, logger, opts...)
+	return proxyHandler
+}
+
+func newAPIHandlerWithProxy(proxyHandler *proxy.Handler) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /internal/agents/{agentID}/revoke", proxyHandler.HandleRevoke)
 	mux.Handle("POST /v1/chat/completions", proxyHandler)
 	mux.Handle("POST /v1/messages", proxyHandler)
 	mux.HandleFunc("GET /history", proxyHandler.HandleSelfHistory)
@@ -148,11 +163,14 @@ func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.L
 	return mux
 }
 
-func newUIHandler(reg *provider.Registry, acc *cost.Accumulator, contextRoot, uiToken string, snapshots *proxy.ContextSnapshotStore) http.Handler {
+func newUIHandler(reg *provider.Registry, acc *cost.Accumulator, contextRoot, uiToken string, snapshots *proxy.ContextSnapshotStore, revoke ...http.HandlerFunc) http.Handler {
 	mux := http.NewServeMux()
 	opts := []ui.UIOption{ui.WithAccumulator(acc), ui.WithContextRoot(contextRoot), ui.WithSnapshotStore(snapshots)}
 	if uiToken != "" {
 		opts = append(opts, ui.WithUIToken(uiToken))
+	}
+	if len(revoke) > 0 {
+		mux.HandleFunc("POST /internal/agents/{agentID}/revoke", revoke[0])
 	}
 	mux.Handle("/", ui.NewHandler(reg, opts...))
 	return mux

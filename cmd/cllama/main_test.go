@@ -473,3 +473,93 @@ func TestHealthcheckURL(t *testing.T) {
 		}
 	}
 }
+
+func TestAPIHandlerExposesDurableOperatorRevocation(t *testing.T) {
+	t.Setenv("CLAW_REVOCATION_DIR", t.TempDir())
+	handler := newAPIHandler(t.TempDir(), nil, logging.New(io.Discard), nil, nil, "", nil, "", "", "operator-secret", proxy.NewContextSnapshotStore())
+	for _, test := range []struct {
+		token  string
+		status int
+	}{{"worker-1:secret", http.StatusForbidden}, {"operator-secret", http.StatusOK}} {
+		req := httptest.NewRequest(http.MethodPost, "/internal/agents/worker-1/revoke", strings.NewReader(`{"generation":1}`))
+		req.Header.Set("Authorization", "Bearer "+test.token)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		if response.Code != test.status {
+			t.Fatalf("status %d, want %d: %s", response.Code, test.status, response.Body.String())
+		}
+	}
+}
+
+func TestPublishedUIRevokesRequestOnAPIListener(t *testing.T) {
+	t.Setenv("CLAW_REVOCATION_DIR", t.TempDir())
+	root := t.TempDir()
+	agentDir := filepath.Join(root, "worker-1")
+	if err := os.Mkdir(agentDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{"AGENTS.md": "worker", "CLAWDAPUS.md": "worker", "metadata.json": `{"token":"worker-1:secret"}`} {
+		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(reached)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer func() { close(release); backend.Close() }()
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: backend.URL, APIKey: "key", Auth: "bearer"})
+	api, uiHandler := newHandlers(config{ContextRoot: root, UIToken: "operator"}, reg, logging.New(io.Discard), nil, nil, nil, proxy.NewContextSnapshotStore())
+	apiServer := httptest.NewServer(api)
+	defer apiServer.Close()
+	uiServer := httptest.NewServer(uiHandler)
+	defer uiServer.Close()
+	done := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodPost, apiServer.URL+"/v1/chat/completions", strings.NewReader(`{"model":"openai/model","messages":[]}`))
+		req.Header.Set("Authorization", "Bearer worker-1:secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+		done <- err
+	}()
+	select {
+	case <-reached:
+	case <-time.After(3 * time.Second):
+		t.Fatal("API request did not reach provider")
+	}
+	for _, token := range []string{"worker-1:secret", "operator"} {
+		req, _ := http.NewRequest(http.MethodPost, uiServer.URL+"/internal/agents/worker-1/revoke", strings.NewReader(`{"generation":1}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		want := 403
+		if token == "operator" {
+			want = 200
+		}
+		if resp.StatusCode != want {
+			t.Fatalf("UI revoke got %d, want %d", resp.StatusCode, want)
+		}
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("API request survived UI revoke")
+	}
+}

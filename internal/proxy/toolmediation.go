@@ -1971,6 +1971,23 @@ func prependChannelToolHeader(toolName string, channels []string, status string,
 }
 
 func (h *Handler) dispatchManagedTool(ctx context.Context, agentID string, tool agentctx.ToolManifestEntry, args map[string]any) ([]byte, int, error) {
+	callID := fmt.Sprintf("%x-%x", time.Now().UnixNano(), h.dispatchSequence.Add(1))
+	release, err := h.revocations.admit(ctx, agentID)
+	if err != nil {
+		h.logger.LogToolDispatch(agentID, callID, "refused")
+		return nil, 0, err
+	}
+	defer release()
+	h.logger.LogToolDispatch(agentID, callID, "admitted")
+	defer func() {
+		status := "completed"
+		h.revocations.mu.Lock()
+		if _, revoked := h.revocations.ledger.Agents[agentID]; revoked {
+			status = "admitted_before_revoke"
+		}
+		h.revocations.mu.Unlock()
+		h.logger.LogToolDispatch(agentID, callID, status)
+	}()
 	switch strings.ToLower(strings.TrimSpace(tool.Execution.Transport)) {
 	case "http":
 		return h.callManagedHTTPTool(ctx, agentID, tool, args)

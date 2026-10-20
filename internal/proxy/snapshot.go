@@ -612,3 +612,15 @@ func cloneJSONValue(v any) any {
 	}
 	return cloned
 }
+
+// Delete removes an inactive identity's prompt and capture history. Callers must
+// ensure no request for that identity can capture a new snapshot afterward.
+func (s *ContextSnapshotStore) Delete(agentID string) {
+	if s == nil {
+		return
+	}
+	s.snapshots.Delete(agentID)
+	s.historyMu.Lock()
+	delete(s.history, agentID)
+	s.historyMu.Unlock()
+}
