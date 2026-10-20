@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mostlydev/cllama/internal/agentctx"
@@ -31,6 +32,8 @@ type ContextLoader func(agentID string) (*agentctx.AgentContext, error)
 
 // Handler proxies OpenAI-compatible chat requests to upstream providers.
 type Handler struct {
+	revocations                  *revocationFence
+	dispatchSequence             atomic.Uint64
 	registry                     *provider.Registry
 	loadContext                  ContextLoader
 	client                       *http.Client
@@ -178,6 +181,7 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 	}
 	h := &Handler{
 		registry:                     registry,
+		revocations:                  newRevocationFence(""),
 		loadContext:                  contextLoader,
 		client:                       &http.Client{},
 		logger:                       logger,
@@ -624,6 +628,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, http.StatusForbidden, "invalid agent secret", agentID, "", start, err)
 		return
 	}
+	requestCtx, finishRequest, err := h.revocations.register(r.Context(), agentID)
+	if err != nil {
+		if !errors.Is(err, errAgentRevoked) {
+			h.logger.LogError(agentID, "", http.StatusServiceUnavailable, 0, fmt.Errorf("revocation storage unavailable at %s", h.revocations.dir))
+			h.fail(w, http.StatusServiceUnavailable, "agent admission unavailable", agentID, "", start, nil)
+		} else {
+			h.fail(w, http.StatusForbidden, "agent admission closed", agentID, "", start, nil)
+		}
+		return
+	}
+	defer finishRequest()
+	r = r.WithContext(requestCtx)
 	if h.policyEnabled(ctx) {
 		inBody, err := io.ReadAll(r.Body)
 		if err != nil {

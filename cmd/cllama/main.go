@@ -120,7 +120,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder, contextLedgerDir string, governanceDir string, adminToken string, snapshots *proxy.ContextSnapshotStore) http.Handler {
 	mux := http.NewServeMux()
-	opts := []proxy.HandlerOption{proxy.WithCostTracking(acc, pricing), proxy.WithSnapshotStore(snapshots)}
+	opts := []proxy.HandlerOption{proxy.WithCostTracking(acc, pricing), proxy.WithSnapshotStore(snapshots), proxy.WithRevocationDir(os.Getenv("CLAW_REVOCATION_DIR"))}
 	if podName != "" {
 		opts = append(opts, proxy.WithFeeds(podName))
 	}
@@ -137,6 +137,7 @@ func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.L
 	proxyHandler := proxy.NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
 		return agentctx.Load(contextRoot, agentID)
 	}, logger, opts...)
+	mux.HandleFunc("POST /internal/agents/{agentID}/revoke", proxyHandler.HandleRevoke)
 	mux.Handle("POST /v1/chat/completions", proxyHandler)
 	mux.Handle("POST /v1/messages", proxyHandler)
 	mux.HandleFunc("GET /history", proxyHandler.HandleSelfHistory)

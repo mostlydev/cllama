@@ -50,6 +50,14 @@ type entry struct {
 	CostUSD            *float64 `json:"cost_usd,omitempty"`
 	Intervention       *string  `json:"intervention"`
 	Error              string   `json:"error,omitempty"`
+
+	// Revocation events contain IDs and counters only.
+	RevocationGeneration *uint64 `json:"revocation_generation,omitempty"`
+	AdmittedBeforeRevoke *uint64 `json:"admitted_before_revoke,omitempty"`
+	RefusedAfterRevoke   *uint64 `json:"refused_after_revoke,omitempty"`
+	DispatchID           string  `json:"dispatch_id,omitempty"`
+	DispatchStatus       string  `json:"dispatch_status,omitempty"`
+
 	// memory_op event fields
 	MemoryService *string `json:"memory_service,omitempty"`
 	MemoryOp      *string `json:"memory_op,omitempty"`
@@ -467,4 +475,19 @@ func ptrString(v string) *string {
 
 func ptrBool(v bool) *bool {
 	return &v
+}
+
+// LogToolDispatch emits only infrastructure IDs and fence status. It never
+// includes tool arguments, results, URLs or credentials.
+func (l *Logger) LogToolDispatch(agentID, callID, status string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_ = l.enc.Encode(entry{TS: time.Now().UTC().Format(time.RFC3339Nano), ClawID: agentID, Type: "tool_dispatch", DispatchID: callID, DispatchStatus: status})
+}
+
+// LogRevocation counts dispatch admissions and refusals in this proxy process.
+func (l *Logger) LogRevocation(agentID string, generation, admitted, refused uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_ = l.enc.Encode(entry{TS: time.Now().UTC().Format(time.RFC3339Nano), ClawID: agentID, Type: "revocation", RevocationGeneration: &generation, AdmittedBeforeRevoke: &admitted, RefusedAfterRevoke: &refused})
 }

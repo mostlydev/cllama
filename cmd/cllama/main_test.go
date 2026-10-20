@@ -473,3 +473,20 @@ func TestHealthcheckURL(t *testing.T) {
 		}
 	}
 }
+
+func TestAPIHandlerExposesDurableOperatorRevocation(t *testing.T) {
+	t.Setenv("CLAW_REVOCATION_DIR", t.TempDir())
+	handler := newAPIHandler(t.TempDir(), nil, logging.New(io.Discard), nil, nil, "", nil, "", "", "operator-secret", proxy.NewContextSnapshotStore())
+	for _, test := range []struct {
+		token  string
+		status int
+	}{{"worker-1:secret", http.StatusForbidden}, {"operator-secret", http.StatusOK}} {
+		req := httptest.NewRequest(http.MethodPost, "/internal/agents/worker-1/revoke", strings.NewReader(`{"generation":1}`))
+		req.Header.Set("Authorization", "Bearer "+test.token)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		if response.Code != test.status {
+			t.Fatalf("status %d, want %d: %s", response.Code, test.status, response.Body.String())
+		}
+	}
+}
