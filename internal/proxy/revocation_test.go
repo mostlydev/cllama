@@ -89,7 +89,8 @@ func TestRevocationPersistenceFailsClosed(t *testing.T) {
 }
 
 func TestRevocationCancelsLiveLoops(t *testing.T) {
-	for _, format := range []string{"openai", "anthropic"} {
+	// bridge is chat/completions served by an anthropic-format provider.
+	for _, format := range []string{"openai", "anthropic", "bridge"} {
 		for _, transport := range []string{"http", "mcp"} {
 			for _, phase := range []string{"provider", "tool"} {
 				for _, stream := range []bool{false, true} {
@@ -140,19 +141,20 @@ func TestRevocationCancelsLiveLoops(t *testing.T) {
 						}))
 						defer func() { close(cleanup); backend.Close(); toolSrv.Close() }()
 						reg := provider.NewRegistry("")
-						prov := &provider.Provider{Name: format, BaseURL: backend.URL + "/v1", APIKey: "provider-secret", Auth: "bearer"}
-						if format == "anthropic" {
+						providerName := map[bool]string{true: "openai", false: "anthropic"}[format == "openai"]
+						prov := &provider.Provider{Name: providerName, BaseURL: backend.URL + "/v1", APIKey: "provider-secret", Auth: "bearer"}
+						if providerName == "anthropic" {
 							prov.APIFormat = "anthropic"
 							prov.Auth = "x-api-key"
 						}
-						reg.Set(format, prov)
+						reg.Set(providerName, prov)
 						var logs bytes.Buffer
 						h := NewHandler(reg, stubContextLoaderWithTools("worker-1", "worker-1:secret", manifest), logging.New(&logs), WithRevocationDir(t.TempDir()), WithAdminToken("admin-secret"))
 						path := "/v1/chat/completions"
 						if format == "anthropic" {
 							path = "/v1/messages"
 						}
-						req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"run"}],"max_tokens":20,"stream":%t}`, format+"/model", stream)))
+						req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"run"}],"max_tokens":20,"stream":%t}`, providerName+"/model", stream)))
 						req.Header.Set("Authorization", "Bearer worker-1:secret")
 						done := make(chan struct{})
 						streamResponse := &revocationStreamRecorder{ResponseRecorder: httptest.NewRecorder(), started: make(chan struct{})}

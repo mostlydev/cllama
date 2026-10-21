@@ -279,6 +279,42 @@ Two behaviours are worth knowing:
   frequency or presence penalties, logit bias, stop sequences, seeds, and
   token log probabilities) receive a 400 instead of being silently discarded.
 
+### Anthropic Messages adapter
+
+Runners that speak only OpenAI chat/completions (PicoClaw, for one) can use an
+Anthropic provider directly. When a `/v1/chat/completions` request resolves to a
+registered provider whose `api_format` is `anthropic`, cllama translates it to
+`POST /v1/messages` at the provider boundary and translates the reply back, the
+same way the Responses adapter does. `anthropic/<model>` therefore always bills
+the declared Anthropic provider; OpenRouter is used only for vendor prefixes no
+provider is registered for. Requests routed this way emit an `intervention`
+audit event with reason `anthropic_messages_adapter`.
+
+Translation covers system and developer messages, text, images (http(s) or
+base64 data URLs), function tools, tool calls and tool results, `tool_choice`,
+`parallel_tool_calls`, `stop` and `user`. Usage is reported in chat terms with
+the cache split preserved (`prompt_tokens_details.cached_tokens` and
+`cache_write_tokens`). Requests whose semantics Anthropic cannot honour, such as
+`response_format` JSON modes, audio or file parts, `n > 1`, `logprobs`,
+penalties, `seed`, `logit_bias`, `reasoning_effort` or unknown fields, are
+rejected with a 400 instead of being silently dropped.
+
+Three request rewrites are logged as their own intervention events:
+
+- `anthropic_adapter_default_max_tokens`: `max_tokens` is required by
+  Anthropic and set to 8192 when the runner sends neither `max_tokens` nor
+  `max_completion_tokens`.
+- `anthropic_adapter_dropped_sampling`: Claude generations after 4.6 (Opus 4.7
+  and 4.8, and every 5.x, Fable and Mythos model) reject non-default
+  `temperature`/`top_p`. Sampling fields are forwarded only to Claude 3 and
+  Claude 4.0–4.6 model IDs.
+- `anthropic_adapter_dropped_top_p`: when a model accepts sampling and both
+  fields are present, only `temperature` is sent, because Anthropic rejects the
+  pair.
+
+Like the Responses adapter, requests are dispatched non-streaming and a
+streamed request receives synthetic chat SSE built from the buffered reply.
+
 ---
 
 ## Audit Logging

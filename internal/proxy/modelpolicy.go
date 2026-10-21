@@ -11,6 +11,10 @@ type dispatchCandidate struct {
 	Ref           string
 	ProviderName  string
 	UpstreamModel string
+	// APIFormat is the resolved provider's wire format. An "anthropic"
+	// candidate on the chat/completions path dispatches through the Anthropic
+	// Messages adapter.
+	APIFormat string
 }
 
 type modelResolution struct {
@@ -187,11 +191,15 @@ func (h *Handler) openAICandidateFromRef(ref string) (dispatchCandidate, error) 
 	if err != nil {
 		return dispatchCandidate{}, err
 	}
-	return dispatchCandidate{
+	candidate := dispatchCandidate{
 		Ref:           ref,
 		ProviderName:  resolvedProvider,
 		UpstreamModel: resolvedUpstream,
-	}, nil
+	}
+	if prov, err := h.registry.Get(resolvedProvider); err == nil {
+		candidate.APIFormat = strings.ToLower(strings.TrimSpace(prov.APIFormat))
+	}
+	return candidate, nil
 }
 
 func anthropicCandidateFromRef(ref string) (dispatchCandidate, error) {
