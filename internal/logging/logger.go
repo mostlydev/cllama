@@ -51,6 +51,10 @@ type entry struct {
 	Intervention       *string  `json:"intervention"`
 	Error              string   `json:"error,omitempty"`
 
+	UpstreamErrorCode  string `json:"upstream_error_code,omitempty"`
+	UpstreamErrorType  string `json:"upstream_error_type,omitempty"`
+	UpstreamErrorParam string `json:"upstream_error_param,omitempty"`
+
 	// Revocation events contain IDs and counters only.
 	RevocationGeneration *uint64 `json:"revocation_generation,omitempty"`
 	AdmittedBeforeRevoke *uint64 `json:"admitted_before_revoke,omitempty"`
@@ -237,6 +241,13 @@ func (l *Logger) LogError(clawID, model string, statusCode int, latencyMS int64,
 		Intervention: nil,
 		Error:        errText,
 	})
+}
+
+// LogUpstreamError records only pre-sanitized, allowlisted provider metadata.
+func (l *Logger) LogUpstreamError(clawID, model, provider string, status int, code, kind, param string) {
+	l.log(entry{TS: time.Now().UTC().Format(time.RFC3339), ClawID: clawID,
+		Type: "upstream_error", Model: model, Provider: provider, StatusCode: ptrInt(status),
+		UpstreamErrorCode: code, UpstreamErrorType: kind, UpstreamErrorParam: param})
 }
 
 func (l *Logger) LogResponseWithCost(clawID, model string, statusCode int, latencyMS int64, ci *CostInfo) {

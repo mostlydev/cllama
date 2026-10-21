@@ -1006,6 +1006,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			}
 		}
 
+		h.logUpstreamError(agentID, requestedModel, candidate.ProviderName, resp)
 		classification := classifyResponse(resp)
 		switch classification {
 		case classAuth:

@@ -964,6 +964,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			return true, sawCooldown, reason
 		}
 
+		h.logUpstreamError(agentID, requestedModel, candidate.ProviderName, resp)
 		classification := classifyResponse(resp)
 
 		switch classification {

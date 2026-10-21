@@ -304,6 +304,17 @@ Every request/response pair emits a structured JSON log line to stdout:
 
 These logs feed `docker compose logs`, fleet telemetry pipelines, and `claw audit`.
 
+Upstream HTTP failures also emit `type: "upstream_error"`, with `provider`,
+`status_code`, and (when recognized) `upstream_error_code`,
+`upstream_error_type`, and `upstream_error_param`. These fields use fixed
+allowlists; unrecognized strings become `other`. Provider messages, response
+bodies, request IDs and headers are never included in this diagnostic event.
+Parsing inspects at most 16 KiB of a failure body and preserves the response
+for normal forwarding and retry classification. Large or invalid error bodies
+still produce a status-only event. Both direct and managed-tool dispatch paths
+emit these diagnostics, including failed attempts before retry or fallback.
+
+
 Feed injection emits a separate `feed_injection` event for each manifest entry.
 It records whether the feed was `included`, `empty`, or `skipped_total_cap`, plus
 source/content/block byte counts, effective caps, and whether the feed body was
