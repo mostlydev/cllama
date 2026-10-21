@@ -175,6 +175,8 @@ func TestHandlerRejectsUnsupportedSemanticsBeforeAnthropicDispatch(t *testing.T)
 		"audio input": `"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}]}]`,
 		"bad args":    `"messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{not json"}}]}]`,
 		"n":           `"n":2`,
+		"null args":   `"messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"null"}}]}]`,
+		"tool audio":  `"messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":[{"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}]}]`,
 		"unknown":     `"some_future_field":true`,
 		"role":        `"messages":[{"role":"secret-role-text","content":"hi"}]`,
 		"store":       `"store":true`,
@@ -415,5 +417,26 @@ func TestAnthropicModelAcceptsSampling(t *testing.T) {
 	}
 	if _, ok := out["temperature"]; ok || len(mutations) != 2 || mutations[1] != anthropicSamplingDroppedIntervention {
 		t.Errorf("sampling must be dropped and logged for current models: %#v %v", out, mutations)
+	}
+}
+
+func TestChatToAnthropicRequestForwardsToolResultImages(t *testing.T) {
+	payload := map[string]any{}
+	if err := json.Unmarshal([]byte(`{"model":"claude-sonnet-5-5","messages":[
+		{"role":"user","content":"look"},
+		{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"shot","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"c1","content":[{"type":"text","text":"screen"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBOR"}}]}
+	]}`), &payload); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := chatToAnthropicRequest(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := out["messages"].([]any)
+	result := messages[2].(map[string]any)["content"].([]any)[0].(map[string]any)
+	blocks, ok := result["content"].([]any)
+	if !ok || len(blocks) != 2 || blocks[0].(map[string]any)["text"] != "screen" || blocks[1].(map[string]any)["type"] != "image" {
+		t.Fatalf("tool result must keep text and image parts: %#v", result)
 	}
 }

@@ -263,7 +263,8 @@ func chatMessagesToAnthropic(messages []any) ([]any, []any, error) {
 				fn, _ := call["function"].(map[string]any)
 				input := map[string]any{}
 				if args := strings.TrimSpace(stringField(fn, "arguments")); args != "" {
-					if err := json.Unmarshal([]byte(args), &input); err != nil {
+					// "null" decodes into a nil map without error.
+					if err := json.Unmarshal([]byte(args), &input); err != nil || input == nil {
 						return nil, nil, anthropicAdapterError("anthropic adapter: messages[%d].tool_calls[%d] arguments are not a JSON object", i, j)
 					}
 				}
@@ -276,10 +277,14 @@ func chatMessagesToAnthropic(messages []any) ([]any, []any, error) {
 			}
 			appendBlocks("assistant", blocks)
 		case "tool":
+			content, err := chatToolResultToAnthropic(message["content"])
+			if err != nil {
+				return nil, nil, err
+			}
 			result := map[string]any{
 				"type":        "tool_result",
 				"tool_use_id": stringField(message, "tool_call_id"),
-				"content":     chatToolResultOutput(message["content"]),
+				"content":     content,
 			}
 			appendBlocks("user", []any{result})
 		default:
@@ -287,6 +292,26 @@ func chatMessagesToAnthropic(messages []any) ([]any, []any, error) {
 		}
 	}
 	return system, out, nil
+}
+
+// chatToolResultToAnthropic keeps string results as strings and converts part
+// arrays with the same fail-closed rules as user content, so an attached image
+// is forwarded and an unsupported part is rejected instead of dropped.
+func chatToolResultToAnthropic(content any) (any, error) {
+	switch typed := content.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return typed, nil
+	}
+	blocks, err := chatContentToAnthropicBlocks(content, true)
+	if err != nil {
+		return nil, err
+	}
+	if len(blocks) == 0 {
+		return "", nil
+	}
+	return blocks, nil
 }
 
 // chatContentToAnthropicBlocks converts string or part-array content. Only
