@@ -256,9 +256,10 @@ observing the unchanged chat/completions shape. Requests routed this way emit an
 
 Selection is per declared provider/model:
 
-- **Built in:** `openai/gpt-5.6*` and `openai/gpt-5-pro*`. The list is
-  deliberately narrow — rerouting a model that already works on
-  chat/completions would be a regression.
+- **Built in:** `openai/gpt-5.6*`, `openai/gpt-5-pro*`, and the exact OpenAI
+  families `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` plus their
+  dated snapshots. GPT6 tool calling uses Responses; unknown sibling names
+  and other providers are unaffected.
 - **Extend** with `CLLAMA_RESPONSES_API_MODELS`.
 - **Recover automatically:** when upstream rejects a request with a message
   naming `/v1/responses`, that request is retried once through the adapter and
@@ -278,6 +279,52 @@ Two behaviours are worth knowing:
 - Chat-only controls that Responses cannot preserve (for example, non-default
   frequency or presence penalties, logit bias, stop sequences, seeds, and
   token log probabilities) receive a 400 instead of being silently discarded.
+
+For those GPT6 families, unsupported `temperature` and `top_p` fields are
+removed with a `responses_adapter_dropped_sampling` intervention. This covers
+sampling defaults inserted by older runners such as PicoClaw v0.2.7. Sampling
+is preserved for GPT6 Sol/Luna with explicit `reasoning_effort: "none"`.
+Explicit `none` on Astra/6.1 Sol or `minimal` on these families receives a
+fixed local 400; cllama never silently changes reasoning effort. The existing
+adapter maps `max_tokens`/`max_completion_tokens` to `max_output_tokens`.
+See the [official OpenAI model guide](https://developers.openai.com/api/docs/guides/latest-model)
+for the API restrictions. Both direct and managed-tool rounds use these rules.
+
+### Anthropic Messages adapter
+
+Runners that speak only OpenAI chat/completions (PicoClaw, for one) can use an
+Anthropic provider directly. When a `/v1/chat/completions` request resolves to a
+registered provider whose `api_format` is `anthropic`, cllama translates it to
+`POST /v1/messages` at the provider boundary and translates the reply back, the
+same way the Responses adapter does. `anthropic/<model>` therefore always bills
+the declared Anthropic provider; OpenRouter is used only for vendor prefixes no
+provider is registered for. Requests routed this way emit an `intervention`
+audit event with reason `anthropic_messages_adapter`.
+
+Translation covers system and developer messages, text, images (http(s) or
+base64 data URLs), function tools, tool calls and tool results, `tool_choice`,
+`parallel_tool_calls`, `stop` and `user`. Usage is reported in chat terms with
+the cache split preserved (`prompt_tokens_details.cached_tokens` and
+`cache_write_tokens`). Requests whose semantics Anthropic cannot honour, such as
+`response_format` JSON modes, audio or file parts, `n > 1`, `logprobs`,
+penalties, `seed`, `logit_bias`, `reasoning_effort` or unknown fields, are
+rejected with a 400 instead of being silently dropped.
+
+Three request rewrites are logged as their own intervention events:
+
+- `anthropic_adapter_default_max_tokens`: `max_tokens` is required by
+  Anthropic and set to 8192 when the runner sends neither `max_tokens` nor
+  `max_completion_tokens`.
+- `anthropic_adapter_dropped_sampling`: Claude generations after 4.6 (Opus 4.7
+  and 4.8, and every 5.x, Fable and Mythos model) reject non-default
+  `temperature`/`top_p`. Sampling fields are forwarded only to Claude 3 and
+  Claude 4.0–4.6 model IDs.
+- `anthropic_adapter_dropped_top_p`: when a model accepts sampling and both
+  fields are present, only `temperature` is sent, because Anthropic rejects the
+  pair.
+
+Like the Responses adapter, requests are dispatched non-streaming and a
+streamed request receives synthetic chat SSE built from the buffered reply.
 
 ---
 
@@ -303,6 +350,17 @@ Every request/response pair emits a structured JSON log line to stdout:
 `intervention` is always `null` in passthrough mode. Policy proxies will populate it with the rule that triggered an amendment, drop, or reroute — the raw material for drift scoring.
 
 These logs feed `docker compose logs`, fleet telemetry pipelines, and `claw audit`.
+
+Upstream HTTP failures also emit `type: "upstream_error"`, with `provider`,
+`status_code`, and (when recognized) `upstream_error_code`,
+`upstream_error_type`, and `upstream_error_param`. These fields use fixed
+allowlists; unrecognized strings become `other`. Provider messages, response
+bodies, request IDs and headers are never included in this diagnostic event.
+Parsing inspects at most 16 KiB of a failure body and preserves the response
+for normal forwarding and retry classification. Large or invalid error bodies
+still produce a status-only event. Both direct and managed-tool dispatch paths
+emit these diagnostics, including failed attempts before retry or fallback.
+
 
 Feed injection emits a separate `feed_injection` event for each manifest entry.
 It records whether the feed was `included`, `empty`, or `skipped_total_cap`, plus

@@ -901,7 +901,7 @@ func (h *Handler) dispatchCandidatesJSONWithReasoning(ctx context.Context, r *ht
 			return nil, http.StatusInternalServerError, "failed to encode upstream body", err
 		}
 		if upstream.Adapter {
-			h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter")
+			h.logger.LogIntervention(agentID, requestedModel, upstream.intervention())
 			for _, mutation := range upstream.Mutations {
 				h.logger.LogIntervention(agentID, requestedModel, mutation)
 			}
@@ -977,6 +977,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 		if upstream.Adapter {
 			// The adapter rewrites the reply, so it must arrive uncompressed.
 			outReq.Header.Set("Accept-Encoding", "identity")
+			upstream.applyHeaders(outReq.Header)
 		}
 		if err := applyProviderAuth(outReq, prov); err != nil {
 			cancel()
@@ -1006,6 +1007,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			}
 		}
 
+		h.logUpstreamError(agentID, requestedModel, candidate.ProviderName, resp)
 		classification := classifyResponse(resp)
 		switch classification {
 		case classAuth:
@@ -1044,7 +1046,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			// model responses-only that the built-in list does not know yet.
 			if !upstream.Adapter && responsesAdapterEligible(r.URL.Path) && responsesOnlyUpstreamSignal(resp) {
 				matchingReasoning, droppedReasoning := responsesReasoningForCandidate(reasoningReplay, candidate)
-				if adapted, adaptErr := adaptChatBodyToResponsesWithReasoning(outBody, matchingReasoning); adaptErr == nil {
+				if adapted, adaptErr := adaptChatBodyToResponsesForCandidate(outBody, matchingReasoning, candidate); adaptErr == nil {
 					resp.Body.Close()
 					cancel()
 					h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter_retry")
@@ -1113,7 +1115,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			if upstream.Adapter {
 				// Translate before the mediation loop sees it: every round of
 				// the loop parses the chat/completions shape.
-				converted, reasoning, convErr := responsesToChatCompletionWithReasoning(capturedBody)
+				converted, reasoning, convErr := upstream.toChatCompletion(capturedBody)
 				if convErr != nil {
 					if canFallback {
 						h.logCandidateFallback(agentID, requestedModel, "responses_adapter_error")

@@ -738,8 +738,10 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 }
 
 // resolveOpenAIProvider maps a parsed provider name to the actual provider name
-// and potentially rewrites the upstream model (format bridge).
-// Returns the final (providerName, upstreamModel) to use.
+// and potentially rewrites the upstream model (vendor-prefix bridge).
+// Returns the final (providerName, upstreamModel) to use. A registered
+// anthropic-format provider is served natively through the Anthropic Messages
+// adapter, so anthropic/<model> always bills the declared Anthropic provider.
 func (h *Handler) resolveOpenAIProvider(providerName, upstreamModel string) (string, string, error) {
 	prov, err := h.registry.Get(providerName)
 	if err != nil {
@@ -751,16 +753,7 @@ func (h *Handler) resolveOpenAIProvider(providerName, upstreamModel string) (str
 		return bridge.Name, providerName + "/" + upstreamModel, nil
 	}
 
-	// Format bridge: anthropic provider on OpenAI path → route via openrouter.
-	if strings.EqualFold(prov.APIFormat, "anthropic") {
-		bridge, bridgeErr := h.registry.Get("openrouter")
-		if bridgeErr != nil {
-			return "", "", fmt.Errorf("provider %q uses anthropic format but request is openai format; configure openrouter for format bridging", providerName)
-		}
-		return bridge.Name, providerName + "/" + upstreamModel, nil
-	}
-
-	return providerName, upstreamModel, nil
+	return prov.Name, upstreamModel, nil
 }
 
 func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, start time.Time) {
@@ -856,7 +849,7 @@ func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, age
 			return
 		}
 		if upstream.Adapter {
-			h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter")
+			h.logger.LogIntervention(agentID, requestedModel, upstream.intervention())
 			for _, mutation := range upstream.Mutations {
 				h.logger.LogIntervention(agentID, requestedModel, mutation)
 			}
@@ -933,6 +926,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			// Copying the agent's Accept-Encoding would disable Go's
 			// transparent decompression and hand us a compressed body.
 			outReq.Header.Set("Accept-Encoding", "identity")
+			upstream.applyHeaders(outReq.Header)
 		}
 
 		// Forward Anthropic-specific headers for the Anthropic path.
@@ -964,6 +958,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			return true, sawCooldown, reason
 		}
 
+		h.logUpstreamError(agentID, requestedModel, candidate.ProviderName, resp)
 		classification := classifyResponse(resp)
 
 		switch classification {
@@ -1008,7 +1003,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			// rather than handing the agent a rejection that reads like a
 			// credentials or provider-pool problem.
 			if !upstream.Adapter && responsesAdapterEligible(r.URL.Path) && responsesOnlyUpstreamSignal(resp) {
-				if adapted, adaptErr := adaptChatBodyToResponses(outBody); adaptErr == nil {
+				if adapted, adaptErr := adaptChatBodyToResponsesForCandidate(outBody, nil, candidate); adaptErr == nil {
 					resp.Body.Close()
 					cancel()
 					h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter_retry")
@@ -1032,7 +1027,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 				return true, sawCooldown, reason
 			}
 			if upstream.Adapter {
-				if err := adaptResponsesResponse(resp, downstreamStream, downstreamIncludeUsage); err != nil {
+				if err := adaptUpstreamResponse(resp, upstream, downstreamStream, downstreamIncludeUsage); err != nil {
 					resp.Body.Close()
 					cancel()
 					if canFallback {

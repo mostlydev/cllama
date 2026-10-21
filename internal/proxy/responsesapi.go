@@ -51,7 +51,10 @@ const (
 // a model that already works on chat/completions would be a regression, so
 // entries are added only with evidence.
 var responsesAPIModelPrefixes = map[string][]string{
-	"openai": {"gpt-5.6", "gpt-5-pro"},
+	// GPT6 tool calling requires Responses. Live PicoClaw reproduction for
+	// gpt-6.1-sol rejected max_tokens on chat, then temperature on Responses
+	// (issue58). Exact families/snapshots are scoped by openAIReasoningFamily.
+	"openai": {"gpt-5.6", "gpt-5-pro", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"},
 }
 
 // responsesAPIRequired reports whether a declared provider/model pair must be
@@ -67,7 +70,11 @@ func responsesAPIRequired(providerName, upstreamModel string) bool {
 	}
 
 	for _, prefix := range responsesAPIModelPrefixes[provider] {
-		if strings.HasPrefix(model, prefix) {
+		if strings.HasPrefix(prefix, "gpt-6") {
+			if openAIReasoningFamily(model) == prefix {
+				return true
+			}
+		} else if strings.HasPrefix(model, prefix) {
 			return true
 		}
 	}
@@ -528,14 +535,57 @@ func stringField(m map[string]any, key string) string {
 }
 
 // upstreamEncoding is the wire form of one candidate's request. It differs from
-// the agent-facing request only when the Responses adapter is active.
+// the agent-facing request only when an adapter (Responses or Anthropic
+// Messages) is active.
 type upstreamEncoding struct {
 	Path    string
 	Body    []byte
 	Adapter bool
+	// Kind names the active adapter; it is empty when Adapter is false.
+	Kind upstreamAdapterKind
 	// Mutations lists env-knob request rewrites applied during translation.
 	// Dispatch sites log each as an intervention alongside the adapter event.
 	Mutations []string
+}
+
+type upstreamAdapterKind string
+
+const (
+	adapterResponses upstreamAdapterKind = "responses"
+	adapterAnthropic upstreamAdapterKind = "anthropic"
+)
+
+// intervention is the audit event dispatch sites log for an adapted request.
+func (u upstreamEncoding) intervention() string {
+	if u.Kind == adapterAnthropic {
+		return anthropicMessagesAdapterIntervention
+	}
+	return "responses_api_adapter"
+}
+
+// applyHeaders sets adapter-specific upstream headers.
+func (u upstreamEncoding) applyHeaders(h http.Header) {
+	if u.Kind == adapterAnthropic {
+		h.Set("Anthropic-Version", anthropicAPIVersion)
+	}
+}
+
+// toChatCompletion translates an adapted upstream reply back into the
+// chat/completions shape. converted is false for bodies that are not a reply
+// object of the adapter's API (an upstream error, say), which callers pass
+// through untouched.
+func (u upstreamEncoding) toChatCompletion(body []byte) (out []byte, reasoning []json.RawMessage, err error) {
+	if u.Kind == adapterAnthropic {
+		converted, ok, err := anthropicToChatCompletion(body)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !ok {
+			return body, nil, nil
+		}
+		return converted, nil, nil
+	}
+	return responsesToChatCompletionWithReasoning(body)
 }
 
 // encodeUpstreamRequest decides whether a candidate must be dispatched through
@@ -546,6 +596,17 @@ func encodeUpstreamRequest(candidate dispatchCandidate, requestPath string, payl
 }
 
 func encodeUpstreamRequestWithReasoning(candidate dispatchCandidate, requestPath string, payload map[string]any, chatBody []byte, replay []responsesReasoningReplay) (upstreamEncoding, bool, error) {
+	if responsesAdapterEligible(requestPath) && candidate.APIFormat == "anthropic" {
+		translated, mutations, err := chatToAnthropicRequest(payload)
+		if err != nil {
+			return upstreamEncoding{}, false, err
+		}
+		body, err := json.Marshal(translated)
+		if err != nil {
+			return upstreamEncoding{}, false, err
+		}
+		return upstreamEncoding{Path: anthropicMessagesPath, Body: body, Adapter: true, Kind: adapterAnthropic, Mutations: mutations}, false, nil
+	}
 	if !responsesAdapterEligible(requestPath) || !responsesAPIRequired(candidate.ProviderName, candidate.UpstreamModel) {
 		return upstreamEncoding{Path: requestPath, Body: chatBody}, false, nil
 	}
@@ -554,11 +615,17 @@ func encodeUpstreamRequestWithReasoning(candidate dispatchCandidate, requestPath
 	if err != nil {
 		return upstreamEncoding{}, droppedReplay, err
 	}
+	capabilityMutations, err := normalizeOpenAIResponses(candidate, translated)
+	if err != nil {
+		return upstreamEncoding{}, droppedReplay, err
+	}
+	mutations = append(mutations, capabilityMutations...)
+
 	body, err := json.Marshal(translated)
 	if err != nil {
 		return upstreamEncoding{}, droppedReplay, err
 	}
-	return upstreamEncoding{Path: responsesAPIPath, Body: body, Adapter: true, Mutations: mutations}, droppedReplay, nil
+	return upstreamEncoding{Path: responsesAPIPath, Body: body, Adapter: true, Kind: adapterResponses, Mutations: mutations}, droppedReplay, nil
 }
 
 func responsesReasoningForCandidate(replay []responsesReasoningReplay, candidate dispatchCandidate) ([]responsesReasoningReplay, bool) {
@@ -593,6 +660,10 @@ func adaptChatBodyToResponses(chatBody []byte) (upstreamEncoding, error) {
 }
 
 func adaptChatBodyToResponsesWithReasoning(chatBody []byte, replay []responsesReasoningReplay) (upstreamEncoding, error) {
+	return adaptChatBodyToResponsesForCandidate(chatBody, replay, dispatchCandidate{})
+}
+
+func adaptChatBodyToResponsesForCandidate(chatBody []byte, replay []responsesReasoningReplay, candidate dispatchCandidate) (upstreamEncoding, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(chatBody, &payload); err != nil {
 		return upstreamEncoding{}, err
@@ -601,11 +672,17 @@ func adaptChatBodyToResponsesWithReasoning(chatBody []byte, replay []responsesRe
 	if err != nil {
 		return upstreamEncoding{}, err
 	}
+	capabilityMutations, err := normalizeOpenAIResponses(candidate, translated)
+	if err != nil {
+		return upstreamEncoding{}, err
+	}
+	mutations = append(mutations, capabilityMutations...)
+
 	body, err := json.Marshal(translated)
 	if err != nil {
 		return upstreamEncoding{}, err
 	}
-	return upstreamEncoding{Path: responsesAPIPath, Body: body, Adapter: true, Mutations: mutations}, nil
+	return upstreamEncoding{Path: responsesAPIPath, Body: body, Adapter: true, Kind: adapterResponses, Mutations: mutations}, nil
 }
 
 // responsesOnlyUpstreamSignal reports whether an upstream rejection says the
@@ -650,24 +727,45 @@ func bodyNamesResponsesAPI(body []byte) bool {
 // When the agent asked for a stream, the buffered completion is re-emitted as
 // synthetic chat SSE, because the Responses event taxonomy is not the chat one.
 func adaptResponsesResponse(resp *http.Response, downstreamStream, downstreamIncludeUsage bool) error {
+	return rewriteAdaptedResponse(resp, downstreamStream, downstreamIncludeUsage, func(body []byte) ([]byte, error) {
+		converted, err := responsesToChatCompletion(body)
+		if err != nil {
+			// A recognized Responses object in a failure state must surface as a
+			// failure — passing it through would hand the agent a 200 whose body
+			// is a raw failed Responses object (or, streamed, a clean empty stop).
+			var failure *responsesFailureError
+			if errors.As(err, &failure) {
+				return nil, err
+			}
+			// Not a Responses object (an upstream error page, say). Pass it through
+			// rather than masking the failure with a synthesized empty reply.
+			return body, nil
+		}
+		return converted, nil
+	})
+}
+
+// adaptUpstreamResponse rewrites an adapted upstream reply in place with the
+// converter for the encoding's adapter.
+func adaptUpstreamResponse(resp *http.Response, upstream upstreamEncoding, downstreamStream, downstreamIncludeUsage bool) error {
+	if upstream.Kind != adapterAnthropic {
+		return adaptResponsesResponse(resp, downstreamStream, downstreamIncludeUsage)
+	}
+	return rewriteAdaptedResponse(resp, downstreamStream, downstreamIncludeUsage, func(body []byte) ([]byte, error) {
+		converted, _, err := upstream.toChatCompletion(body)
+		return converted, err
+	})
+}
+
+func rewriteAdaptedResponse(resp *http.Response, downstreamStream, downstreamIncludeUsage bool, convert func([]byte) ([]byte, error)) error {
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
 		return err
 	}
-
-	converted, err := responsesToChatCompletion(body)
+	converted, err := convert(body)
 	if err != nil {
-		// A recognized Responses object in a failure state must surface as a
-		// failure — passing it through would hand the agent a 200 whose body
-		// is a raw failed Responses object (or, streamed, a clean empty stop).
-		var failure *responsesFailureError
-		if errors.As(err, &failure) {
-			return err
-		}
-		// Not a Responses object (an upstream error page, say). Pass it through
-		// rather than masking the failure with a synthesized empty reply.
-		converted = body
+		return err
 	}
 
 	contentType := "application/json"
