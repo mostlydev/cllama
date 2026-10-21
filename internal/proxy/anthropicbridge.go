@@ -41,9 +41,7 @@ var anthropicIgnoredChatFields = map[string]bool{
 	"messages":         true,
 	"stream":           true,
 	"stream_options":   true,
-	"store":            true,
 	"metadata":         true,
-	"service_tier":     true,
 	"prompt_cache_key": true,
 }
 
@@ -87,6 +85,10 @@ func anthropicModelAcceptsSampling(model string) bool {
 	return err == nil && minor <= 6
 }
 
+// anthropicAdapterError builds a client error. Callers pass only fixed text,
+// array indices and field names from the adapter's own vocabulary: the
+// message is returned to the agent and logged, so request-supplied keys,
+// roles or types must never be interpolated into it.
 func anthropicAdapterError(format string, args ...any) error {
 	return &responsesAdapterRequestError{message: fmt.Sprintf(format, args...)}
 }
@@ -129,13 +131,21 @@ func chatToAnthropicRequest(payload map[string]any) (map[string]any, []string, e
 			if value != nil {
 				return nil, nil, anthropicAdapterError("anthropic adapter: %s is not supported", key)
 			}
+		case "store":
+			if stored, ok := value.(bool); value != nil && (!ok || stored) {
+				return nil, nil, anthropicAdapterError("anthropic adapter: store is not supported")
+			}
+		case "service_tier":
+			if tier, ok := value.(string); value != nil && (!ok || (tier != "auto" && tier != "default")) {
+				return nil, nil, anthropicAdapterError("anthropic adapter: service_tier is not supported")
+			}
 		case "logit_bias":
 			if !isEmptyMapOrNil(value) {
 				return nil, nil, anthropicAdapterError("anthropic adapter: logit_bias is not supported")
 			}
 		default:
 			if !anthropicIgnoredChatFields[key] {
-				return nil, nil, anthropicAdapterError("anthropic adapter: %s is not supported", key)
+				return nil, nil, anthropicAdapterError("anthropic adapter: unsupported request field")
 			}
 		}
 	}
@@ -273,7 +283,7 @@ func chatMessagesToAnthropic(messages []any) ([]any, []any, error) {
 			}
 			appendBlocks("user", []any{result})
 		default:
-			return nil, nil, anthropicAdapterError("anthropic adapter: messages[%d] role %q is not supported", i, role)
+			return nil, nil, anthropicAdapterError("anthropic adapter: messages[%d] role is not supported", i)
 		}
 	}
 	return system, out, nil
@@ -298,7 +308,7 @@ func chatContentToAnthropicBlocks(content any, allowImages bool) ([]any, error) 
 			if !ok {
 				return nil, anthropicAdapterError("anthropic adapter: content part is not an object")
 			}
-			switch partType := stringField(part, "type"); partType {
+			switch stringField(part, "type") {
 			case "text":
 				if text := stringField(part, "text"); text != "" {
 					blocks = append(blocks, map[string]any{"type": "text", "text": text})
@@ -313,7 +323,7 @@ func chatContentToAnthropicBlocks(content any, allowImages bool) ([]any, error) 
 				}
 				blocks = append(blocks, block)
 			default:
-				return nil, anthropicAdapterError("anthropic adapter: content part type %q is not supported", partType)
+				return nil, anthropicAdapterError("anthropic adapter: content part type is not supported")
 			}
 		}
 		return blocks, nil
@@ -372,6 +382,15 @@ func chatToolsToAnthropic(payload, out map[string]any) error {
 		if description := stringField(fn, "description"); description != "" {
 			converted["description"] = description
 		}
+		switch strict := fn["strict"].(type) {
+		case nil:
+		case bool:
+			if strict {
+				converted["strict"] = true
+			}
+		default:
+			return anthropicAdapterError("anthropic adapter: tools[%d] strict must be a boolean", i)
+		}
 		tools = append(tools, converted)
 	}
 	if len(tools) > 0 {
@@ -390,7 +409,7 @@ func chatToolsToAnthropic(payload, out map[string]any) error {
 		case "required":
 			choice = map[string]any{"type": "any"}
 		default:
-			return anthropicAdapterError("anthropic adapter: tool_choice %q is not supported", typed)
+			return anthropicAdapterError("anthropic adapter: tool_choice is not supported")
 		}
 	case map[string]any:
 		fn, _ := typed["function"].(map[string]any)
@@ -456,7 +475,7 @@ func anthropicToChatCompletion(body []byte) ([]byte, bool, error) {
 			// Not requested by the adapter and not representable in the chat
 			// shape; never surfaced as answer text.
 		default:
-			return nil, true, fmt.Errorf("anthropic adapter: unsupported response block %q", stringField(block, "type"))
+			return nil, true, fmt.Errorf("anthropic adapter: unsupported response block")
 		}
 	}
 

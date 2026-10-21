@@ -176,6 +176,10 @@ func TestHandlerRejectsUnsupportedSemanticsBeforeAnthropicDispatch(t *testing.T)
 		"bad args":    `"messages":[{"role":"user","content":"hi"},{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{not json"}}]}]`,
 		"n":           `"n":2`,
 		"unknown":     `"some_future_field":true`,
+		"role":        `"messages":[{"role":"secret-role-text","content":"hi"}]`,
+		"store":       `"store":true`,
+		"tier":        `"service_tier":"flex"`,
+		"bad strict":  `"tools":[{"type":"function","function":{"name":"f","strict":"yes"}}]`,
 	}
 	for name, extra := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -193,6 +197,11 @@ func TestHandlerRejectsUnsupportedSemanticsBeforeAnthropicDispatch(t *testing.T)
 			}
 			if len(backend.bodies) != 0 {
 				t.Fatalf("unsupported request must not reach upstream")
+			}
+			for _, leaked := range []string{"some_future_field", "input_audio", "flex", "secret-role-text"} {
+				if strings.Contains(w.Body.String(), leaked) {
+					t.Fatalf("client error must not echo request content %q: %s", leaked, w.Body.String())
+				}
 			}
 		})
 	}
@@ -296,7 +305,8 @@ func TestChatToAnthropicRequestTranslatesToolRounds(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{
 		"model":"claude-sonnet-4-6","max_completion_tokens":512,"temperature":0.5,"top_p":0.9,"stop":"END","user":"u1",
 		"parallel_tool_calls":false,"tool_choice":"required",
-		"tools":[{"type":"function","function":{"name":"lookup","description":"d","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}],
+		"store":false,"service_tier":"auto",
+		"tools":[{"type":"function","function":{"name":"lookup","description":"d","strict":true,"parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}],
 		"messages":[
 			{"role":"developer","content":[{"type":"text","text":"rules"}]},
 			{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBOR"}}]},
@@ -329,7 +339,7 @@ func TestChatToAnthropicRequestTranslatesToolRounds(t *testing.T) {
 		t.Errorf("tool_choice: %#v", choice)
 	}
 	tool := out["tools"].([]any)[0].(map[string]any)
-	if tool["name"] != "lookup" || tool["input_schema"] == nil {
+	if tool["name"] != "lookup" || tool["input_schema"] == nil || tool["strict"] != true {
 		t.Errorf("tool: %#v", tool)
 	}
 	messages := out["messages"].([]any)
