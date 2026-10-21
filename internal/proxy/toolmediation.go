@@ -1046,7 +1046,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			// model responses-only that the built-in list does not know yet.
 			if !upstream.Adapter && responsesAdapterEligible(r.URL.Path) && responsesOnlyUpstreamSignal(resp) {
 				matchingReasoning, droppedReasoning := responsesReasoningForCandidate(reasoningReplay, candidate)
-				if adapted, adaptErr := adaptChatBodyToResponsesWithReasoning(outBody, matchingReasoning); adaptErr == nil {
+				if adapted, adaptErr := adaptChatBodyToResponsesForCandidate(outBody, matchingReasoning, candidate); adaptErr == nil {
 					resp.Body.Close()
 					cancel()
 					h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter_retry")

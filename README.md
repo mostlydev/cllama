@@ -256,9 +256,10 @@ observing the unchanged chat/completions shape. Requests routed this way emit an
 
 Selection is per declared provider/model:
 
-- **Built in:** `openai/gpt-5.6*` and `openai/gpt-5-pro*`. The list is
-  deliberately narrow — rerouting a model that already works on
-  chat/completions would be a regression.
+- **Built in:** `openai/gpt-5.6*`, `openai/gpt-5-pro*`, and the exact OpenAI
+  families `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` plus their
+  dated snapshots. GPT6 tool calling uses Responses; unknown sibling names
+  and other providers are unaffected.
 - **Extend** with `CLLAMA_RESPONSES_API_MODELS`.
 - **Recover automatically:** when upstream rejects a request with a message
   naming `/v1/responses`, that request is retried once through the adapter and
@@ -278,6 +279,16 @@ Two behaviours are worth knowing:
 - Chat-only controls that Responses cannot preserve (for example, non-default
   frequency or presence penalties, logit bias, stop sequences, seeds, and
   token log probabilities) receive a 400 instead of being silently discarded.
+
+For those GPT6 families, unsupported `temperature` and `top_p` fields are
+removed with a `responses_adapter_dropped_sampling` intervention. This covers
+sampling defaults inserted by older runners such as PicoClaw v0.2.7. Sampling
+is preserved for GPT6 Sol/Luna with explicit `reasoning_effort: "none"`.
+Explicit `none` on Astra/6.1 Sol or `minimal` on these families receives a
+fixed local 400; cllama never silently changes reasoning effort. The existing
+adapter maps `max_tokens`/`max_completion_tokens` to `max_output_tokens`.
+See the [official OpenAI model guide](https://developers.openai.com/api/docs/guides/latest-model)
+for the API restrictions. Both direct and managed-tool rounds use these rules.
 
 ### Anthropic Messages adapter
 

@@ -1003,7 +1003,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			// rather than handing the agent a rejection that reads like a
 			// credentials or provider-pool problem.
 			if !upstream.Adapter && responsesAdapterEligible(r.URL.Path) && responsesOnlyUpstreamSignal(resp) {
-				if adapted, adaptErr := adaptChatBodyToResponses(outBody); adaptErr == nil {
+				if adapted, adaptErr := adaptChatBodyToResponsesForCandidate(outBody, nil, candidate); adaptErr == nil {
 					resp.Body.Close()
 					cancel()
 					h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter_retry")

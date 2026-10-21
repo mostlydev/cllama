@@ -51,7 +51,10 @@ const (
 // a model that already works on chat/completions would be a regression, so
 // entries are added only with evidence.
 var responsesAPIModelPrefixes = map[string][]string{
-	"openai": {"gpt-5.6", "gpt-5-pro"},
+	// GPT6 tool calling requires Responses. Live PicoClaw reproduction for
+	// gpt-6.1-sol rejected max_tokens on chat, then temperature on Responses
+	// (issue58). Exact families/snapshots are scoped by openAIReasoningFamily.
+	"openai": {"gpt-5.6", "gpt-5-pro", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"},
 }
 
 // responsesAPIRequired reports whether a declared provider/model pair must be
@@ -67,7 +70,11 @@ func responsesAPIRequired(providerName, upstreamModel string) bool {
 	}
 
 	for _, prefix := range responsesAPIModelPrefixes[provider] {
-		if strings.HasPrefix(model, prefix) {
+		if strings.HasPrefix(prefix, "gpt-6") {
+			if openAIReasoningFamily(model) == prefix {
+				return true
+			}
+		} else if strings.HasPrefix(model, prefix) {
 			return true
 		}
 	}
@@ -608,6 +615,12 @@ func encodeUpstreamRequestWithReasoning(candidate dispatchCandidate, requestPath
 	if err != nil {
 		return upstreamEncoding{}, droppedReplay, err
 	}
+	capabilityMutations, err := normalizeOpenAIResponses(candidate, translated)
+	if err != nil {
+		return upstreamEncoding{}, droppedReplay, err
+	}
+	mutations = append(mutations, capabilityMutations...)
+
 	body, err := json.Marshal(translated)
 	if err != nil {
 		return upstreamEncoding{}, droppedReplay, err
@@ -647,6 +660,10 @@ func adaptChatBodyToResponses(chatBody []byte) (upstreamEncoding, error) {
 }
 
 func adaptChatBodyToResponsesWithReasoning(chatBody []byte, replay []responsesReasoningReplay) (upstreamEncoding, error) {
+	return adaptChatBodyToResponsesForCandidate(chatBody, replay, dispatchCandidate{})
+}
+
+func adaptChatBodyToResponsesForCandidate(chatBody []byte, replay []responsesReasoningReplay, candidate dispatchCandidate) (upstreamEncoding, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(chatBody, &payload); err != nil {
 		return upstreamEncoding{}, err
@@ -655,6 +672,12 @@ func adaptChatBodyToResponsesWithReasoning(chatBody []byte, replay []responsesRe
 	if err != nil {
 		return upstreamEncoding{}, err
 	}
+	capabilityMutations, err := normalizeOpenAIResponses(candidate, translated)
+	if err != nil {
+		return upstreamEncoding{}, err
+	}
+	mutations = append(mutations, capabilityMutations...)
+
 	body, err := json.Marshal(translated)
 	if err != nil {
 		return upstreamEncoding{}, err

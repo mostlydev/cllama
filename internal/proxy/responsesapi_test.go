@@ -119,6 +119,15 @@ func TestHandlerDispatchesResponsesOnlyModelThroughAdapter(t *testing.T) {
 // so the mediation loop — not just a single dispatch — has to run through the
 // adapter, including replaying the executed round back to the model.
 func TestHandlerRunsManagedToolMediationThroughAdapter(t *testing.T) {
+	testHandlerRunsManagedToolMediationThroughAdapter(t, "gpt-5.6-terra")
+}
+
+func TestCurrentOpenAIManagedWorkerRounds(t *testing.T) {
+	testHandlerRunsManagedToolMediationThroughAdapter(t, "gpt-6.1-sol")
+}
+
+func testHandlerRunsManagedToolMediationThroughAdapter(t *testing.T, model string) {
+	t.Helper()
 	toolSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"balance":5000}`))
@@ -134,18 +143,30 @@ func TestHandlerRunsManagedToolMediationThroughAdapter(t *testing.T) {
 		}
 		paths = append(paths, r.URL.Path)
 		bodies = append(bodies, body)
+		if model == "gpt-6.1-sol" {
+			var wire map[string]any
+			if err := json.Unmarshal(body, &wire); err != nil {
+				t.Error(err)
+			}
+			if _, present := wire["temperature"]; present {
+				t.Error("sampling default leaked into managed round")
+			}
+			if wire["max_output_tokens"] != float64(32768) {
+				t.Error("token limit translation missing in managed round")
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		switch len(bodies) {
 		case 1:
 			_, _ = w.Write([]byte(`{
-				"id":"resp_1","status":"completed","model":"gpt-5.6-terra",
+				"id":"resp_1","status":"completed","model":"` + model + `",
 				"output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"` +
 				managedToolHashlessAliasForCanonical("trading-api.get_market_context") + `","arguments":"{}"}],
 				"usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}
 			}`))
 		case 2:
 			_, _ = w.Write([]byte(`{
-				"id":"resp_2","status":"completed","model":"gpt-5.6-terra",
+				"id":"resp_2","status":"completed","model":"` + model + `",
 				"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"market context loaded"}]}],
 				"usage":{"input_tokens":7,"output_tokens":5,"total_tokens":12}
 			}`))
@@ -164,7 +185,7 @@ func TestHandlerRunsManagedToolMediationThroughAdapter(t *testing.T) {
 		managedToolManifestForURL(toolSrv.URL, http.MethodGet, "/api/v1/market_context/{claw_id}", "")),
 		logging.New(io.Discard))
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-		bytes.NewBufferString(`{"model":"openai/gpt-5.6-terra","messages":[{"role":"user","content":"hi"}]}`))
+		bytes.NewBufferString(`{"model":"openai/`+model+`","temperature":0.7,"max_tokens":32768,"messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Authorization", "Bearer tiverton:dummy123")
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
