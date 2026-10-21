@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -54,6 +55,8 @@ func TestUpstreamErrorDiagnostics(t *testing.T) {
 		{"invalid", `secret upstream HTML`, "", "", ""},
 		{"oversized", `{"error":{"code":"unsupported_parameter","message":"` + strings.Repeat("x", upstreamErrorPeekLimit) + `"}}`, "", "", ""},
 		{"null", `{"error":{"code":null,"type":123,"param":null}}`, "", "", ""},
+		{"nested", `{"error":{"code":"invalid_tool_schema","param":"tools[123].function.secret_token"}}`, "invalid_tool_schema", "", "tools"},
+		{"nested_unknown", `{"error":{"param":"sk_secret[123].secret_token"}}`, "", "", "other"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var logs bytes.Buffer
@@ -91,6 +94,25 @@ func TestUpstreamErrorDiagnostics(t *testing.T) {
 				t.Fatalf("bad event: %v", event)
 			}
 		})
+	}
+}
+
+func TestUpstreamErrorDiagnosticsPreservesReadFailure(t *testing.T) {
+	var logs bytes.Buffer
+	want := errors.New("upstream read failed")
+	body := &observedErrorBody{Reader: io.MultiReader(strings.NewReader("partial"), responseReadError{want})}
+	resp := &http.Response{StatusCode: 400, Body: body}
+	(&Handler{logger: logging.New(&logs)}).logUpstreamError("worker", "model", "provider", resp)
+	got, err := io.ReadAll(resp.Body)
+	if string(got) != "partial" || !errors.Is(err, want) {
+		t.Fatalf("read failure changed: %q %v", got, err)
+	}
+	if strings.Contains(logs.String(), want.Error()) {
+		t.Fatal("raw read error logged")
+	}
+	resp.Body.Close()
+	if !body.closed {
+		t.Fatal("original Close lost")
 	}
 }
 

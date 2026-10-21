@@ -35,6 +35,17 @@ func errorVocabulary(value any, vocabulary string) string {
 	return "other"
 }
 
+// Keep only a recognized root field for indexed/nested parameter paths. No
+// caller-controlled suffix or array index is ever copied into the audit log.
+func errorParameter(value any) string {
+	if s, ok := value.(string); ok {
+		if i := strings.IndexAny(s, ".["); i >= 0 {
+			value = s[:i]
+		}
+	}
+	return errorVocabulary(value, "model messages input tools tool_choice temperature top_p top_logprobs logprobs max_tokens max_completion_tokens max_output_tokens reasoning_effort reasoning stream stream_options response_format text parallel_tool_calls n stop seed presence_penalty frequency_penalty")
+}
+
 func (h *Handler) logUpstreamError(agentID, model, provider string, resp *http.Response) {
 	if resp.StatusCode < 400 || h.logger == nil {
 		return
@@ -55,9 +66,9 @@ func (h *Handler) logUpstreamError(agentID, model, provider string, resp *http.R
 				Error map[string]any `json:"error"`
 			}
 			if json.Unmarshal(prefix, &envelope) == nil {
-				code = errorVocabulary(envelope.Error["code"], "unsupported_parameter unsupported_value invalid_value invalid_request_error model_not_found context_length_exceeded insufficient_quota rate_limit_exceeded invalid_api_key content_policy_violation")
+				code = errorVocabulary(envelope.Error["code"], "unsupported_parameter unsupported_value invalid_value invalid_type missing_required_parameter string_above_max_length array_above_max_length integer_above_max_value invalid_tool_schema invalid_request_error model_not_found context_length_exceeded insufficient_quota rate_limit_exceeded invalid_api_key content_policy_violation")
 				kind = errorVocabulary(envelope.Error["type"], "invalid_request_error authentication_error permission_error not_found_error rate_limit_error api_error overloaded_error server_error tokens")
-				param = errorVocabulary(envelope.Error["param"], "model messages input tools tool_choice temperature top_p top_logprobs logprobs max_tokens max_completion_tokens max_output_tokens reasoning_effort reasoning.effort stream stream_options response_format text.format parallel_tool_calls n stop seed presence_penalty frequency_penalty")
+				param = errorParameter(envelope.Error["param"])
 			}
 		}
 	}
