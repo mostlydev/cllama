@@ -375,6 +375,13 @@ func (h *Handler) HandleRevoke(w http.ResponseWriter, r *http.Request) {
 	admitted, refused := state.admitted, state.refused
 	h.revocations.mu.Unlock()
 	h.logger.LogRevocation(id, record.Generation, admitted, refused)
+	if h.journal != nil {
+		// Every handler for id has exited, so the admission count is final.
+		// A seal failure leaves coverage unproven but never blocks revocation.
+		if err := h.journal.Seal(id, record.Generation); err != nil {
+			h.logger.LogError(id, "", 0, 0, err)
+		}
+	}
 	h.clearRevokedSnapshot(id)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(record)

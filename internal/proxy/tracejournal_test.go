@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -419,5 +420,233 @@ func TestTraceJournalRevocationWaitsForRegisteredHandler(t *testing.T) {
 	}
 	if hits.Load() != 0 {
 		t.Fatal("provider called by a revoked identity")
+	}
+}
+
+func readJSONFile(t *testing.T, path string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v map[string]any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	return v
+}
+
+// coverageVerified applies the operator rule for whole-run coverage.
+func coverageVerified(t *testing.T, historyDir, agentID string, generation int, launchEpoch string) (bool, string) {
+	t.Helper()
+	seal := readJSONFile(t, filepath.Join(historyDir, agentID, "journal", fmt.Sprintf("seal-%d.json", generation)))
+	if seal["schema"] != tracejournal.SealSchema || seal["agent_id"] != agentID || int(seal["generation"].(float64)) != generation {
+		return false, fmt.Sprintf("bad seal %v", seal)
+	}
+	if seal["capture_epoch"] != launchEpoch {
+		return false, "epoch changed"
+	}
+	covered := map[int]string{}
+	for _, u := range seal["unopened"].([]any) {
+		covered[int(u.(map[string]any)["agent_seq"].(float64))] = "unopened"
+	}
+	for _, path := range journalSegments(t, historyDir, agentID, tracejournal.SuffixClosed) {
+		raw, _ := os.ReadFile(path)
+		first, last := strings.SplitN(string(raw), "\n", 2)[0], ""
+		lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+		last = lines[len(lines)-1]
+		var open, closeRec map[string]any
+		_ = json.Unmarshal([]byte(first), &open)
+		_ = json.Unmarshal([]byte(last), &closeRec)
+		if open["capture_epoch"] != launchEpoch || closeRec["complete"] != true {
+			continue
+		}
+		k := int(open["agent_seq"].(float64))
+		if covered[k] != "" {
+			return false, fmt.Sprintf("seq %d covered twice", k)
+		}
+		covered[k] = "closed"
+	}
+	n := int(seal["requests"].(float64))
+	for k := 1; k <= n; k++ {
+		if covered[k] == "" {
+			return false, fmt.Sprintf("missing seq %d", k)
+		}
+	}
+	if len(covered) != n {
+		return false, fmt.Sprintf("covered %d of %d", len(covered), n)
+	}
+	return true, ""
+}
+
+func TestTraceJournalSealProvesWholeRunCoverage(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"r","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer backend.Close()
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "k-provider-key", Auth: "bearer"})
+	journal, historyDir := newTestJournal(t, nil)
+	epochFile := readJSONFile(t, filepath.Join(historyDir, tracejournal.EpochFileName))
+	launchEpoch, _ := epochFile["capture_epoch"].(string)
+	if epochFile["schema"] != tracejournal.EpochSchema || launchEpoch != journal.Epoch() || epochFile["cllama_version"] != "v-test" {
+		t.Fatalf("epoch file = %v", epochFile)
+	}
+	h := NewHandler(reg, stubContextLoaderWithTools("worker-1", "worker-1:secret-value", nil), nil, WithRevocationDir(t.TempDir()), WithAdminToken("operator"), WithTraceJournal(journal))
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai/model","messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Authorization", "Bearer worker-1:secret-value")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Fatalf("request %d: %d", i, w.Code)
+		}
+	}
+	// A request admitted but cancelled before its segment opened is named.
+	body := &revocationHeldBody{Reader: strings.NewReader(`{"model":"openai/model","messages":[]}`), entered: make(chan struct{}), release: make(chan struct{})}
+	held := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	held.Body = io.NopCloser(body)
+	held.Header.Set("Authorization", "Bearer worker-1:secret-value")
+	done := make(chan struct{})
+	go func() { h.ServeHTTP(httptest.NewRecorder(), held); close(done) }()
+	<-body.entered
+	acked := make(chan int, 1)
+	go func() { acked <- revokeForTest(h, "worker-1", 7, "operator").Code }()
+	time.Sleep(50 * time.Millisecond)
+	close(body.release)
+	if code := <-acked; code != 200 {
+		t.Fatalf("revoke: %d", code)
+	}
+	<-done
+	seal := readJSONFile(t, filepath.Join(historyDir, "worker-1", "journal", "seal-7.json"))
+	if int(seal["requests"].(float64)) != 3 {
+		t.Fatalf("seal = %v", seal)
+	}
+	unopened := seal["unopened"].([]any)
+	if len(unopened) != 1 || unopened[0].(map[string]any)["reason"] != tracejournal.ReasonCancelledBeforeOpen || unopened[0].(map[string]any)["agent_seq"].(float64) != 3 {
+		t.Fatalf("unopened = %v", unopened)
+	}
+	if ok, why := coverageVerified(t, historyDir, "worker-1", 7, launchEpoch); !ok {
+		t.Fatalf("coverage not verified: %s", why)
+	}
+	// Deleting one closed segment is detected as a missing request.
+	closed := journalSegments(t, historyDir, "worker-1", tracejournal.SuffixClosed)
+	if err := os.Remove(closed[0]); err != nil {
+		t.Fatal(err)
+	}
+	if ok, why := coverageVerified(t, historyDir, "worker-1", 7, launchEpoch); ok || !strings.Contains(why, "missing seq") {
+		t.Fatalf("missing segment not detected: %v %s", ok, why)
+	}
+	// A different launch epoch (a restart) never verifies.
+	if ok, why := coverageVerified(t, historyDir, "worker-1", 7, "other-epoch"); ok || why != "epoch changed" {
+		t.Fatalf("epoch change not detected: %v %s", ok, why)
+	}
+}
+
+func TestTraceJournalSealsEmptyRunAndOpenFailures(t *testing.T) {
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: "http://127.0.0.1:1/v1", APIKey: "k-provider-key", Auth: "bearer"})
+	journal, historyDir := newTestJournal(t, nil)
+	h := NewHandler(reg, stubContextLoaderWithTools("worker-1", "worker-1:secret-value", nil), nil, WithRevocationDir(t.TempDir()), WithAdminToken("operator"), WithTraceJournal(journal))
+	if code := revokeForTest(h, "idle-agent", 1, "operator").Code; code != 200 {
+		t.Fatalf("revoke idle: %d", code)
+	}
+	if ok, why := coverageVerified(t, historyDir, "idle-agent", 1, journal.Epoch()); !ok {
+		t.Fatalf("empty run not verified: %s", why)
+	}
+	if seal := readJSONFile(t, filepath.Join(historyDir, "idle-agent", "journal", "seal-1.json")); seal["requests"].(float64) != 0 {
+		t.Fatalf("empty seal = %v", seal)
+	}
+	// Make the next segment unopenable: the request is named, not lost.
+	dir := filepath.Join(historyDir, "worker-1", "journal")
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai/model","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer worker-1:secret-value")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d", w.Code)
+	}
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	if code := revokeForTest(h, "worker-1", 2, "operator").Code; code != 200 {
+		t.Fatalf("revoke: %d", code)
+	}
+	seal := readJSONFile(t, filepath.Join(historyDir, "worker-1", "journal", "seal-2.json"))
+	unopened := seal["unopened"].([]any)
+	if seal["requests"].(float64) != 1 || len(unopened) != 1 || unopened[0].(map[string]any)["reason"] != tracejournal.ReasonJournalOpenFailed {
+		t.Fatalf("seal = %v", seal)
+	}
+}
+
+func TestTraceJournalSealCountsConcurrentAdmissionsAtRevocation(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		time.Sleep(5 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"r","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer backend.Close()
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "k-provider-key", Auth: "bearer"})
+	journal, historyDir := newTestJournal(t, nil)
+	h := NewHandler(reg, stubContextLoaderWithTools("worker-1", "worker-1:secret-value", nil), nil, WithRevocationDir(t.TempDir()), WithAdminToken("operator"), WithTraceJournal(journal))
+	var wg sync.WaitGroup
+	for i := 0; i < 24; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai/model","messages":[{"role":"user","content":"hi"}]}`))
+			req.Header.Set("Authorization", "Bearer worker-1:secret-value")
+			h.ServeHTTP(httptest.NewRecorder(), req)
+		}()
+		if i == 12 {
+			if code := revokeForTest(h, "worker-1", 1, "operator").Code; code != 200 {
+				t.Errorf("revoke: %d", code)
+			}
+		}
+	}
+	wg.Wait()
+	// Requests refused after the revocation were never admitted; every
+	// admitted one is accounted for, closed or named.
+	if ok, why := coverageVerified(t, historyDir, "worker-1", 1, journal.Epoch()); !ok {
+		t.Fatalf("coverage after concurrent revoke: %s", why)
+	}
+	seal := readJSONFile(t, filepath.Join(historyDir, "worker-1", "journal", "seal-1.json"))
+	closed := len(journalSegments(t, historyDir, "worker-1", tracejournal.SuffixClosed))
+	if n := int(seal["requests"].(float64)); n == 0 || n != closed+len(seal["unopened"].([]any)) {
+		t.Fatalf("seal %v does not account for %d closed segments", seal, closed)
+	}
+}
+
+func TestTraceJournalSealFailureNeverBlocksRevocation(t *testing.T) {
+	var failSeal atomic.Bool
+	journal, historyDir := newTestJournal(t, func(cfg *tracejournal.Config) {
+		cfg.SyncFile = func(f *os.File) error {
+			if failSeal.Load() {
+				return errors.New("disk failed")
+			}
+			return f.Sync()
+		}
+	})
+	h := NewHandler(nil, stubContextLoaderWithTools("worker-1", "worker-1:secret-value", nil), nil, WithRevocationDir(t.TempDir()), WithAdminToken("operator"), WithTraceJournal(journal))
+	failSeal.Store(true)
+	if code := revokeForTest(h, "worker-1", 1, "operator").Code; code != 200 {
+		t.Fatalf("revocation blocked by seal failure: %d", code)
+	}
+	if _, err := os.Stat(filepath.Join(historyDir, "worker-1", "journal", "seal-1.json")); !os.IsNotExist(err) {
+		t.Fatalf("seal published despite sync failure: %v", err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(historyDir, "worker-1", "journal", ".tmp-*"))
+	if len(matches) != 0 {
+		t.Fatalf("temporary seal left behind: %v", matches)
 	}
 }

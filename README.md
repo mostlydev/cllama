@@ -481,6 +481,29 @@ The journal fails closed:
 
 With the journal on, a revocation acknowledgement waits until every registered request handler for that identity has exited, and each handler closes its segment first. After the acknowledgement no new segment can appear for that identity. A run's set of segments is final once the acknowledgement is in hand and no open segment remains. A closed segment proves one request was captured; whole-run completeness is the operator's join of segments with its own run state.
 
+### Whole-run coverage
+
+A closed segment proves that one request was captured. Three more pieces let an operator prove that a whole run was captured:
+
+- **Capture epoch.** Each journal start writes a new random `capture_epoch` to `<session-history-dir>/.trace-journal-epoch.json` (`schema` `cllama.trace.epoch/v1`, `capture_epoch`, `started_at`, `cllama_version`, `cllama_revision`). It is published atomically before cllama serves any request.
+- **Admission sequence.** Every request the revocation fence admits for an agent is numbered as `agent_seq` (1-based per agent per epoch) before its body is read. `segment_open` carries `capture_epoch` and `agent_seq`.
+- **Seal.** After a revocation has drained every handler for the agent, cllama atomically publishes `<agent-id>/journal/seal-<generation>.json` (`schema` `cllama.trace.seal/v1`, `agent_id`, `generation`, `capture_epoch`, `sealed_at`, `requests` N, and `unopened`: a list of `{agent_seq, reason}`). The reasons are `cancelled_before_open`, `body_read_failed` and `journal_open_failed`.
+
+What each piece proves:
+
+- **The acknowledgement.** A 200 acknowledgement proves the revocation and drain. A seal that cannot be written never blocks revocation, but without a valid seal coverage is unverified.
+- **An unopened entry.** It proves the admitted request caused no provider or tool effect. It does not prove that the client's body or the error delivery was captured. Any partial file for that request is still evidence.
+
+Coverage is verified only if all of these hold:
+
+1. The run uses a fresh agent identity that was never used before.
+2. The operator read `capture_epoch` as E before launching the run, so before the identity could be admitted.
+3. After the run is terminal and its revocation acknowledged, `seal-<generation>.json` exists with that agent and generation and with `capture_epoch == E`.
+4. Each k in 1..N is accounted for exactly once: either by a closed segment of that agent with `capture_epoch == E`, `agent_seq == k`, a verifying digest and count, and `complete: true`, or by an `unopened` entry with an allowed reason.
+5. No segment for that agent carries a seq outside 1..N, and no open or incomplete segment is left unexplained.
+
+N = 0 with a matching E is a verified empty run. A changed epoch means cllama restarted and admission state may be lost, so coverage is unverified. Old seals and epoch files never stand in for the expected agent, generation and epoch. Request-set coverage is separate from content completeness: redaction, truncation and delivery limits still apply per segment.
+
 ---
 
 ## The cllama Standard

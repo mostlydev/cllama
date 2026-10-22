@@ -405,3 +405,30 @@ func TestRecoveredSegmentsAreOwnedAndReadableByCollector(t *testing.T) {
 		t.Fatalf("recovered segment owner %d mode %v", st.Uid, info.Mode())
 	}
 }
+
+func TestEachJournalStartReplacesTheCaptureEpoch(t *testing.T) {
+	cfg := testConfig(t)
+	first, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch1 := first.Epoch()
+	first.Close()
+	second := openJournal(t, cfg)
+	if second.Epoch() == epoch1 || second.Epoch() == "" {
+		t.Fatalf("restart reused epoch %q", epoch1)
+	}
+	raw, err := os.ReadFile(filepath.Join(cfg.HistoryDir, EpochFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file map[string]any
+	if err := json.Unmarshal(raw, &file); err != nil || file["capture_epoch"] != second.Epoch() || file["schema"] != EpochSchema {
+		t.Fatalf("epoch file %s not replaced: %v", raw, err)
+	}
+	// The new process starts every agent's sequence again, so a seal can
+	// only ever be checked against the epoch it names.
+	if seq := second.Admit("worker-1"); seq != 1 {
+		t.Fatalf("first admission in a new epoch = %d", seq)
+	}
+}

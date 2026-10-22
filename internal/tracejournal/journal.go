@@ -10,6 +10,7 @@ package tracejournal
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -116,9 +117,37 @@ type Journal struct {
 	cfg  Config
 	lock *os.File
 
-	mu       sync.Mutex
-	prepared map[string]bool // agent journal dirs already created and owned
+	epoch string // capture_epoch: one per journal process lifetime
+
+	mu         sync.Mutex
+	prepared   map[string]bool // agent journal dirs already created and owned
+	admissions map[string]*admissionState
 }
+
+// admissionState counts the requests the revocation fence admitted for one
+// agent in this epoch, and those that never opened a segment.
+type admissionState struct {
+	requests int
+	unopened []Unopened
+}
+
+// Unopened names an admitted request that never opened a segment. None of
+// them caused a provider or tool effect.
+type Unopened struct {
+	AgentSeq int    `json:"agent_seq"`
+	Reason   string `json:"reason"`
+}
+
+const (
+	EpochFileName  = ".trace-journal-epoch.json"
+	EpochSchema    = "cllama.trace.epoch/v1"
+	SealSchema     = "cllama.trace.seal/v1"
+	sealFilePrefix = "seal-"
+
+	ReasonCancelledBeforeOpen = "cancelled_before_open"
+	ReasonBodyReadFailed      = "body_read_failed"
+	ReasonJournalOpenFailed   = "journal_open_failed"
+)
 
 // Open takes the exclusive writer lock, proves the configured owner can be
 // applied, and renames every segment a previous process left open to its
@@ -135,7 +164,7 @@ func Open(cfg Config) (*Journal, error) {
 		lock.Close()
 		return nil, fmt.Errorf("trace journal: another writer holds %s: %w", lockFileName, err)
 	}
-	j := &Journal{cfg: cfg, lock: lock, prepared: make(map[string]bool)}
+	j := &Journal{cfg: cfg, lock: lock, prepared: make(map[string]bool), admissions: make(map[string]*admissionState)}
 	if err := j.chown(lock); err != nil {
 		j.Close()
 		return nil, fmt.Errorf("trace journal: apply %s: %w", EnvOwner, err)
@@ -148,7 +177,118 @@ func Open(cfg Config) (*Journal, error) {
 		j.Close()
 		return nil, err
 	}
+	if j.epoch, err = newRequestID(); err != nil {
+		j.Close()
+		return nil, fmt.Errorf("trace journal: capture epoch: %w", err)
+	}
+	if err := j.writeDurableJSON(cfg.HistoryDir, EpochFileName, map[string]any{
+		"schema":          EpochSchema,
+		"capture_epoch":   j.epoch,
+		"started_at":      time.Now().UTC().Format(time.RFC3339Nano),
+		"cllama_version":  cfg.Version,
+		"cllama_revision": cfg.Revision,
+	}); err != nil {
+		j.Close()
+		return nil, fmt.Errorf("trace journal: write capture epoch: %w", err)
+	}
 	return j, nil
+}
+
+// Epoch is this journal process's capture_epoch.
+func (j *Journal) Epoch() string {
+	return j.epoch
+}
+
+// Admit assigns the next agent_seq to a request the revocation fence has
+// just admitted, before its body is read. A request that then never opens a
+// segment must be reported through Unopen.
+func (j *Journal) Admit(agentID string) int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	st := j.admissions[agentID]
+	if st == nil {
+		st = &admissionState{}
+		j.admissions[agentID] = st
+	}
+	st.requests++
+	return st.requests
+}
+
+// Unopen records why an admitted request never opened a segment.
+func (j *Journal) Unopen(agentID string, agentSeq int, reason string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if st := j.admissions[agentID]; st != nil {
+		st.unopened = append(st.unopened, Unopened{AgentSeq: agentSeq, Reason: reason})
+	}
+}
+
+// Seal durably writes seal-<generation>.json for an agent whose revocation
+// has drained every handler, naming how many requests this epoch admitted
+// and which of them never opened a segment.
+func (j *Journal) Seal(agentID string, generation uint64) error {
+	if !validAgentID(agentID) {
+		return fmt.Errorf("trace journal: unusable agent id")
+	}
+	dir, err := j.prepareDir(agentID)
+	if err != nil {
+		return err
+	}
+	j.mu.Lock()
+	requests := 0
+	unopened := []Unopened{}
+	if st := j.admissions[agentID]; st != nil {
+		requests = st.requests
+		unopened = append(unopened, st.unopened...)
+	}
+	j.mu.Unlock()
+	return j.writeDurableJSON(dir, fmt.Sprintf("%s%d.json", sealFilePrefix, generation), map[string]any{
+		"schema":        SealSchema,
+		"agent_id":      agentID,
+		"generation":    generation,
+		"capture_epoch": j.epoch,
+		"sealed_at":     time.Now().UTC().Format(time.RFC3339Nano),
+		"requests":      requests,
+		"unopened":      unopened,
+	})
+}
+
+// writeDurableJSON publishes name in dir atomically: a temporary file is
+// written, owned, fsynced and renamed, then the directory is fsynced.
+func (j *Journal) writeDurableJSON(dir, name string, v any) error {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".tmp-"+name+"-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(append(raw, '\n')); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := j.chown(tmp); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := j.syncFile(tmp); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, filepath.Join(dir, name)); err != nil {
+		return err
+	}
+	return syncDir(dir)
 }
 
 // MaxFieldBytes is the largest body recorded verbatim.
@@ -207,8 +347,10 @@ type OpenInfo struct {
 	Method         string
 	Path           string
 	RequestedModel string
-	Stream         bool
-	Body           []byte
+	// AgentSeq is the admission sequence from Admit.
+	AgentSeq int
+	Stream   bool
+	Body     []byte
 	// Secrets are exact credential values redacted from every record.
 	Secrets []string
 }
@@ -251,6 +393,8 @@ func (j *Journal) Begin(agentID string, info OpenInfo) (*Segment, error) {
 		"pod":             j.cfg.Pod,
 		"agent_id":        agentID,
 		"request_id":      requestID,
+		"capture_epoch":   j.epoch,
+		"agent_seq":       info.AgentSeq,
 		"method":          info.Method,
 		"path":            info.Path,
 		"requested_model": info.RequestedModel,

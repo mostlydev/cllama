@@ -32,16 +32,21 @@ func (h *Handler) beginTrace(w http.ResponseWriter, r *http.Request, agentID, pr
 	if h.journal == nil {
 		return nil, nil, r, true
 	}
+	// The fence has admitted this request; it is counted before anything
+	// else, so the revocation seal can account for it whatever happens next.
+	agentSeq := h.journal.Admit(agentID)
 	// Reading the body can outlast a revocation. A cancelled request opens
 	// no segment and causes no effect.
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		h.journal.Unopen(agentID, agentSeq, tracejournal.ReasonBodyReadFailed)
 		h.fail(w, http.StatusBadRequest, "failed to read request body", agentID, "", start, err)
 		return nil, nil, r, false
 	}
 	_ = r.Body.Close()
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	if err := r.Context().Err(); err != nil {
+		h.journal.Unopen(agentID, agentSeq, tracejournal.ReasonCancelledBeforeOpen)
 		h.fail(w, http.StatusServiceUnavailable, "request cancelled", agentID, "", start, err)
 		return nil, nil, r, false
 	}
@@ -52,11 +57,13 @@ func (h *Handler) beginTrace(w http.ResponseWriter, r *http.Request, agentID, pr
 		Method:         r.Method,
 		Path:           r.URL.Path,
 		RequestedModel: strings.TrimSpace(requestedModel),
+		AgentSeq:       agentSeq,
 		Stream:         requestedStream(payload),
 		Body:           body,
 		Secrets:        h.traceSecrets(presentedSecret, agentCtx),
 	})
 	if err != nil {
+		h.journal.Unopen(agentID, agentSeq, tracejournal.ReasonJournalOpenFailed)
 		h.logger.LogError(agentID, "", http.StatusServiceUnavailable, time.Since(start).Milliseconds(), err)
 		writeJSONError(w, http.StatusServiceUnavailable, "trace journal unavailable")
 		return nil, nil, r, false
