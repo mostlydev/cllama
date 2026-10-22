@@ -502,6 +502,8 @@ Coverage is verified only if all of these hold:
 4. Each k in 1..N is accounted for exactly once: either by a closed segment of that agent with `capture_epoch == E`, `agent_seq == k`, a verifying digest and count, and `complete: true`, or by an `unopened` entry with an allowed reason.
 5. No segment for that agent carries a seq outside 1..N, and no open or incomplete segment is left unexplained.
 
+`tracejournal.VerifyCoverage` is the reference implementation of these checks. It reports request coverage and content completeness separately. A torn segment file with no readable `segment_open` is explained only by a `journal_open_failed` entry that has no other file.
+
 N = 0 with a matching E is a verified empty run. A changed epoch means cllama restarted and admission state may be lost, so coverage is unverified. Old seals and epoch files never stand in for the expected agent, generation and epoch. Request-set coverage is separate from content completeness: redaction, truncation and delivery limits still apply per segment.
 
 ---

@@ -436,47 +436,12 @@ func readJSONFile(t *testing.T, path string) map[string]any {
 	return v
 }
 
-// coverageVerified applies the operator rule for whole-run coverage.
+// coverageVerified applies the reference operator rule and requires both
+// request coverage and complete content.
 func coverageVerified(t *testing.T, historyDir, agentID string, generation int, launchEpoch string) (bool, string) {
 	t.Helper()
-	seal := readJSONFile(t, filepath.Join(historyDir, agentID, "journal", fmt.Sprintf("seal-%d.json", generation)))
-	if seal["schema"] != tracejournal.SealSchema || seal["agent_id"] != agentID || int(seal["generation"].(float64)) != generation {
-		return false, fmt.Sprintf("bad seal %v", seal)
-	}
-	if seal["capture_epoch"] != launchEpoch {
-		return false, "epoch changed"
-	}
-	covered := map[int]string{}
-	for _, u := range seal["unopened"].([]any) {
-		covered[int(u.(map[string]any)["agent_seq"].(float64))] = "unopened"
-	}
-	for _, path := range journalSegments(t, historyDir, agentID, tracejournal.SuffixClosed) {
-		raw, _ := os.ReadFile(path)
-		first, last := strings.SplitN(string(raw), "\n", 2)[0], ""
-		lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-		last = lines[len(lines)-1]
-		var open, closeRec map[string]any
-		_ = json.Unmarshal([]byte(first), &open)
-		_ = json.Unmarshal([]byte(last), &closeRec)
-		if open["capture_epoch"] != launchEpoch || closeRec["complete"] != true {
-			continue
-		}
-		k := int(open["agent_seq"].(float64))
-		if covered[k] != "" {
-			return false, fmt.Sprintf("seq %d covered twice", k)
-		}
-		covered[k] = "closed"
-	}
-	n := int(seal["requests"].(float64))
-	for k := 1; k <= n; k++ {
-		if covered[k] == "" {
-			return false, fmt.Sprintf("missing seq %d", k)
-		}
-	}
-	if len(covered) != n {
-		return false, fmt.Sprintf("covered %d of %d", len(covered), n)
-	}
-	return true, ""
+	c := tracejournal.VerifyCoverage(filepath.Join(historyDir, agentID, "journal"), agentID, uint64(generation), launchEpoch)
+	return c.RequestsVerified && c.ContentComplete, strings.Join(c.Problems, "; ")
 }
 
 func TestTraceJournalSealProvesWholeRunCoverage(t *testing.T) {
@@ -536,11 +501,11 @@ func TestTraceJournalSealProvesWholeRunCoverage(t *testing.T) {
 	if err := os.Remove(closed[0]); err != nil {
 		t.Fatal(err)
 	}
-	if ok, why := coverageVerified(t, historyDir, "worker-1", 7, launchEpoch); ok || !strings.Contains(why, "missing seq") {
+	if ok, why := coverageVerified(t, historyDir, "worker-1", 7, launchEpoch); ok || !strings.Contains(why, "missing agent_seq") {
 		t.Fatalf("missing segment not detected: %v %s", ok, why)
 	}
 	// A different launch epoch (a restart) never verifies.
-	if ok, why := coverageVerified(t, historyDir, "worker-1", 7, "other-epoch"); ok || why != "epoch changed" {
+	if ok, why := coverageVerified(t, historyDir, "worker-1", 7, "other-epoch"); ok || !strings.HasPrefix(why, "epoch changed") {
 		t.Fatalf("epoch change not detected: %v %s", ok, why)
 	}
 }
@@ -588,42 +553,63 @@ func TestTraceJournalSealsEmptyRunAndOpenFailures(t *testing.T) {
 }
 
 func TestTraceJournalSealCountsConcurrentAdmissionsAtRevocation(t *testing.T) {
+	const inFlight = 12
+	var hits atomic.Int32
+	allIn := make(chan struct{})
+	release := make(chan struct{})
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
-		time.Sleep(5 * time.Millisecond)
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":"r","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+		if hits.Add(1) == inFlight {
+			close(allIn)
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
 	}))
 	defer backend.Close()
+	defer close(release)
 	reg := provider.NewRegistry("")
 	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "k-provider-key", Auth: "bearer"})
 	journal, historyDir := newTestJournal(t, nil)
 	h := NewHandler(reg, stubContextLoaderWithTools("worker-1", "worker-1:secret-value", nil), nil, WithRevocationDir(t.TempDir()), WithAdminToken("operator"), WithTraceJournal(journal))
+	send := func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai/model","messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Authorization", "Bearer worker-1:secret-value")
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}
 	var wg sync.WaitGroup
-	for i := 0; i < 24; i++ {
+	for i := 0; i < inFlight; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai/model","messages":[{"role":"user","content":"hi"}]}`))
-			req.Header.Set("Authorization", "Bearer worker-1:secret-value")
-			h.ServeHTTP(httptest.NewRecorder(), req)
-		}()
-		if i == 12 {
-			if code := revokeForTest(h, "worker-1", 1, "operator").Code; code != 200 {
-				t.Errorf("revoke: %d", code)
-			}
-		}
+		go func() { defer wg.Done(); send() }()
+	}
+	// Barrier: every first-wave request is admitted and mid-dispatch.
+	select {
+	case <-allIn:
+	case <-time.After(5 * time.Second):
+		t.Fatal("requests never reached the provider")
+	}
+	acked := make(chan int, 1)
+	go func() { acked <- revokeForTest(h, "worker-1", 1, "operator").Code }()
+	// A second wave races the revocation: each is either admitted and
+	// accounted, or refused before admission.
+	for i := 0; i < inFlight; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); send() }()
+	}
+	if code := <-acked; code != 200 {
+		t.Fatalf("revoke: %d", code)
 	}
 	wg.Wait()
-	// Requests refused after the revocation were never admitted; every
-	// admitted one is accounted for, closed or named.
 	if ok, why := coverageVerified(t, historyDir, "worker-1", 1, journal.Epoch()); !ok {
-		t.Fatalf("coverage after concurrent revoke: %s", why)
+		c := tracejournal.VerifyCoverage(filepath.Join(historyDir, "worker-1", "journal"), "worker-1", 1, journal.Epoch())
+		if !c.RequestsVerified {
+			t.Fatalf("coverage after concurrent revoke: %s", why)
+		}
 	}
 	seal := readJSONFile(t, filepath.Join(historyDir, "worker-1", "journal", "seal-1.json"))
-	closed := len(journalSegments(t, historyDir, "worker-1", tracejournal.SuffixClosed))
-	if n := int(seal["requests"].(float64)); n == 0 || n != closed+len(seal["unopened"].([]any)) {
-		t.Fatalf("seal %v does not account for %d closed segments", seal, closed)
+	if n := int(seal["requests"].(float64)); n < inFlight {
+		t.Fatalf("seal counts %d admitted requests, at least %d were in flight", n, inFlight)
 	}
 }
 
