@@ -140,3 +140,32 @@ func TestReviewCaptureReadAndCloseAreRaceSafe(t *testing.T) {
 		<-done
 	}
 }
+
+func TestReviewEmbeddedDepthLimitDoesNotKeepUncheckedCredentials(t *testing.T) {
+	secret := "credential-\"-123"
+	var nested any = map[string]string{"content": secret}
+	for i := 0; i < maxEmbeddedDepth+1; i++ {
+		raw, _ := json.Marshal(nested)
+		nested = map[string]any{"nested": string(raw)}
+	}
+	raw, _ := json.Marshal(nested)
+	projected, lossless := projectBody(raw, usableSecrets([]string{secret}))
+	if !lossless {
+		return
+	} // An explicit bounded omission is safe.
+	v := projected
+	for i := 0; i < maxEmbeddedDepth+1; i++ {
+		s, ok := v.(map[string]any)["nested"].(string)
+		if !ok {
+			return
+		}
+		var next any
+		if err := json.Unmarshal([]byte(s), &next); err != nil {
+			return
+		}
+		v = next
+	}
+	if v.(map[string]any)["content"] == secret {
+		t.Fatal("depth cap retained unchecked known credential and marked capture lossless")
+	}
+}
