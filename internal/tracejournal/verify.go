@@ -1,7 +1,6 @@
 package tracejournal
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,14 +10,15 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
 // Coverage is the verdict on one run identity's journal. RequestsVerified
-// means every admitted request is accounted for exactly once.
-// ContentComplete additionally means every recorded request was captured
-// in full. The two are reported separately: an unopened request or an
-// incomplete segment is accounted for without being full capture.
+// means every admitted request is accounted for exactly once, by a closed
+// or readable incomplete segment or an unopened entry. ContentComplete
+// additionally means every admitted request has a closed segment with
+// complete:true. RequestsVerified alone never means full trace content.
 type Coverage struct {
 	RequestsVerified bool
 	ContentComplete  bool
@@ -54,12 +54,15 @@ func VerifyCoverage(journalDir, agentID string, generation uint64, epoch string)
 	}
 
 	var seal struct {
-		Schema       string     `json:"schema"`
-		AgentID      string     `json:"agent_id"`
-		Generation   uint64     `json:"generation"`
-		CaptureEpoch string     `json:"capture_epoch"`
-		Requests     *int       `json:"requests"`
-		Unopened     []Unopened `json:"unopened"`
+		Schema       string       `json:"schema"`
+		AgentID      string       `json:"agent_id"`
+		Generation   uint64       `json:"generation"`
+		CaptureEpoch string       `json:"capture_epoch"`
+		Requests     *json.Number `json:"requests"`
+		Unopened     []struct {
+			AgentSeq json.Number `json:"agent_seq"`
+			Reason   string      `json:"reason"`
+		} `json:"unopened"`
 	}
 	sealName := fmt.Sprintf("%s%d.json", sealFilePrefix, generation)
 	raw, err := readRegular(filepath.Join(journalDir, sealName))
@@ -67,7 +70,7 @@ func VerifyCoverage(journalDir, agentID string, generation uint64, epoch string)
 		fail("seal %s: %v", sealName, err)
 		return c
 	}
-	if err := json.Unmarshal(raw, &seal); err != nil || seal.Requests == nil {
+	if err := decodeStrict(raw, &seal); err != nil || seal.Requests == nil {
 		fail("seal %s is malformed", sealName)
 		return c
 	}
@@ -79,14 +82,16 @@ func VerifyCoverage(journalDir, agentID string, generation uint64, epoch string)
 		fail("epoch changed: seal %s, launch %s", seal.CaptureEpoch, epoch)
 		return c
 	}
-	n := *seal.Requests
-	c.Requests = n
-	if n < 0 {
-		fail("seal requests %d is negative", n)
+	n, ok := exactInt(*seal.Requests)
+	if !ok || n < 0 {
+		fail("seal requests %q is not a non-negative integer", seal.Requests.String())
 		return c
 	}
+	c.Requests = n
 
-	accounted := make(map[int]string, n)
+	// Sized by observed entries, never by the seal's count, so a corrupt
+	// count cannot drive allocation.
+	accounted := map[int]string{}
 	account := func(k int, how string) {
 		if k < 1 || k > n {
 			fail("agent_seq %d (%s) is outside 1..%d", k, how, n)
@@ -102,13 +107,21 @@ func VerifyCoverage(journalDir, agentID string, generation uint64, epoch string)
 	openFailedFiled := map[int]bool{}
 	unreadableIncomplete := 0
 	for _, u := range seal.Unopened {
-		if !allowedUnopened[u.Reason] {
-			fail("agent_seq %d has unknown unopened reason %q", u.AgentSeq, u.Reason)
+		k, ok := exactInt(u.AgentSeq)
+		if !ok {
+			fail("unopened agent_seq %q is not an integer", u.AgentSeq.String())
 			continue
 		}
-		account(u.AgentSeq, "unopened")
+		if !allowedUnopened[u.Reason] {
+			fail("agent_seq %d has unknown unopened reason %q", k, u.Reason)
+			continue
+		}
+		// An unopened request caused no effect, but its body and any error
+		// delivered to the client were not captured.
+		c.ContentComplete = false
+		account(k, "unopened")
 		if u.Reason == ReasonJournalOpenFailed {
-			openFailed[u.AgentSeq] = true
+			openFailed[k] = true
 		}
 	}
 
@@ -170,12 +183,42 @@ func VerifyCoverage(journalDir, agentID string, generation uint64, epoch string)
 	if unreadableIncomplete > len(openFailed)-len(openFailedFiled) {
 		fail("%d incomplete segments without a readable segment_open are not explained by journal_open_failed entries", unreadableIncomplete)
 	}
-	for k := 1; k <= n; k++ {
-		if _, ok := accounted[k]; !ok {
-			fail("missing agent_seq %d", k)
+	// accounted holds only distinct seqs in 1..N, so all are present
+	// exactly when its size is N. Search for the first gap only up to the
+	// observed count.
+	if len(accounted) != n {
+		for k := 1; k <= len(accounted)+1; k++ {
+			if _, ok := accounted[k]; !ok {
+				fail("missing agent_seq %d (%d of %d accounted)", k, len(accounted), n)
+				break
+			}
 		}
 	}
 	return c
+}
+
+// decodeStrict decodes JSON keeping numbers as json.Number.
+func decodeStrict(raw []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	return dec.Decode(v)
+}
+
+// exactInt accepts only an integral JSON number written as an integer.
+func exactInt(n json.Number) (int, bool) {
+	v, err := strconv.ParseInt(n.String(), 10, 64)
+	if err != nil || v != int64(int(v)) {
+		return 0, false
+	}
+	return int(v), true
+}
+
+func numberField(rec map[string]any, key string) (int, bool) {
+	n, ok := rec[key].(json.Number)
+	if !ok {
+		return 0, false
+	}
+	return exactInt(n)
 }
 
 var errNoSegmentOpen = fmt.Errorf("no readable segment_open")
@@ -187,41 +230,39 @@ func verifyClosed(path, agentID, epoch string) (int, bool, error) {
 	if err != nil {
 		return 0, false, err
 	}
-	var lines [][]byte
-	sc := bufio.NewScanner(bytes.NewReader(raw))
-	sc.Buffer(make([]byte, 1<<20), 1<<30)
-	for sc.Scan() {
-		lines = append(lines, append(append([]byte(nil), sc.Bytes()...), '\n'))
+	// Records are split on the exact LF bytes the journal wrote; a CR or
+	// any other change to the persisted bytes breaks the digest.
+	if len(raw) == 0 || raw[len(raw)-1] != '\n' {
+		return 0, false, fmt.Errorf("unterminated segment")
 	}
-	if err := sc.Err(); err != nil || len(lines) < 2 || !bytes.HasSuffix(raw, []byte("\n")) {
-		return 0, false, fmt.Errorf("unreadable segment")
+	lines := bytes.SplitAfter(raw, []byte("\n"))
+	lines = lines[:len(lines)-1] // SplitAfter leaves an empty tail
+	if len(lines) < 2 {
+		return 0, false, fmt.Errorf("segment has no close record")
 	}
-	digest := sha256.New()
 	var open, closeRec map[string]any
 	for i, line := range lines {
 		var rec map[string]any
-		if err := json.Unmarshal(line, &rec); err != nil {
+		if err := decodeStrict(line, &rec); err != nil {
 			return 0, false, fmt.Errorf("line %d is not JSON", i+1)
 		}
-		if seq, _ := rec["seq"].(float64); int(seq) != i+1 {
+		if seq, ok := numberField(rec, "seq"); !ok || seq != i+1 {
 			return 0, false, fmt.Errorf("seq gap at line %d", i+1)
 		}
 		if i == 0 {
 			open = rec
 		}
-		if i < len(lines)-1 {
-			digest.Write(line)
-		} else {
-			closeRec = rec
-		}
+		closeRec = rec
 	}
+	closeLine := lines[len(lines)-1]
 	if closeRec["type"] != "segment_close" {
 		return 0, false, fmt.Errorf("no close record")
 	}
-	if count, _ := closeRec["record_count"].(float64); int(count) != len(lines)-1 {
+	if count, ok := numberField(closeRec, "record_count"); !ok || count != len(lines)-1 {
 		return 0, false, fmt.Errorf("record_count mismatch")
 	}
-	if closeRec["sha256"] != hex.EncodeToString(digest.Sum(nil)) {
+	sum := sha256.Sum256(raw[:len(raw)-len(closeLine)])
+	if closeRec["sha256"] != hex.EncodeToString(sum[:]) {
 		return 0, false, fmt.Errorf("digest mismatch")
 	}
 	k, err := openIdentity(open, agentID, epoch)
@@ -241,7 +282,7 @@ func incompleteSeq(path, agentID, epoch string) (int, error) {
 	}
 	first, _, _ := bytes.Cut(raw, []byte("\n"))
 	var open map[string]any
-	if err := json.Unmarshal(first, &open); err != nil || open["type"] != "segment_open" {
+	if err := decodeStrict(first, &open); err != nil || open["type"] != "segment_open" {
 		return 0, errNoSegmentOpen
 	}
 	return openIdentity(open, agentID, epoch)
@@ -257,11 +298,11 @@ func openIdentity(open map[string]any, agentID, epoch string) (int, error) {
 	if open["capture_epoch"] != epoch {
 		return 0, fmt.Errorf("segment from epoch %v", open["capture_epoch"])
 	}
-	k, ok := open["agent_seq"].(float64)
-	if !ok || k != float64(int(k)) {
-		return 0, fmt.Errorf("segment has no agent_seq")
+	k, ok := numberField(open, "agent_seq")
+	if !ok {
+		return 0, fmt.Errorf("segment has no integer agent_seq")
 	}
-	return int(k), nil
+	return k, nil
 }
 
 func readRegular(path string) ([]byte, error) {

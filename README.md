@@ -499,10 +499,15 @@ Coverage is verified only if all of these hold:
 1. The run uses a fresh agent identity that was never used before.
 2. The operator read `capture_epoch` as E before launching the run, so before the identity could be admitted.
 3. After the run is terminal and its revocation acknowledged, `seal-<generation>.json` exists with that agent and generation and with `capture_epoch == E`.
-4. Each k in 1..N is accounted for exactly once: either by a closed segment of that agent with `capture_epoch == E`, `agent_seq == k`, a verifying digest and count, and `complete: true`, or by an `unopened` entry with an allowed reason.
+4. Each k in 1..N is accounted for exactly once by one of:
+   - a closed segment of that agent with `capture_epoch == E`, `agent_seq == k`, and a verifying digest and count, computed over the exact persisted bytes, with integral counts;
+   - a readable incomplete segment for k;
+   - an `unopened` entry with an allowed reason.
 5. No segment for that agent carries a seq outside 1..N, and no open or incomplete segment is left unexplained.
 
-`tracejournal.VerifyCoverage` is the reference implementation of these checks. It reports request coverage and content completeness separately. A torn segment file with no readable `segment_open` is explained only by a `journal_open_failed` entry that has no other file.
+Those checks establish request coverage (`RequestsVerified`). Full trace content (`ContentComplete`) additionally requires every admitted request to have a closed segment with `complete: true`. So any unopened request, incomplete segment or truncated segment means the content is not complete. Request coverage alone never means full trace content.
+
+`tracejournal.VerifyCoverage` is the reference implementation of these checks and reports both flags. A torn segment file with no readable `segment_open` is explained only by a `journal_open_failed` entry that has no other file.
 
 N = 0 with a matching E is a verified empty run. A changed epoch means cllama restarted and admission state may be lost, so coverage is unverified. Old seals and epoch files never stand in for the expected agent, generation and epoch. Request-set coverage is separate from content completeness: redaction, truncation and delivery limits still apply per segment.
 

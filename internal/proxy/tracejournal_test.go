@@ -493,16 +493,19 @@ func TestTraceJournalSealProvesWholeRunCoverage(t *testing.T) {
 	if len(unopened) != 1 || unopened[0].(map[string]any)["reason"] != tracejournal.ReasonCancelledBeforeOpen || unopened[0].(map[string]any)["agent_seq"].(float64) != 3 {
 		t.Fatalf("unopened = %v", unopened)
 	}
-	if ok, why := coverageVerified(t, historyDir, "worker-1", 7, launchEpoch); !ok {
-		t.Fatalf("coverage not verified: %s", why)
+	// Every admitted request is accounted for, but the cancelled one's
+	// content was never captured, so the run is not full content.
+	c := tracejournal.VerifyCoverage(filepath.Join(historyDir, "worker-1", "journal"), "worker-1", 7, launchEpoch)
+	if !c.RequestsVerified || c.ContentComplete || c.Requests != 3 {
+		t.Fatalf("coverage = %+v", c)
 	}
 	// Deleting one closed segment is detected as a missing request.
 	closed := journalSegments(t, historyDir, "worker-1", tracejournal.SuffixClosed)
 	if err := os.Remove(closed[0]); err != nil {
 		t.Fatal(err)
 	}
-	if ok, why := coverageVerified(t, historyDir, "worker-1", 7, launchEpoch); ok || !strings.Contains(why, "missing agent_seq") {
-		t.Fatalf("missing segment not detected: %v %s", ok, why)
+	if c := tracejournal.VerifyCoverage(filepath.Join(historyDir, "worker-1", "journal"), "worker-1", 7, launchEpoch); c.RequestsVerified || !strings.Contains(strings.Join(c.Problems, ";"), "missing agent_seq") {
+		t.Fatalf("missing segment not detected: %+v", c)
 	}
 	// A different launch epoch (a restart) never verifies.
 	if ok, why := coverageVerified(t, historyDir, "worker-1", 7, "other-epoch"); ok || !strings.HasPrefix(why, "epoch changed") {
