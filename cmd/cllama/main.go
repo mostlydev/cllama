@@ -22,7 +22,15 @@ import (
 	"github.com/mostlydev/cllama/internal/provider"
 	"github.com/mostlydev/cllama/internal/proxy"
 	"github.com/mostlydev/cllama/internal/sessionhistory"
+	"github.com/mostlydev/cllama/internal/tracejournal"
 	"github.com/mostlydev/cllama/internal/ui"
+)
+
+// version and revision are stamped at build time through -ldflags; an
+// unstamped build reports them explicitly as unknown.
+var (
+	version  = "dev"
+	revision = "unknown"
 )
 
 type config struct {
@@ -74,7 +82,19 @@ func run(args []string, stdout, stderr io.Writer) error {
 		recorder = sessionhistory.New(cfg.SessionHistoryDir)
 	}
 
-	apiHandler, uiHandler := newHandlers(cfg, reg, logger, acc, pricing, recorder, snapshots)
+	journalCfg, journalOn, err := tracejournal.ConfigFromEnv(cfg.SessionHistoryDir, version, revision, cfg.PodName)
+	if err != nil {
+		return err
+	}
+	var journal *tracejournal.Journal
+	if journalOn {
+		if journal, err = tracejournal.Open(journalCfg); err != nil {
+			return err
+		}
+		defer journal.Close()
+	}
+
+	apiHandler, uiHandler := newHandlers(cfg, reg, logger, acc, pricing, recorder, snapshots, proxy.WithTraceJournal(journal))
 	apiServer := &http.Server{
 		Addr:              cfg.APIAddr,
 		Handler:           apiHandler,
@@ -123,12 +143,12 @@ func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.L
 	return newAPIHandlerWithProxy(newProxyHandler(contextRoot, reg, logger, acc, pricing, podName, recorder, contextLedgerDir, governanceDir, adminToken, snapshots))
 }
 
-func newHandlers(cfg config, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, recorder *sessionhistory.Recorder, snapshots *proxy.ContextSnapshotStore) (http.Handler, http.Handler) {
-	shared := newProxyHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, recorder, cfg.ContextLedgerDir, cfg.GovernanceDir, cfg.UIToken, snapshots)
+func newHandlers(cfg config, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, recorder *sessionhistory.Recorder, snapshots *proxy.ContextSnapshotStore, extra ...proxy.HandlerOption) (http.Handler, http.Handler) {
+	shared := newProxyHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, recorder, cfg.ContextLedgerDir, cfg.GovernanceDir, cfg.UIToken, snapshots, extra...)
 	return newAPIHandlerWithProxy(shared), newUIHandler(reg, acc, cfg.ContextRoot, cfg.UIToken, snapshots, shared.HandleRevoke)
 }
 
-func newProxyHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder, contextLedgerDir string, governanceDir string, adminToken string, snapshots *proxy.ContextSnapshotStore) *proxy.Handler {
+func newProxyHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder, contextLedgerDir string, governanceDir string, adminToken string, snapshots *proxy.ContextSnapshotStore, extra ...proxy.HandlerOption) *proxy.Handler {
 	opts := []proxy.HandlerOption{proxy.WithCostTracking(acc, pricing), proxy.WithSnapshotStore(snapshots), proxy.WithRevocationDir(os.Getenv("CLAW_REVOCATION_DIR"))}
 	if podName != "" {
 		opts = append(opts, proxy.WithFeeds(podName))
@@ -143,6 +163,7 @@ func newProxyHandler(contextRoot string, reg *provider.Registry, logger *logging
 	if adminToken != "" {
 		opts = append(opts, proxy.WithAdminToken(adminToken))
 	}
+	opts = append(opts, extra...)
 	proxyHandler := proxy.NewHandler(reg, func(agentID string) (*agentctx.AgentContext, error) {
 		return agentctx.Load(contextRoot, agentID)
 	}, logger, opts...)

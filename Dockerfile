@@ -3,7 +3,9 @@ WORKDIR /src
 COPY go.mod go.sum* ./
 RUN go mod download 2>/dev/null || true
 COPY . .
-RUN CGO_ENABLED=0 go build -o /cllama ./cmd/cllama
+ARG CLLAMA_VERSION=dev
+ARG CLLAMA_REVISION=unknown
+RUN CGO_ENABLED=0 go build -ldflags "-X main.version=${CLLAMA_VERSION} -X main.revision=${CLLAMA_REVISION}" -o /cllama ./cmd/cllama
 
 FROM gcr.io/distroless/static-debian12
 COPY --from=build /cllama /cllama

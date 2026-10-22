@@ -22,6 +22,7 @@ import (
 	"github.com/mostlydev/cllama/internal/mcp"
 	"github.com/mostlydev/cllama/internal/provider"
 	"github.com/mostlydev/cllama/internal/sessionhistory"
+	"github.com/mostlydev/cllama/internal/tracejournal"
 )
 
 const (
@@ -989,7 +990,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 		}
 
 		h.logger.LogRequestWithInfo(agentID, requestedModel, requestInfo)
-		resp, err := h.client.Do(outReq)
+		resp, err := h.tracedDo(outReq, upstreamTraceInfo(candidate, upstream))
 		if err != nil {
 			cancel()
 			if !canFallback {
@@ -1514,7 +1515,7 @@ func (h *Handler) executeManagedOpenAITool(ctx context.Context, agentID string, 
 	}
 
 	start := time.Now()
-	childCtx, cancel := context.WithTimeout(ctx, policy.PerToolTimeout)
+	childCtx, cancel := context.WithTimeout(tracejournal.WithToolCallID(ctx, call.ID), policy.PerToolTimeout)
 	defer cancel()
 	raw, statusCode, err := h.dispatchManagedTool(childCtx, agentID, resolved.Manifest, call.Arguments)
 	trace.LatencyMS = time.Since(start).Milliseconds()
@@ -1627,7 +1628,7 @@ func (h *Handler) executeManagedAnthropicTool(ctx context.Context, agentID strin
 	}
 
 	start := time.Now()
-	childCtx, cancel := context.WithTimeout(ctx, policy.PerToolTimeout)
+	childCtx, cancel := context.WithTimeout(tracejournal.WithToolCallID(ctx, call.ID), policy.PerToolTimeout)
 	defer cancel()
 	raw, statusCode, err := h.dispatchManagedTool(childCtx, agentID, resolved.Manifest, call.Arguments)
 	trace.LatencyMS = time.Since(start).Milliseconds()
@@ -1990,6 +1991,18 @@ func (h *Handler) dispatchManagedTool(ctx context.Context, agentID string, tool 
 		h.revocations.mu.Unlock()
 		h.logger.LogToolDispatch(agentID, callID, status)
 	}()
+	seg := tracejournal.FromContext(ctx)
+	modelCallID := tracejournal.ToolCallID(ctx)
+	if err := seg.ToolCall(modelCallID, tool.Name, tool.Execution.Service, args); err != nil {
+		return nil, 0, err
+	}
+	started := time.Now()
+	raw, statusCode, err := h.executeManagedTransport(ctx, agentID, tool, args)
+	seg.ToolResult(modelCallID, statusCode, time.Since(started), raw, err)
+	return raw, statusCode, err
+}
+
+func (h *Handler) executeManagedTransport(ctx context.Context, agentID string, tool agentctx.ToolManifestEntry, args map[string]any) ([]byte, int, error) {
 	switch strings.ToLower(strings.TrimSpace(tool.Execution.Transport)) {
 	case "http":
 		return h.callManagedHTTPTool(ctx, agentID, tool, args)
