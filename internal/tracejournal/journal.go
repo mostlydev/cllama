@@ -140,6 +140,10 @@ func Open(cfg Config) (*Journal, error) {
 		j.Close()
 		return nil, fmt.Errorf("trace journal: apply %s: %w", EnvOwner, err)
 	}
+	if err := j.checkTraversable(cfg.HistoryDir); err != nil {
+		j.Close()
+		return nil, err
+	}
 	if err := j.recover(); err != nil {
 		j.Close()
 		return nil, err
@@ -268,6 +272,9 @@ func (j *Journal) prepareDir(agentID string) (string, error) {
 			return "", fmt.Errorf("trace journal: sync history dir: %w", err)
 		}
 	}
+	if err := j.checkTraversable(agentDir); err != nil {
+		return "", err
+	}
 	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return "", fmt.Errorf("trace journal: create journal dir: %w", err)
 	}
@@ -286,6 +293,37 @@ func (j *Journal) prepareDir(agentID string) (string, error) {
 	}
 	j.prepared[dir] = true
 	return dir, nil
+}
+
+// checkTraversable fails when the configured collector could not reach the
+// journal through dir, so a misconfigured owner is caught before any request
+// rather than discovered by a collector that silently sees nothing.
+func (j *Journal) checkTraversable(dir string) error {
+	if j.cfg.OwnerUID < 0 {
+		return nil
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("trace journal: stat %s: %w", dir, err)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	perm := info.Mode().Perm()
+	var bit os.FileMode
+	switch {
+	case int(st.Uid) == j.cfg.OwnerUID:
+		bit = 0o100
+	case int(st.Gid) == j.cfg.OwnerGID:
+		bit = 0o010
+	default:
+		bit = 0o001
+	}
+	if perm&bit == 0 {
+		return fmt.Errorf("trace journal: %s (mode %o) is not traversable by %s %d:%d", dir, perm, EnvOwner, j.cfg.OwnerUID, j.cfg.OwnerGID)
+	}
+	return nil
 }
 
 func (j *Journal) syncFile(f *os.File) error {

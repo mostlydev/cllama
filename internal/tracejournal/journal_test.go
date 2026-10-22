@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -354,5 +355,53 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv(EnvEnabled, "maybe")
 	if _, _, err := ConfigFromEnv("/h", "v", "r", "p"); err == nil {
 		t.Fatal("unknown enable value accepted")
+	}
+}
+
+func TestOwnerMustBeAbleToTraverseAncestors(t *testing.T) {
+	cfg := testConfig(t)
+	// The test process can always chown to itself, so it stands in for the
+	// collector user.
+	cfg.OwnerUID, cfg.OwnerGID = os.Getuid(), os.Getgid()
+	j := openJournal(t, cfg)
+	agentDir := filepath.Join(cfg.HistoryDir, "worker-1")
+	if err := os.Mkdir(agentDir, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(agentDir, 0o755) })
+	if _, err := j.Begin("worker-1", OpenInfo{}); err == nil || !strings.Contains(err.Error(), "not traversable") {
+		t.Fatalf("Begin through an untraversable agent dir: %v", err)
+	}
+	if err := os.Chmod(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seg, err := j.Begin("worker-1", OpenInfo{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seg.Close("ok"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoveredSegmentsAreOwnedAndReadableByCollector(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.OwnerUID, cfg.OwnerGID = os.Getuid(), os.Getgid()
+	dir := filepath.Join(cfg.HistoryDir, "worker-1", journalDirName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	openPath := filepath.Join(dir, "1-00000000-0000-4000-8000-000000000000"+SuffixOpen)
+	if err := os.WriteFile(openPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	openJournal(t, cfg)
+	info, err := os.Stat(strings.TrimSuffix(openPath, SuffixOpen) + SuffixIncomplete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := info.Sys().(*syscall.Stat_t)
+	if int(st.Uid) != cfg.OwnerUID || info.Mode().Perm()&0o400 == 0 {
+		t.Fatalf("recovered segment owner %d mode %v", st.Uid, info.Mode())
 	}
 }

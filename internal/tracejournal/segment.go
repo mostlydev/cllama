@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -34,12 +35,13 @@ type Segment struct {
 	written   int64
 	truncated bool
 	calls     int
+	pending   map[int]bool // provider attempts without a settled response
 	err       error
 	done      bool
 }
 
 func newSegment(j *Journal, f *os.File, dir, name string, secrets []string) *Segment {
-	return &Segment{j: j, f: f, dir: dir, name: name, secrets: usableSecrets(secrets), digest: sha256.New()}
+	return &Segment{j: j, f: f, dir: dir, name: name, secrets: usableSecrets(secrets), digest: sha256.New(), pending: make(map[int]bool)}
 }
 
 // Err reports the write failure that poisoned this segment, if any. Once it
@@ -68,7 +70,7 @@ func (s *Segment) appendLocked(typ string, fields map[string]any) error {
 	}
 	record := make(map[string]any, len(fields)+3)
 	for k, v := range fields {
-		record[k] = v
+		record[k] = redactFields(v, s.secrets)
 	}
 	record["seq"] = s.seq + 1
 	record["ts"] = time.Now().UTC().Format(time.RFC3339Nano)
@@ -104,15 +106,22 @@ func (s *Segment) body(raw []byte) any {
 	if int64(len(raw)) > s.j.cfg.MaxFieldBytes {
 		return s.omitTooLarge(len(raw))
 	}
-	projected, err := json.Marshal(ProjectBody(raw))
+	value, lossless := projectBody(raw, s.secrets)
+	projected, err := json.Marshal(value)
 	if err != nil {
 		return s.omitTooLarge(len(raw))
 	}
 	s.mu.Lock()
-	over := s.written+int64(len(projected)) > s.j.cfg.MaxSegmentBytes
-	s.mu.Unlock()
-	if over {
-		return s.omitTooLarge(len(raw))
+	defer s.mu.Unlock()
+	if s.done {
+		return nil
+	}
+	if s.written+int64(len(projected)) > s.j.cfg.MaxSegmentBytes {
+		s.truncated = true
+		return map[string]any{"omitted": "too_large", "bytes": len(raw)}
+	}
+	if !lossless {
+		s.truncated = true
 	}
 	return json.RawMessage(projected)
 }
@@ -130,7 +139,9 @@ func (s *Segment) value(v any) any {
 
 func (s *Segment) omitTooLarge(n int) any {
 	s.mu.Lock()
-	s.truncated = true
+	if !s.done {
+		s.truncated = true
+	}
 	s.mu.Unlock()
 	return map[string]any{"omitted": "too_large", "bytes": n}
 }
@@ -155,6 +166,7 @@ func (s *Segment) BeginUpstream(info UpstreamInfo) (int, error) {
 	defer s.mu.Unlock()
 	s.calls++
 	call := s.calls
+	s.pending[call] = true
 	err := s.appendLocked("upstream_request", map[string]any{
 		"call":     call,
 		"provider": info.Provider,
@@ -172,15 +184,24 @@ func (s *Segment) FinishUpstream(call int, started time.Time, resp *http.Respons
 	if s == nil {
 		return resp, err
 	}
-	if err != nil {
-		_ = s.append("upstream_response", map[string]any{
+	if err != nil || resp == nil || resp.Body == nil {
+		msg := "no response"
+		if err != nil {
+			msg = err.Error()
+		}
+		s.settle(call, map[string]any{
 			"call":       call,
 			"latency_ms": time.Since(started).Milliseconds(),
-			"error":      err.Error(),
+			"error":      msg,
 		})
 		return resp, err
 	}
-	if resp == nil || resp.Body == nil {
+	s.mu.Lock()
+	live := s.pending[call] && !s.done
+	s.mu.Unlock()
+	if !live {
+		// Already settled (for example by a first-byte timeout) or the
+		// segment is closed: the late response is not recorded.
 		return resp, err
 	}
 	resp.Body = &upstreamCapture{
@@ -257,9 +278,22 @@ func (c *upstreamCapture) finish(eof bool) {
 		if c.readErr != nil {
 			fields["error"] = c.readErr.Error()
 		}
-		_ = c.seg.append("upstream_response", fields)
+		c.seg.settle(c.call, fields)
 		c.buf = nil
 	})
+}
+
+// settle writes the one upstream_response for a pending call. It is a
+// no-op once the call is settled or the segment is closed, so a late or
+// duplicate outcome can neither append nor change the closed state.
+func (s *Segment) settle(call int, fields map[string]any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.pending[call] || s.done {
+		return
+	}
+	delete(s.pending, call)
+	_ = s.appendLocked("upstream_response", fields)
 }
 
 // ToolCall durably records a managed tool dispatch before it is executed. An
@@ -341,13 +375,22 @@ func (s *Segment) Close(status string) error {
 		}
 		return s.err
 	}
-	err := s.appendLocked("segment_close", map[string]any{
+	unsettled := make([]int, 0, len(s.pending))
+	for call := range s.pending {
+		unsettled = append(unsettled, call)
+	}
+	sort.Ints(unsettled)
+	fields := map[string]any{
 		"status":       status,
 		"record_count": s.seq,
 		"truncated":    s.truncated,
-		"complete":     !s.truncated,
+		"complete":     !s.truncated && len(unsettled) == 0,
 		"sha256":       hex.EncodeToString(s.digest.Sum(nil)),
-	})
+	}
+	if len(unsettled) > 0 {
+		fields["unsettled_calls"] = unsettled
+	}
+	err := s.appendLocked("segment_close", fields)
 	s.done = true
 	closeErr := s.f.Close()
 	if err != nil {

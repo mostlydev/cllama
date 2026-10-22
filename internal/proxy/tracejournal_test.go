@@ -104,7 +104,10 @@ func recordTypes(records []map[string]any) string {
 }
 
 func TestTraceJournalCapturesManagedToolLoop(t *testing.T) {
-	for _, format := range []string{"openai", "anthropic"} {
+	// openai and anthropic pass through; responses and bridge exercise the
+	// Responses and chat-to-Messages adapters, whose upstream bodies differ
+	// from what the runner sent.
+	for _, format := range []string{"openai", "anthropic", "responses", "bridge"} {
 		for _, stream := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/stream=%t", format, stream), func(t *testing.T) {
 				// The tool echoes its credential so redaction is exercised.
@@ -122,11 +125,15 @@ func TestTraceJournalCapturesManagedToolLoop(t *testing.T) {
 					w.Header().Set("Content-Type", "application/json")
 					first := calls.Add(1) == 1
 					switch {
+					case format == "responses" && first:
+						fmt.Fprintf(w, `{"id":"resp_1","object":"response","status":"completed","output":[{"type":"reasoning","id":"rs_1","encrypted_content":"PRIVATE-CHAIN","summary":[{"type":"summary_text","text":"PRIVATE-CHAIN"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checking"}]},{"type":"function_call","call_id":"call-1","name":%q,"arguments":"{}"}],"usage":{"input_tokens":1,"output_tokens":1}}`, name)
+					case format == "responses":
+						fmt.Fprint(w, `{"id":"resp_2","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"price is 42"}]}],"usage":{"input_tokens":1,"output_tokens":1}}`)
 					case format == "openai" && first:
 						fmt.Fprintf(w, `{"id":"r1","choices":[{"message":{"role":"assistant","content":"checking","tool_calls":[{"id":"call-1","type":"function","function":{"name":%q,"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`, name)
 					case format == "openai":
 						fmt.Fprint(w, `{"id":"r2","choices":[{"message":{"role":"assistant","content":"price is 42","reasoning_content":"PRIVATE-CHAIN"},"finish_reason":"stop"}]}`)
-					case first:
+					case first: // anthropic and bridge
 						fmt.Fprintf(w, `{"id":"m1","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"PRIVATE-CHAIN","signature":"SIG"},{"type":"text","text":"checking"},{"type":"tool_use","id":"call-1","name":%q,"input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}`, name)
 					default:
 						fmt.Fprint(w, `{"id":"m2","type":"message","role":"assistant","content":[{"type":"text","text":"price is 42"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
@@ -134,21 +141,26 @@ func TestTraceJournalCapturesManagedToolLoop(t *testing.T) {
 				}))
 				defer backend.Close()
 
+				providerName, model, path, upstreamPath := "openai", "openai/model", "/v1/chat/completions", "/v1/chat/completions"
+				switch format {
+				case "anthropic":
+					providerName, model, path, upstreamPath = "anthropic", "anthropic/model", "/v1/messages", "/v1/messages"
+				case "bridge":
+					providerName, model, upstreamPath = "anthropic", "anthropic/model", "/v1/messages"
+				case "responses":
+					model, upstreamPath = "openai/gpt-5.6-terra", "/v1/responses"
+				}
 				reg := provider.NewRegistry("")
-				prov := &provider.Provider{Name: format, BaseURL: backend.URL + "/v1", APIKey: "provider-secret-key", Auth: "bearer"}
-				if format == "anthropic" {
+				prov := &provider.Provider{Name: providerName, BaseURL: backend.URL + "/v1", APIKey: "provider-secret-key", Auth: "bearer"}
+				if providerName == "anthropic" {
 					prov.APIFormat = "anthropic"
 					prov.Auth = "x-api-key"
 				}
-				reg.Set(format, prov)
+				reg.Set(providerName, prov)
 				journal, historyDir := newTestJournal(t, nil)
 				h := NewHandler(reg, stubContextLoaderWithTools("worker-1", "worker-1:agent-secret-value", manifest), nil, WithTraceJournal(journal))
 
-				path := "/v1/chat/completions"
-				if format == "anthropic" {
-					path = "/v1/messages"
-				}
-				body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"price? my token is agent-secret-value"}],"max_tokens":20,"stream":%t}`, format+"/model", stream)
+				body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"price? my token is agent-secret-value"}],"max_tokens":20,"stream":%t}`, model, stream)
 				req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 				req.Header.Set("Authorization", "Bearer worker-1:agent-secret-value")
 				w := httptest.NewRecorder()
@@ -165,8 +177,16 @@ func TestTraceJournalCapturesManagedToolLoop(t *testing.T) {
 				if records[3]["call_id"] != "call-1" || records[4]["call_id"] != "call-1" {
 					t.Fatalf("tool call id not carried: %v / %v", records[3], records[4])
 				}
-				if records[1]["provider"] != format || records[1]["call"].(float64) != 1 || records[5]["call"].(float64) != 2 {
+				if records[1]["provider"] != providerName || records[1]["call"].(float64) != 1 || records[5]["call"].(float64) != 2 {
 					t.Fatalf("upstream calls not numbered: %v %v", records[1], records[5])
+				}
+				if records[1]["path"] != upstreamPath || records[5]["path"] != upstreamPath {
+					t.Fatalf("upstream path = %v / %v, want %s", records[1]["path"], records[5]["path"], upstreamPath)
+				}
+				// The recorded body is the translated upstream shape.
+				shape := map[string]string{"openai": `messages`, "anthropic": `max_tokens`, "bridge": `max_tokens`, "responses": `input`}[format]
+				if _, ok := records[1]["body"].(map[string]any)[shape]; !ok {
+					t.Fatalf("upstream body is not the %s shape: %v", format, records[1]["body"])
 				}
 				// The second provider request carries the tool result the model saw.
 				if !strings.Contains(fmt.Sprint(records[5]["body"]), "42") {

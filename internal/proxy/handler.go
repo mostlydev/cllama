@@ -1112,15 +1112,18 @@ func envDurationMS(name string, fallbackMS int) time.Duration {
 }
 
 func (h *Handler) doUpstreamRequest(req *http.Request, cancel context.CancelFunc, downstreamStream bool, trace tracejournal.UpstreamInfo) (*http.Response, error) {
-	if !downstreamStream {
-		return h.tracedDo(req, trace)
+	seg := tracejournal.FromContext(req.Context())
+	call, err := seg.BeginUpstream(trace)
+	if err != nil {
+		return nil, err
 	}
-
+	started := time.Now()
 	// This timeout gates the header wait here and the first body read in
 	// streamBody, so a header-only stream can consume up to two intervals.
 	timeout := streamFirstByteTimeoutDuration()
-	if timeout <= 0 {
-		return h.tracedDo(req, trace)
+	if !downstreamStream || timeout <= 0 {
+		resp, err := h.client.Do(req)
+		return seg.FinishUpstream(call, started, resp, err)
 	}
 
 	type result struct {
@@ -1129,7 +1132,7 @@ func (h *Handler) doUpstreamRequest(req *http.Request, cancel context.CancelFunc
 	}
 	ch := make(chan result, 1)
 	go func() {
-		resp, err := h.tracedDo(req, trace)
+		resp, err := h.client.Do(req)
 		ch <- result{resp: resp, err: err}
 	}()
 
@@ -1138,9 +1141,12 @@ func (h *Handler) doUpstreamRequest(req *http.Request, cancel context.CancelFunc
 
 	select {
 	case res := <-ch:
-		return res.resp, res.err
+		return seg.FinishUpstream(call, started, res.resp, res.err)
 	case <-timer.C:
 		cancel()
+		// Settle the attempt now; the late transport result is discarded
+		// and never recorded.
+		_, _ = seg.FinishUpstream(call, started, nil, errStreamFirstByteTimeout)
 		go func() {
 			res := <-ch
 			if res.resp != nil && res.resp.Body != nil {
