@@ -460,6 +460,7 @@ Results cllama synthesizes without dispatching a tool appear verbatim in the nex
 - **Known credentials.** Provider keys, agent bearer tokens, the UI and admin token, and managed-tool, memory and feed auth tokens are redacted inside every recorded string, as are values of credential-named fields.
 - **Hidden reasoning.** Thinking blocks and deltas, Responses reasoning items and events, `encrypted_content` and chat reasoning fields are replaced by `{"omitted":"hidden_reasoning"}`. This happens before sizing, so excluded reasoning is never hashed or kept.
 - **Unparseable bodies.** A body or event that cannot be parsed is omitted rather than kept raw, because hidden reasoning in it could not be removed. This includes an interrupted stream.
+- **Deeply nested JSON text.** JSON carried inside strings, such as tool-call arguments, is inspected up to four levels deep. Anything deeper is replaced by `{"omitted":"embedded_json_too_deep"}`, and the segment is marked truncated.
 
 Residual boundary: an unknown secret written into free text by a client, model or tool cannot be detected and may be recorded.
 

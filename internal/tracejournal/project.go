@@ -50,7 +50,8 @@ type projector struct {
 }
 
 // maxEmbeddedDepth bounds how deep JSON text nested inside strings is
-// decoded and projected.
+// decoded and projected. JSON text nested deeper is omitted and the capture
+// marked lossy.
 const maxEmbeddedDepth = 4
 
 // ProjectBody returns the recordable form of a captured body with no known
@@ -211,12 +212,18 @@ func (p *projector) value(v any) any {
 // valid JSON; one that does not is kept byte for byte.
 func (p *projector) embedded(s string) string {
 	trimmed := strings.TrimSpace(s)
-	if p.depth >= maxEmbeddedDepth || len(trimmed) < 2 || (trimmed[0] != '{' && trimmed[0] != '[') {
+	if len(trimmed) < 2 || (trimmed[0] != '{' && trimmed[0] != '[') {
 		return s
 	}
 	v, ok := decodeJSON([]byte(trimmed))
 	if !ok {
 		return s
+	}
+	if p.depth >= maxEmbeddedDepth {
+		// Deeper JSON text is not inspected, so it cannot be kept: an
+		// escaped credential or reasoning field could hide in it.
+		p.lossless = false
+		return `{"omitted":"embedded_json_too_deep"}`
 	}
 	p.depth++
 	projected := p.value(v)
