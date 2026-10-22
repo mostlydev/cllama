@@ -225,28 +225,35 @@ type upstreamCapture struct {
 	inner      io.ReadCloser
 	limit      int
 
-	buf      []byte
-	total    int
-	readErr  error
-	once     sync.Once
-	recorded bool
+	// mu guards the capture state, never the blocking inner Read: a stream
+	// reader may still be inside Read when another goroutine closes the
+	// body. Once sealed, a late Read changes nothing.
+	mu      sync.Mutex
+	buf     []byte
+	total   int
+	readErr error
+	sealed  bool
 }
 
 func (c *upstreamCapture) Read(p []byte) (int, error) {
 	n, err := c.inner.Read(p)
-	if n > 0 {
-		c.total += n
-		if keep := c.limit + 1 - len(c.buf); keep > 0 {
-			if keep > n {
-				keep = n
+	c.mu.Lock()
+	if !c.sealed {
+		if n > 0 {
+			c.total += n
+			if keep := c.limit + 1 - len(c.buf); keep > 0 {
+				if keep > n {
+					keep = n
+				}
+				c.buf = append(c.buf, p[:keep]...)
 			}
-			c.buf = append(c.buf, p[:keep]...)
 		}
-	}
-	if err != nil {
-		if !errors.Is(err, io.EOF) {
+		if err != nil && !errors.Is(err, io.EOF) {
 			c.readErr = err
 		}
+	}
+	c.mu.Unlock()
+	if err != nil {
 		c.finish(errors.Is(err, io.EOF))
 	}
 	return n, err
@@ -258,29 +265,38 @@ func (c *upstreamCapture) Close() error {
 	return err
 }
 
+// finish seals the capture and settles its call exactly once, at the end of
+// the body or at Close, whichever comes first.
 func (c *upstreamCapture) finish(eof bool) {
-	c.once.Do(func() {
-		var body any
-		if c.total > len(c.buf) || c.total > c.limit {
-			body = c.seg.omitTooLarge(c.total)
-		} else {
-			body = c.seg.body(c.buf)
-		}
-		fields := map[string]any{
-			"call":        c.call,
-			"status_code": c.statusCode,
-			"latency_ms":  c.headerMS,
-			"duration_ms": time.Since(c.started).Milliseconds(),
-			"bytes":       c.total,
-			"complete":    eof,
-			"body":        body,
-		}
-		if c.readErr != nil {
-			fields["error"] = c.readErr.Error()
-		}
-		c.seg.settle(c.call, fields)
-		c.buf = nil
-	})
+	c.mu.Lock()
+	if c.sealed {
+		c.mu.Unlock()
+		return
+	}
+	c.sealed = true
+	buf, total, readErr := c.buf, c.total, c.readErr
+	c.buf = nil
+	c.mu.Unlock()
+
+	var body any
+	if total > len(buf) || total > c.limit {
+		body = c.seg.omitTooLarge(total)
+	} else {
+		body = c.seg.body(buf)
+	}
+	fields := map[string]any{
+		"call":        c.call,
+		"status_code": c.statusCode,
+		"latency_ms":  c.headerMS,
+		"duration_ms": time.Since(c.started).Milliseconds(),
+		"bytes":       total,
+		"complete":    eof,
+		"body":        body,
+	}
+	if readErr != nil {
+		fields["error"] = readErr.Error()
+	}
+	c.seg.settle(c.call, fields)
 }
 
 // settle writes the one upstream_response for a pending call. It is a

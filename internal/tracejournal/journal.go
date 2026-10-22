@@ -187,6 +187,14 @@ func (j *Journal) recover() error {
 		dirs[filepath.Dir(path)] = true
 	}
 	for dir := range dirs {
+		// A journal left by an earlier owner must become reachable by the
+		// configured collector too, not only its recovered files.
+		if err := j.checkTraversable(filepath.Dir(dir)); err != nil {
+			return err
+		}
+		if err := j.chownPath(dir); err != nil {
+			return fmt.Errorf("trace journal: own %s: %w", dir, err)
+		}
 		if err := syncDir(dir); err != nil {
 			return fmt.Errorf("trace journal: sync %s: %w", dir, err)
 		}

@@ -3,6 +3,9 @@ package tracejournal
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
+	"reflect"
 	"sort"
 	"strings"
 )
@@ -43,7 +46,12 @@ var sseFields = []string{"event:", "id:", "retry:"}
 type projector struct {
 	secrets  []string
 	lossless bool
+	depth    int // nesting of JSON text inside strings, such as tool arguments
 }
+
+// maxEmbeddedDepth bounds how deep JSON text nested inside strings is
+// decoded and projected.
+const maxEmbeddedDepth = 4
 
 // ProjectBody returns the recordable form of a captured body with no known
 // secrets. See projectBody.
@@ -78,7 +86,8 @@ func decodeJSON(raw []byte) (any, bool) {
 	if err := dec.Decode(&v); err != nil {
 		return nil, false
 	}
-	if _, err := dec.Token(); err == nil {
+	// Only whitespace may follow; trailing data of any kind is not JSON.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return nil, false
 	}
 	return v, true
@@ -190,10 +199,37 @@ func (p *projector) value(v any) any {
 		}
 		return out
 	case string:
-		return redact(t, p.secrets)
+		return p.embedded(redact(t, p.secrets))
 	default:
 		return v
 	}
+}
+
+// embedded projects JSON carried as text, such as Chat function.arguments,
+// where an escaped credential or reasoning field would survive literal
+// redaction of the outer string. A string that changes is re-encoded as
+// valid JSON; one that does not is kept byte for byte.
+func (p *projector) embedded(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if p.depth >= maxEmbeddedDepth || len(trimmed) < 2 || (trimmed[0] != '{' && trimmed[0] != '[') {
+		return s
+	}
+	v, ok := decodeJSON([]byte(trimmed))
+	if !ok {
+		return s
+	}
+	p.depth++
+	projected := p.value(v)
+	p.depth--
+	if reflect.DeepEqual(v, projected) {
+		return s
+	}
+	encoded, err := json.Marshal(projected)
+	if err != nil {
+		p.lossless = false
+		return redactedCredential
+	}
+	return string(encoded)
 }
 
 // redactFields redacts known secrets in the plain string values of a record
