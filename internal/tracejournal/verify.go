@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -201,7 +203,14 @@ func VerifyCoverage(journalDir, agentID string, generation uint64, epoch string)
 func decodeStrict(raw []byte, v any) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
-	return dec.Decode(v)
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("expected exactly one JSON value")
+	}
+	return nil
 }
 
 // exactInt accepts only an integral JSON number written as an integer.
