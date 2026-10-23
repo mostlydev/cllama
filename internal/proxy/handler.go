@@ -25,6 +25,7 @@ import (
 	"github.com/mostlydev/cllama/internal/mcp"
 	"github.com/mostlydev/cllama/internal/provider"
 	"github.com/mostlydev/cllama/internal/sessionhistory"
+	"github.com/mostlydev/cllama/internal/tracejournal"
 )
 
 // ContextLoader resolves per-agent context by ID.
@@ -47,6 +48,7 @@ type Handler struct {
 	managedTurns                 *managedOpenAIContinuityStore
 	managedAnthropicTurns        *managedAnthropicContinuityStore
 	sessionRecorder              *sessionhistory.Recorder
+	journal                      *tracejournal.Journal
 	governanceDir                string
 	channelCursors               *channelCursorStore
 	adminToken                   string
@@ -197,6 +199,9 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 	}
 	for _, opt := range opts {
 		opt(h)
+	}
+	if h.journal != nil {
+		h.revocations.drainHandlers = true
 	}
 	if h.policyEvaluator == nil {
 		h.policyEvaluator = newHTTPPolicyEvaluatorFromEnv(h.client)
@@ -640,6 +645,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { finishRequest(); h.clearRevokedSnapshot(agentID) }()
 	r = r.WithContext(requestCtx)
+	seg, tw, r, ok := h.beginTrace(w, r, agentID, secret, ctx, start)
+	if !ok {
+		return
+	}
+	if seg != nil {
+		w = tw
+		defer h.finishTrace(seg, tw, r, agentID)
+	}
 	if h.policyEnabled(ctx) {
 		inBody, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -945,7 +958,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		}
 
 		h.logger.LogRequestWithInfo(agentID, requestedModel, requestInfo)
-		resp, err := h.doUpstreamRequest(outReq, cancel, attemptStream)
+		resp, err := h.doUpstreamRequest(outReq, cancel, attemptStream, upstreamTraceInfo(candidate, upstream))
 		if err != nil {
 			cancel()
 			if !canFallback {
@@ -1098,16 +1111,19 @@ func envDurationMS(name string, fallbackMS int) time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
-func (h *Handler) doUpstreamRequest(req *http.Request, cancel context.CancelFunc, downstreamStream bool) (*http.Response, error) {
-	if !downstreamStream {
-		return h.client.Do(req)
+func (h *Handler) doUpstreamRequest(req *http.Request, cancel context.CancelFunc, downstreamStream bool, trace tracejournal.UpstreamInfo) (*http.Response, error) {
+	seg := tracejournal.FromContext(req.Context())
+	call, err := seg.BeginUpstream(trace)
+	if err != nil {
+		return nil, err
 	}
-
+	started := time.Now()
 	// This timeout gates the header wait here and the first body read in
 	// streamBody, so a header-only stream can consume up to two intervals.
 	timeout := streamFirstByteTimeoutDuration()
-	if timeout <= 0 {
-		return h.client.Do(req)
+	if !downstreamStream || timeout <= 0 {
+		resp, err := h.client.Do(req)
+		return seg.FinishUpstream(call, started, resp, err)
 	}
 
 	type result struct {
@@ -1125,9 +1141,12 @@ func (h *Handler) doUpstreamRequest(req *http.Request, cancel context.CancelFunc
 
 	select {
 	case res := <-ch:
-		return res.resp, res.err
+		return seg.FinishUpstream(call, started, res.resp, res.err)
 	case <-timer.C:
 		cancel()
+		// Settle the attempt now; the late transport result is discarded
+		// and never recorded.
+		_, _ = seg.FinishUpstream(call, started, nil, errStreamFirstByteTimeout)
 		go func() {
 			res := <-ch
 			if res.resp != nil && res.resp.Body != nil {

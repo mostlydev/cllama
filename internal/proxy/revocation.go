@@ -29,6 +29,7 @@ type revocationLedger struct {
 type agentFence struct {
 	requests map[uint64]context.CancelFunc
 	active   int
+	handlers int
 	admitted uint64
 	refused  uint64
 	drained  chan struct{}
@@ -47,6 +48,11 @@ type revocationFence struct {
 	maxBytes int
 	agents   map[string]*agentFence
 	next     uint64
+	// drainHandlers makes a revocation wait for every registered request
+	// handler, not only tool dispatches. The trace journal needs it: a
+	// handler closes its segment before it unregisters, so after the
+	// acknowledgement no segment for that identity can still be written.
+	drainHandlers bool
 }
 
 func newRevocationFence(dir string) *revocationFence {
@@ -168,7 +174,42 @@ func (f *revocationFence) register(parent context.Context, id string) (context.C
 	n := f.next
 	s := f.stateLocked(id)
 	s.requests[n] = cancel
-	return ctx, func() { cancel(); f.mu.Lock(); delete(s.requests, n); f.mu.Unlock() }, nil
+	if f.drainHandlers {
+		f.enterLocked(s)
+		s.handlers++
+	}
+	return ctx, func() {
+		cancel()
+		f.mu.Lock()
+		delete(s.requests, n)
+		if f.drainHandlers {
+			s.handlers--
+			f.leaveLocked(s)
+		}
+		f.mu.Unlock()
+	}, nil
+}
+
+// pendingLocked counts the work a revocation must wait for.
+func (f *revocationFence) pendingLocked(s *agentFence) int {
+	if f.drainHandlers {
+		return s.active + s.handlers
+	}
+	return s.active
+}
+
+// enterLocked arms a fresh drained channel before pending work starts.
+func (f *revocationFence) enterLocked(s *agentFence) {
+	if f.pendingLocked(s) == 0 {
+		s.drained = make(chan struct{})
+	}
+}
+
+// leaveLocked closes the drained channel once pending work has finished.
+func (f *revocationFence) leaveLocked(s *agentFence) {
+	if f.pendingLocked(s) == 0 {
+		close(s.drained)
+	}
 }
 func (f *revocationFence) admit(ctx context.Context, id string) (func(), error) {
 	f.mu.Lock()
@@ -184,17 +225,13 @@ func (f *revocationFence) admit(ctx context.Context, id string) (func(), error) 
 		return nil, err
 	}
 	s := f.stateLocked(id)
-	if s.active == 0 {
-		s.drained = make(chan struct{})
-	}
+	f.enterLocked(s)
 	s.active++
 	s.admitted++
 	return func() {
 		f.mu.Lock()
 		s.active--
-		if s.active == 0 {
-			close(s.drained)
-		}
+		f.leaveLocked(s)
 		f.mu.Unlock()
 	}, nil
 }
@@ -338,6 +375,13 @@ func (h *Handler) HandleRevoke(w http.ResponseWriter, r *http.Request) {
 	admitted, refused := state.admitted, state.refused
 	h.revocations.mu.Unlock()
 	h.logger.LogRevocation(id, record.Generation, admitted, refused)
+	if h.journal != nil {
+		// Every handler for id has exited, so the admission count is final.
+		// A seal failure leaves coverage unproven but never blocks revocation.
+		if err := h.journal.Seal(id, record.Generation); err != nil {
+			h.logger.LogError(id, "", 0, 0, err)
+		}
+	}
 	h.clearRevokedSnapshot(id)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(record)

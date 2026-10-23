@@ -66,6 +66,9 @@ go build -o cllama ./cmd/cllama
 
 # Docker (~15 MB distroless)
 docker build -t ghcr.io/mostlydev/cllama:latest .
+
+# Stamp the version the trace journal records (unstamped builds record dev/unknown)
+docker build --build-arg CLLAMA_VERSION=v0.X.Y --build-arg CLLAMA_REVISION=$(git rev-parse HEAD) -t ghcr.io/mostlydev/cllama:v0.X.Y .
 ```
 
 Zero external dependencies. Go standard library only.
@@ -103,6 +106,10 @@ docker run -p 8080:8080 -p 8081:8081 \
 | `CLAW_AUTH_DIR` | `/claw/auth` | Provider credentials |
 | `CLAW_POD` | | Pod name (dashboard display) |
 | `CLAW_SESSION_HISTORY_DIR` | `/claw/session-history` | Per-agent JSONL session history base dir. When set, cllama appends one entry per successful 2xx upstream completion to `<dir>/<agent-id>/history.jsonl`. |
+| `CLLAMA_TRACE_JOURNAL` | `off` | Set to `on` to write the [trace journal](#trace-journal). Requires `CLAW_SESSION_HISTORY_DIR`. |
+| `CLLAMA_TRACE_OWNER` | _(empty)_ | `<uid>:<gid>` that owns journal directories and segments, so a host collector can read and remove them. cllama refuses to start if it cannot apply it or the collector could not traverse the history directory. |
+| `CLLAMA_TRACE_MAX_FIELD_BYTES` | `1048576` | Largest captured body recorded verbatim; larger bodies become a size marker. |
+| `CLLAMA_TRACE_MAX_SEGMENT_BYTES` | `67108864` | Per-segment capture budget; later bodies become size markers. |
 | `CLLAMA_FEED_MAX_RESPONSE_BYTES` | `32768` | Maximum bytes read from any single feed response before truncation. |
 | `CLLAMA_FEED_MAX_TOTAL_BYTES` | `65536` | Maximum aggregate bytes of formatted feed blocks injected into one request. |
 | `CLLAMA_FEED_FETCH_TIMEOUT_MS` | `3000` | Per-fetch HTTP timeout for feed providers (sanity range 100–120000; invalid values fall back to default). Raise it when a feed provider computes synchronously under load. |
@@ -411,6 +418,98 @@ One file per agent. Each line is one entry, appended on every successful upstrea
 When orchestrated by Clawdapus, `claw up` automatically bind-mounts `.claw-session-history/` (relative to the pod file) into the cllama container at `/claw/session-history` whenever cllama is enabled for any service in the pod. No manual volume configuration is required.
 
 Session history is infrastructure-owned. Agents do not write to it and have no read API against it in Phase 1. The JSONL files are accessible to operators via the host filesystem for offline analysis and auditing.
+
+## Trace Journal
+
+Session history keeps one line per finished request. The trace journal is an opt-in, durable record of every step of every authenticated request, for operators who must later prove what a model saw and did. Enable it with `CLLAMA_TRACE_JOURNAL=on` (under Clawdapus, through `x-claw.cllama-env` or `cllama-defaults.env`).
+
+### Layout and states
+
+```
+<session-history-dir>/<agent-id>/journal/
+├── <start-unix-nanos>-<request-uuid>.open.jsonl        # being written; never touch
+├── <start-unix-nanos>-<request-uuid>.closed.jsonl      # finished and verifiable
+└── <start-unix-nanos>-<request-uuid>.incomplete.jsonl  # cut off; never complete
+```
+
+There is one segment per client HTTP request. The agent ID is the authenticated bearer identity, and the request UUID is minted by the proxy. Each record is fsynced before the step it describes proceeds. Directories are created 0700 and segments 0600.
+
+- **Open:** the segment is being written by a live request.
+- **Closed:** a `segment_close` record was written, then the file was renamed. A closed segment is never written again.
+- **Incomplete:** the writer failed, or the proxy restarted while the segment was open. At startup cllama takes an exclusive lock on the history directory and renames leftover open segments; it renames, never rewrites. The filename state is the authority, even if an incomplete file happens to contain a close record.
+
+### Records
+
+Every line has `seq` (1-based, contiguous, the ordering authority), `ts` and `type`.
+
+| Type | Fields |
+|---|---|
+| `segment_open` | `schema` (`cllama.trace/v1`), `cllama_version`, `cllama_revision`, `pod`, `agent_id`, `request_id`, `method`, `path`, `requested_model`, `stream`, `client_request`. Written before any provider or tool effect. |
+| `upstream_request` | `call` (one per provider attempt, including retries and fallbacks), `provider`, `model`, `path`, `body` (exactly what was sent, after adapter translation). |
+| `upstream_response` | `call`, `status_code`, `latency_ms`, `duration_ms`, `bytes`, `complete`, `body`, `error`. Exactly one per settled call. |
+| `tool_call` | `call_id` (the model's id), `name`, `service`, `arguments`. Written before the managed tool runs. |
+| `tool_result` | `call_id`, `status_code`, `latency_ms`, `result`, `error`. |
+| `client_response` | `status_code`, `bytes_written`, `body`, `write_error`: what the proxy wrote, not proof the client received it. |
+| `segment_close` | `status` (`ok`, `error`, `client_cancelled`, `client_write_failed`, `revoked`), `record_count`, `truncated`, `complete`, `unsettled_calls`, `sha256` (hex SHA-256 over the exact bytes of every earlier line). |
+
+Results cllama synthesizes without dispatching a tool appear verbatim in the next `upstream_request` body, which is what the model saw.
+
+### What is excluded
+
+- **Headers.** No HTTP headers are recorded.
+- **Known credentials.** Provider keys, agent bearer tokens, the UI and admin token, and managed-tool, memory and feed auth tokens are redacted inside every recorded string, as are values of credential-named fields.
+- **Hidden reasoning.** Thinking blocks and deltas, Responses reasoning items and events, `encrypted_content` and chat reasoning fields are replaced by `{"omitted":"hidden_reasoning"}`. This happens before sizing, so excluded reasoning is never hashed or kept.
+- **Unparseable bodies.** A body or event that cannot be parsed is omitted rather than kept raw, because hidden reasoning in it could not be removed. This includes an interrupted stream.
+- **Deeply nested JSON text.** JSON carried inside strings, such as tool-call arguments, is inspected up to four levels deep. Anything deeper is replaced by `{"omitted":"embedded_json_too_deep"}`, and the segment is marked truncated.
+
+Residual boundary: an unknown secret written into free text by a client, model or tool cannot be detected and may be recorded.
+
+### Completeness and failure
+
+`complete` is true only when nothing was omitted for size or parseability and every provider attempt was settled. A truncated or incomplete segment is never full capture.
+
+The journal fails closed:
+
+- If the open record cannot be written, the request gets 503 before dispatch.
+- If a later record cannot be written, no further provider or tool effect happens. The client gets a 503 if the response has not started, otherwise the stream is cut. The segment becomes incomplete, with no close record or digest.
+
+### Collecting
+
+- Enumerate by full suffix, never a bare `*.jsonl`. Use exact names read from the directory, and reject symlinks and names that do not match the pattern above.
+- Accept a closed segment only if its `seq` is contiguous, `record_count` matches and `sha256` verifies. Then remove exactly that file.
+- Store an incomplete segment as incomplete. Never touch an open segment.
+
+With the journal on, a revocation acknowledgement waits until every registered request handler for that identity has exited, and each handler closes its segment first. After the acknowledgement no new segment can appear for that identity. A run's set of segments is final once the acknowledgement is in hand and no open segment remains. A closed segment proves one request was captured; whole-run completeness is the operator's join of segments with its own run state.
+
+### Whole-run coverage
+
+A closed segment proves that one request was captured. Three more pieces let an operator prove that a whole run was captured:
+
+- **Capture epoch.** Each journal start writes a new random `capture_epoch` to `<session-history-dir>/.trace-journal-epoch.json` (`schema` `cllama.trace.epoch/v1`, `capture_epoch`, `started_at`, `cllama_version`, `cllama_revision`). It is published atomically before cllama serves any request.
+- **Admission sequence.** Every request the revocation fence admits for an agent is numbered as `agent_seq` (1-based per agent per epoch) before its body is read. `segment_open` carries `capture_epoch` and `agent_seq`.
+- **Seal.** After a revocation has drained every handler for the agent, cllama atomically publishes `<agent-id>/journal/seal-<generation>.json` (`schema` `cllama.trace.seal/v1`, `agent_id`, `generation`, `capture_epoch`, `sealed_at`, `requests` N, and `unopened`: a list of `{agent_seq, reason}`). The reasons are `cancelled_before_open`, `body_read_failed` and `journal_open_failed`.
+
+What each piece proves:
+
+- **The acknowledgement.** A 200 acknowledgement proves the revocation and drain. A seal that cannot be written never blocks revocation, but without a valid seal coverage is unverified.
+- **An unopened entry.** It proves the admitted request caused no provider or tool effect. It does not prove that the client's body or the error delivery was captured. Any partial file for that request is still evidence.
+
+Coverage is verified only if all of these hold:
+
+1. The run uses a fresh agent identity that was never used before.
+2. The operator read `capture_epoch` as E before launching the run, so before the identity could be admitted.
+3. After the run is terminal and its revocation acknowledged, `seal-<generation>.json` exists with that agent and generation and with `capture_epoch == E`.
+4. Each k in 1..N is accounted for exactly once by one of:
+   - a closed segment of that agent with `capture_epoch == E`, `agent_seq == k`, and a verifying digest and count, computed over the exact persisted bytes, with integral counts;
+   - a readable incomplete segment for k;
+   - an `unopened` entry with an allowed reason.
+5. No segment for that agent carries a seq outside 1..N, and no open or incomplete segment is left unexplained.
+
+Those checks establish request coverage (`RequestsVerified`). Full trace content (`ContentComplete`) additionally requires every admitted request to have a closed segment with `complete: true`. So any unopened request, incomplete segment or truncated segment means the content is not complete. Request coverage alone never means full trace content.
+
+`tracejournal.VerifyCoverage` is the reference implementation of these checks and reports both flags. A torn segment file with no readable `segment_open` is explained only by a `journal_open_failed` entry that has no other file.
+
+N = 0 with a matching E is a verified empty run. A changed epoch means cllama restarted and admission state may be lost, so coverage is unverified. Old seals and epoch files never stand in for the expected agent, generation and epoch. Request-set coverage is separate from content completeness: redaction, truncation and delivery limits still apply per segment.
 
 ---
 
