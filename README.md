@@ -531,7 +531,12 @@ With `local_retention:none`, new ordinary history entries keep accounting,
 models, status, timestamps and IDs, with `response:{"format":"metadata"}`;
 request/response bodies and tool traces are omitted. New context snapshots,
 cross-request tool continuity, feed content caching and automatic memory retain
-are suppressed. Existing files are preserved. Explicit `CLLAMA_TRACE_JOURNAL=on`
+are suppressed, and so is the optional asynchronous policy `Score` call, which
+carries full request and response content (logged as
+`policy_score_suppressed:local_retention`). The policy sidecar's request and
+response gates and decoration still run: they decide the request, and their data
+flow is operator-owned service processing, outside provider-policy guarantees.
+Existing files are preserved. Explicit `CLLAMA_TRACE_JOURNAL=on`
 is a separate operator opt-in to **journal content only**: it continues to record
 bounded/redacted trace segments even when ordinary content retention is off.
 Revocation and cursor metadata remain available. This policy covers model-provider

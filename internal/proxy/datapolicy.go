@@ -188,6 +188,17 @@ func dataPolicyConstrained(p agentctx.DataPolicy) bool {
 	return p.Training == "none" || p.Retention == "none" || !policyAllowsRegion(p, "global")
 }
 func hasUnscopedFeature(x map[string]any) bool {
+	// OpenRouter enables its hosted web plugin for a ":online" model variant.
+	if model, _ := x["model"].(string); strings.HasSuffix(model, ":online") {
+		return true
+	}
+	if models, ok := x["models"].([]any); ok {
+		for _, m := range models {
+			if name, _ := m.(string); strings.HasSuffix(name, ":online") {
+				return true
+			}
+		}
+	}
 	for _, key := range []string{"mcp_servers", "web_search_options", "plugins"} {
 		if v, present := x[key]; present && v != nil {
 			switch v := v.(type) {

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,8 +12,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mostlydev/cllama/internal/agentctx"
+	"github.com/mostlydev/cllama/internal/logging"
 	"github.com/mostlydev/cllama/internal/provider"
 	"github.com/mostlydev/cllama/internal/sessionhistory"
 )
@@ -521,5 +524,57 @@ func TestDataPolicyExplicitJournalDoesNotEnableOrdinaryContent(t *testing.T) {
 	data, _ := json.Marshal(entries)
 	if bytes.Contains(data, []byte(canary)) || entries[0].Response.Format != "metadata" {
 		t.Fatalf("journal enabled ordinary retention: %s", data)
+	}
+}
+
+func TestDataPolicyRefusesOnlineModelVariant(t *testing.T) {
+	for _, body := range []map[string]any{
+		{"model": "openai/gpt-4o:online"},
+		{"model": "openai/gpt-4o", "models": []any{"anthropic/claude-sonnet-5:online"}},
+	} {
+		if !hasUnscopedFeature(body) {
+			t.Errorf("%v must count as a hosted feature", body)
+		}
+	}
+	if hasUnscopedFeature(map[string]any{"model": "openai/gpt-4o", "models": []any{"x/y"}}) {
+		t.Error("a plain model is not a hosted feature")
+	}
+}
+
+func TestCopyRequestHeadersNeverForwardsCllamaSecret(t *testing.T) {
+	src := http.Header{}
+	src.Set("X-Api-Key", "agent:secret")
+	src.Set("X-Goog-Api-Key", "agent:secret")
+	src.Set("Authorization", "Bearer agent:secret")
+	src.Set("Anthropic-Version", "2023-06-01")
+	dst := http.Header{}
+	copyRequestHeaders(dst, src)
+	for _, k := range []string{"X-Api-Key", "X-Goog-Api-Key", "Authorization"} {
+		if dst.Get(k) != "" {
+			t.Errorf("%s forwarded upstream", k)
+		}
+	}
+	if dst.Get("Anthropic-Version") == "" {
+		t.Error("unrelated headers must still be forwarded in permissive mode")
+	}
+}
+
+func TestPolicyScoreSuppressedWithoutLocalRetention(t *testing.T) {
+	scored := make(chan struct{}, 1)
+	policy := stubPolicyEvaluator{score: func(context.Context, PolicyScoreRequest) error { scored <- struct{}{}; return nil }}
+	h := NewHandler(provider.NewRegistry(""), nil, logging.New(io.Discard), WithPolicyEvaluator(policy))
+	strict := agentctx.DefaultDataPolicy()
+	h.scorePolicyResponse("agent", &agentctx.AgentContext{AgentID: "agent", DataPolicy: &strict}, "openai", "direct", false, "openai/gpt-4o", []byte(`{"secret":"content"}`), 200, http.Header{}, []byte(`{"answer":"content"}`))
+	allowed := &agentctx.AgentContext{AgentID: "agent", DataPolicy: testPermissiveDataPolicy()}
+	h.scorePolicyResponse("agent", allowed, "openai", "direct", false, "openai/gpt-4o", []byte(`{}`), 200, http.Header{}, []byte(`{}`))
+	select {
+	case <-scored:
+	case <-time.After(time.Second):
+		t.Fatal("score must run when local content retention is allowed")
+	}
+	select {
+	case <-scored:
+		t.Fatal("score must not receive content under local_retention none")
+	case <-time.After(100 * time.Millisecond):
 	}
 }

@@ -510,6 +510,13 @@ func (h *Handler) scorePolicyResponse(agentID string, agentCtx *agentctx.AgentCo
 	if !h.policyEnabled(agentCtx) {
 		return
 	}
+	// Scoring is optional and asynchronous, and it carries full request and
+	// response content. Under local_retention none it is skipped; the gates,
+	// which decide the request, still run.
+	if !localContentAllowed(agentCtx) {
+		h.logger.LogIntervention(agentID, requestedModel, "policy_score_suppressed:local_retention")
+		return
+	}
 	req := PolicyScoreRequest{
 		PolicyRequestMeta: h.policyMeta(agentID, agentCtx, format, mode, stream, requestedModel),
 		RequestBody:       string(requestEffective),
@@ -1616,6 +1623,10 @@ func copyRequestHeaders(dst, src http.Header) {
 	for k, vals := range src {
 		if isHopByHopHeader(k) ||
 			strings.EqualFold(k, "Authorization") ||
+			// An Anthropic- or Gemini-format runner authenticates to cllama
+			// with these; never pass the agent's cllama secret upstream.
+			strings.EqualFold(k, "X-Api-Key") ||
+			strings.EqualFold(k, "X-Goog-Api-Key") ||
 			strings.EqualFold(k, "Accept-Encoding") ||
 			strings.EqualFold(k, "X-Claw-Consumer-Session-Epoch") ||
 			strings.EqualFold(k, "X-Cllama-Policy-Origin") {
