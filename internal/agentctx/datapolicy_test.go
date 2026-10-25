@@ -25,3 +25,12 @@ func TestDataPolicyEndpointScope(t *testing.T) {
 		}
 	}
 }
+
+func TestDataPolicyCanonicalizesRegionsWithoutMutatingLoader(t *testing.T) {
+	original := DefaultDataPolicy()
+	original.Regions = []string{"us", "eu", "us"}
+	got, err := (&AgentContext{DataPolicy: &original}).EffectiveDataPolicy()
+	if err != nil || len(got.Regions) != 2 || got.Regions[0] != "eu" || len(original.Regions) != 3 || original.Regions[0] != "us" {
+		t.Fatalf("%+v original=%+v err=%v", got, original, err)
+	}
+}

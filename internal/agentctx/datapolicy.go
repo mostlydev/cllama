@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -66,6 +67,16 @@ func (a *AgentContext) EffectiveDataPolicy() (DataPolicy, error) {
 	if len(p.Regions) == 0 {
 		return p, fmt.Errorf("data_policy regions must not be empty")
 	}
+	// Canonicalize a private copy; caller/loader slices may be shared.
+	p.Regions = append([]string(nil), p.Regions...)
+	sort.Strings(p.Regions)
+	unique := p.Regions[:0]
+	for _, r := range p.Regions {
+		if len(unique) == 0 || unique[len(unique)-1] != r {
+			unique = append(unique, r)
+		}
+	}
+	p.Regions = unique
 	for _, r := range p.Regions {
 		if r == "global" {
 			if len(p.Regions) != 1 {

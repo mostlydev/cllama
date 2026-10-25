@@ -990,7 +990,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 				Err:           err,
 			}
 		}
-		copyRequestHeaders(outReq.Header, r.Header)
+		copyDataPolicyHeaders(outReq.Header, r.Header, requestDataPolicy(ctx))
 		outReq.Header.Set("Content-Type", "application/json")
 		if upstream.Adapter {
 			// The adapter rewrites the reply, so it must arrive uncompressed.
@@ -3743,7 +3743,7 @@ func (h *Handler) recordManagedSuccess(agentID string, agentCtx *agentctx.AgentC
 		Version:           1,
 		Status:            "ok",
 		ClawID:            agentID,
-		TS:                time.Now().UTC().Format(time.RFC3339),
+		TS:                time.Now().UTC().Format(time.RFC3339Nano),
 		Path:              requestPath,
 		RequestedModel:    requestedModel,
 		EffectiveProvider: providerName,
@@ -3797,7 +3797,7 @@ func (h *Handler) recordManagedFailure(agentID string, agentCtx *agentctx.AgentC
 		Version:           1,
 		Status:            "error",
 		ClawID:            agentID,
-		TS:                time.Now().UTC().Format(time.RFC3339),
+		TS:                time.Now().UTC().Format(time.RFC3339Nano),
 		Path:              requestPath,
 		RequestedModel:    requestedModel,
 		EffectiveProvider: providerName,

@@ -39,7 +39,9 @@ func metadataHistory(a *agentctx.AgentContext, e sessionhistory.Entry) sessionhi
 	e.ToolTrace = nil
 	e.Response = sessionhistory.Payload{Format: "metadata"}
 	e.ID = ""
-	e.TS = time.Now().UTC().Format(time.RFC3339Nano)
+	if e.TS == "" {
+		e.TS = time.Now().UTC().Format(time.RFC3339Nano)
+	}
 	return e
 }
 
@@ -181,17 +183,73 @@ func hasRetentionIneligibleModel(body map[string]any) bool {
 	return false
 }
 
-// Stateful provider features must be deliberately enabled by the operator,
-// not smuggled in by an untrusted request or a later adapter retry.
-func hasPersistentFeature(x map[string]any) bool {
+// An untrusted caller cannot widen the processor chain through hosted tools.
+func dataPolicyConstrained(p agentctx.DataPolicy) bool {
+	return p.Training == "none" || p.Retention == "none" || !policyAllowsRegion(p, "global")
+}
+func hasUnscopedFeature(x map[string]any) bool {
+	for _, key := range []string{"mcp_servers", "web_search_options", "plugins"} {
+		if v, present := x[key]; present && v != nil {
+			switch v := v.(type) {
+			case []any:
+				if len(v) > 0 {
+					return true
+				}
+			case map[string]any:
+				return true
+			default:
+				return true
+			}
+		}
+	}
+	if tools, ok := x["tools"].([]any); ok {
+		for _, raw := range tools {
+			if tool, ok := raw.(map[string]any); ok {
+				typ, _ := tool["type"].(string)
+				if typ != "" && typ != "function" && typ != "custom" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// Short-lived Anthropic KV caches are documented as ZDR-eligible. Longer or
+// unknown cache markers require an explicit retention relaxation.
+func safeShortCache(v any, allow bool) bool {
+	if v == nil {
+		return true
+	}
+	if !allow {
+		return false
+	}
+	m, ok := v.(map[string]any)
+	if !ok || m["type"] != "ephemeral" {
+		return false
+	}
+	for key := range m {
+		if key != "type" && key != "ttl" {
+			return false
+		}
+	}
+	ttl, present := m["ttl"]
+	return !present || ttl == "5m"
+}
+
+func hasPersistentFeature(x map[string]any, allowShortCache bool) bool {
 	for k, val := range x {
 		switch k {
 		case "background", "store", "store_messages":
 			if val != nil && val != false {
 				return true
 			}
-		case "previous_response_id", "conversation", "container", "file_id", "cached_content", "cachedContent", "cache_control":
+		case "previous_response_id", "conversation", "container", "file_id", "cached_content", "cachedContent":
 			if val != nil && val != "" {
+				return true
+			}
+		case "cache_control":
+			if !safeShortCache(val, allowShortCache) {
 				return true
 			}
 		case "prompt_cache_retention":
@@ -202,41 +260,62 @@ func hasPersistentFeature(x map[string]any) bool {
 			if val != nil {
 				return true
 			}
-		case "tools":
-			if tools, ok := val.([]any); ok {
-				for _, raw := range tools {
-					if t, ok := raw.(map[string]any); ok {
-						typ, _ := t["type"].(string)
-						if typ != "" && typ != "function" && typ != "custom" {
-							return true
-						}
-					}
-				}
+		}
+	}
+	// Provider-specific options are controls, not business tool arguments.
+	if opts, ok := x["providerOptions"].(map[string]any); ok {
+		for _, raw := range opts {
+			if m, ok := raw.(map[string]any); ok && hasPersistentFeature(m, allowShortCache) {
+				return true
 			}
 		}
 	}
-	// Only walk provider content structures, never client tool schemas or
-	// arguments whose business fields may legitimately be named "store".
-	return hasStoredContent(x["messages"]) || hasStoredContent(x["system"]) || hasStoredContent(x["input"])
+	// Never descend tool schemas/arguments: a business property may be named store.
+	for _, key := range []string{"messages", "system", "input", "tools"} {
+		if hasStoredContent(x[key], allowShortCache) {
+			return true
+		}
+	}
+	return false
 }
-
-func hasStoredContent(v any) bool {
+func hasStoredContent(v any, allowShortCache bool) bool {
 	switch x := v.(type) {
 	case []any:
 		for _, v := range x {
-			if hasStoredContent(v) {
+			if hasStoredContent(v, allowShortCache) {
 				return true
 			}
 		}
 	case map[string]any:
-		for _, k := range []string{"file_id", "cache_control", "cached_content", "cachedContent"} {
+		for _, k := range []string{"file_id", "cached_content", "cachedContent"} {
 			if v, present := x[k]; present && v != nil && v != "" {
 				return true
 			}
 		}
-		return hasStoredContent(x["content"])
+		if v, present := x["cache_control"]; present && !safeShortCache(v, allowShortCache) {
+			return true
+		}
+		for _, k := range []string{"content", "source", "file"} {
+			if hasStoredContent(x[k], allowShortCache) {
+				return true
+			}
+		}
 	}
 	return false
+}
+
+// Caller account selectors, credentials and experimental controls must not
+// invalidate assurances about the key's configured account.
+func copyDataPolicyHeaders(dst, src http.Header, p agentctx.DataPolicy) {
+	if !dataPolicyConstrained(p) {
+		copyRequestHeaders(dst, src)
+		return
+	}
+	for _, key := range []string{"Accept", "Content-Type", "Anthropic-Version"} {
+		for _, v := range src.Values(key) {
+			dst.Add(key, v)
+		}
+	}
 }
 
 // enforceProviderDataPolicy acts on the final wire body, after translation,
@@ -256,8 +335,36 @@ func enforceProviderDataPolicy(p agentctx.DataPolicy, prov *provider.Provider, u
 	if p.Retention == "none" && hasRetentionIneligibleModel(body) {
 		return upstream, denyData("retention_model")
 	}
-	if p.Retention == "none" && hasPersistentFeature(body) {
+	if prov.Name == "vercel" && dataPolicyConstrained(p) {
+		if raw, present := body["providerOptions"]; present {
+			opts, ok := raw.(map[string]any)
+			if !ok {
+				return upstream, denyData("provider_preferences")
+			}
+			for name, raw := range opts {
+				gateway, ok := raw.(map[string]any)
+				if name != "gateway" || !ok {
+					return upstream, denyData("provider_preferences")
+				}
+				for key := range gateway {
+					if key != "zeroDataRetention" {
+						return upstream, denyData("provider_preferences")
+					}
+				}
+			}
+		}
+	}
+	if dataPolicyConstrained(p) && hasUnscopedFeature(body) {
+		return upstream, denyData("processor_feature")
+	}
+	if p.Retention == "none" && hasPersistentFeature(body, prov.Name == "anthropic" && upstream.Path == "/v1/messages") {
 		return upstream, denyData("retention_feature")
+	}
+	if prov.Name == "openrouter" && !policyAllowsRegion(p, "global") && region != "" {
+		if !guarantees["processing:"+region] {
+			return upstream, denyData("processing_region")
+		}
+		regionMode = "attested"
 	}
 	if !policyAllowsRegion(p, "global") {
 		if region != "" {
@@ -272,10 +379,18 @@ func enforceProviderDataPolicy(p agentctx.DataPolicy, prov *provider.Provider, u
 			region = "us"
 		} else {
 			regionMode = "attested"
-			for _, r := range p.Regions {
-				if guarantees["processing:"+r] {
-					region = r
-					break
+			if geo, present := body["inference_geo"]; present {
+				value, ok := geo.(string)
+				if !ok || !policyAllowsRegion(p, value) || !guarantees["processing:"+value] {
+					return upstream, denyData("processing_region")
+				}
+				region = value
+			} else {
+				for _, r := range p.Regions {
+					if guarantees["processing:"+r] {
+						region = r
+						break
+					}
 				}
 			}
 			if region == "" {
@@ -321,8 +436,8 @@ func enforceProviderDataPolicy(p agentctx.DataPolicy, prov *provider.Provider, u
 			}
 			prefs["zdr"] = true
 			if official {
-				retentionOK = true
-				retentionMode = "enforced"
+				retentionOK = guarantees["zero-data-retention"]
+				retentionMode = "attested"
 			}
 		}
 		body["provider"] = prefs
@@ -351,8 +466,8 @@ func enforceProviderDataPolicy(p agentctx.DataPolicy, prov *provider.Provider, u
 		opts["gateway"] = gateway
 		body["providerOptions"] = opts
 		if official {
-			retentionOK = true
-			retentionMode = "enforced"
+			retentionOK = guarantees["zero-data-retention"]
+			retentionMode = "attested"
 		}
 	}
 	if !trainingOK {
@@ -379,6 +494,20 @@ func enforceProviderDataPolicy(p agentctx.DataPolicy, prov *provider.Provider, u
 	if policyAllowsRegion(p, "global") {
 		regionMode = "allowed"
 		region = "global"
+	}
+	if official && prov.Name == "openrouter" {
+		if p.Training == "none" {
+			mutations = append(mutations, "data_policy_control:openrouter:data_collection_deny")
+		}
+		if p.Retention == "none" {
+			mutations = append(mutations, "data_policy_control:openrouter:zdr")
+		}
+		if !policyAllowsRegion(p, "global") && region != "" {
+			mutations = append(mutations, "data_policy_control:openrouter:regional_"+region)
+		}
+	}
+	if official && prov.Name == "vercel" && p.Retention == "none" {
+		mutations = append(mutations, "data_policy_control:vercel:zero_data_retention")
 	}
 	mutations = append(mutations, "data_policy_processing:"+prov.Name+":"+regionMode+":"+region, "data_policy_training:"+prov.Name+":"+trainingMode, "data_policy_retention:"+prov.Name+":"+retentionMode)
 	upstream.Mutations = mutations

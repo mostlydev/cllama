@@ -29,7 +29,7 @@ func policyForEndpoint(name, endpoint, region string) agentctx.DataPolicy {
 }
 
 func TestDataPolicyAdapterControlsAndScope(t *testing.T) {
-	base := agentctx.DefaultDataPolicy()
+	base := policyForEndpoint("openrouter", "https://us.openrouter.ai/api/v1", "us")
 	cases := []struct {
 		name, endpoint, path, model string
 		p                           agentctx.DataPolicy
@@ -171,7 +171,7 @@ func TestDataPolicyControlReachesActualWireBody(t *testing.T) {
 	defer srv.Close()
 	reg := provider.NewRegistry("")
 	reg.Set("openrouter", &provider.Provider{BaseURL: "https://us.openrouter.ai/api/v1", APIKey: "provider-key"})
-	p := agentctx.DefaultDataPolicy()
+	p := policyForEndpoint("openrouter", "", "us")
 	h := NewHandler(reg, dataPolicyLoader(&p), nil)
 	target, _ := url.Parse(srv.URL)
 	h.client.Transport = policyRoundTrip(func(r *http.Request) (*http.Response, error) {
@@ -241,6 +241,9 @@ func TestDataPolicyManagedAdapterRoundsAndStream(t *testing.T) {
 				var hits int
 				backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					hits++
+					if r.Header.Get("OpenAI-Project") != "" || r.Header.Get("Anthropic-Beta") != "" {
+						t.Error("caller account/beta header leaked in managed round")
+					}
 					var body map[string]any
 					json.NewDecoder(r.Body).Decode(&body)
 					w.Header().Set("Content-Type", "application/json")
@@ -289,6 +292,8 @@ func TestDataPolicyManagedAdapterRoundsAndStream(t *testing.T) {
 				})
 				req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(fmt.Sprintf(`{"model":%q,"stream":%v,"messages":[{"role":"user","content":"synthetic"}]}`, name+"/"+model, stream)))
 				req.Header.Set("Authorization", "Bearer policy-agent:secret")
+				req.Header.Set("OpenAI-Project", "untrusted-project")
+				req.Header.Set("Anthropic-Beta", "mcp-client-untrusted")
 				w := httptest.NewRecorder()
 				h.ServeHTTP(w, req)
 				if w.Code != 200 || hits != 2 || !strings.Contains(w.Body.String(), "done") {
@@ -384,5 +389,137 @@ func TestDataPolicyReappliesOnFormatRetry(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != 200 || len(paths) != 2 || paths[0] != "/v1/chat/completions" || paths[1] != "/v1/responses" {
 		t.Fatalf("%d %v: %s", w.Code, paths, w.Body.String())
+	}
+}
+
+func TestDataPolicyRefusesUnvettedProviderFeatures(t *testing.T) {
+	for _, spec := range []struct{ name, path, body string }{
+		{"anthropic", "/v1/messages", `{"model":"claude-sonnet-5-5","mcp_servers":[{"type":"url","url":"https://third-party.invalid"}]}`},
+		{"openai", "/v1/chat/completions", `{"web_search_options":{}}`},
+		{"openrouter", "/v1/chat/completions", `{"plugins":[{"id":"web"}]}`},
+		{"openai", "/v1/chat/completions", `{"messages":[{"role":"user","content":[{"type":"file","file":{"file_id":"stored-id"}}]}]}`},
+		{"anthropic", "/v1/messages", `{"messages":[{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"stored-id"}}]}]}`},
+		{"anthropic", "/v1/messages", `{"tools":[{"name":"lookup","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"1h"}}]}`},
+		{"vercel", "/v1/chat/completions", `{"providerOptions":{"openai":{"store":true}}}`},
+		{"vercel", "/v1/chat/completions", `{"providerOptions":{"gateway":{"credentials":{"apiKey":"untrusted"}}}}`},
+	} {
+		t.Run(spec.name+spec.body, func(t *testing.T) {
+			endpoint := "https://custom.example/v1"
+			p := policyForEndpoint(spec.name, endpoint, "us")
+			_, err := enforceProviderDataPolicy(p, &provider.Provider{Name: spec.name, BaseURL: endpoint}, upstreamEncoding{Path: spec.path, Body: []byte(spec.body)})
+			if err == nil {
+				t.Fatal("unvetted feature accepted")
+			}
+		})
+	}
+	// An unrelated business schema property must not be read as a provider flag.
+	raw := `{"tools":[{"name":"lookup","input_schema":{"type":"object","properties":{"cache_control":{"type":"object"},"file_id":{"type":"string"}}},"cache_control":{"type":"ephemeral","ttl":"5m"}}]}`
+	p := policyForEndpoint("anthropic", "https://api.anthropic.com/v1", "us")
+	for _, ttl := range []string{"5m", "1h", "unknown"} {
+		_, err := enforceProviderDataPolicy(p, &provider.Provider{Name: "anthropic", BaseURL: "https://api.anthropic.com/v1"}, upstreamEncoding{Path: "/v1/messages", Body: []byte(strings.ReplaceAll(raw, "5m", ttl))})
+		if (err == nil) != (ttl == "5m") {
+			t.Fatalf("ttl=%s err=%v", ttl, err)
+		}
+	}
+}
+
+func TestDataPolicyHeadersAndQueriesCannotSelectAnotherAccount(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		for _, key := range []string{"OpenAI-Project", "OpenAI-Organization", "X-Goog-User-Project", "X-Goog-Api-Key", "X-Api-Key", "Anthropic-Beta", "Cookie"} {
+			if r.Header.Get(key) != "" {
+				t.Errorf("caller override forwarded: %s", key)
+			}
+		}
+		if r.Header.Get("Authorization") != "Bearer trusted-pool-key" {
+			t.Errorf("wrong auth %q", r.Header.Get("Authorization"))
+		}
+		io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer srv.Close()
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{BaseURL: srv.URL + "/v1", APIKey: "trusted-pool-key"})
+	p := policyForEndpoint("openai", srv.URL+"/v1", "us")
+	h := NewHandler(reg, dataPolicyLoader(&p), nil)
+	for _, query := range []string{"", "?key=caller-secret", "?OpenAI-Project=other", "?"} {
+		before := hits.Load()
+		r := httptest.NewRequest("POST", "/v1/chat/completions"+query, strings.NewReader(`{"model":"openai/gpt-4.1","messages":[]}`))
+		r.Header.Set("Authorization", "Bearer policy-agent:secret")
+		for _, key := range []string{"OpenAI-Project", "OpenAI-Organization", "X-Goog-User-Project", "X-Goog-Api-Key", "X-Api-Key", "Anthropic-Beta", "Cookie"} {
+			r.Header.Set(key, "untrusted")
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if query == "" {
+			if w.Code != 200 || hits.Load() != before+1 {
+				t.Fatalf("%d: %s", w.Code, w.Body.String())
+			}
+		} else if w.Code != 400 || hits.Load() != before || strings.Contains(w.Body.String(), "caller-secret") {
+			t.Fatalf("query escaped: %d %s", w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestDataPolicyGatewayRequiresAccountEvidence(t *testing.T) {
+	cases := []struct{ name, url, guarantee string }{
+		{"openrouter", "https://us.openrouter.ai/api/v1", "processing:us"},
+		{"openrouter", "https://us.openrouter.ai/api/v1", "zero-data-retention"},
+		{"vercel", "https://ai-gateway.vercel.sh/v1", "zero-data-retention"},
+	}
+	for _, tc := range cases {
+		p := policyForEndpoint(tc.name, "", "us")
+		var filtered []string
+		for _, g := range p.Attestations[0].Guarantees {
+			if g != tc.guarantee {
+				filtered = append(filtered, g)
+			}
+		}
+		p.Attestations[0].Guarantees = filtered
+		if _, err := enforceProviderDataPolicy(p, &provider.Provider{Name: tc.name, BaseURL: tc.url}, upstreamEncoding{Path: "/v1/chat/completions", Body: []byte(`{"model":"m"}`)}); err == nil {
+			t.Fatalf("%s accepted without %s", tc.name, tc.guarantee)
+		}
+	}
+}
+func TestDataPolicyAttestedAllowedRegionSelection(t *testing.T) {
+	p := policyForEndpoint("anthropic", "https://custom.example/v1", "eu")
+	p.Attestations[0].Guarantees = append(p.Attestations[0].Guarantees, "processing:us")
+	for _, geo := range []string{"us", "eu", "jp", "global"} {
+		_, err := enforceProviderDataPolicy(p, &provider.Provider{Name: "anthropic", BaseURL: "https://custom.example/v1"}, upstreamEncoding{Path: "/v1/messages", Body: []byte(`{"model":"m","inference_geo":"` + geo + `"}`)})
+		if (err == nil) != (geo == "us" || geo == "eu") {
+			t.Fatalf("%s: %v", geo, err)
+		}
+	}
+}
+
+func TestDataPolicyExplicitJournalDoesNotEnableOrdinaryContent(t *testing.T) {
+	const canary = "journal-only-synthetic-canary"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer srv.Close()
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{BaseURL: srv.URL + "/v1", APIKey: "provider-key"})
+	p := policyForEndpoint("openai", srv.URL+"/v1", "us")
+	journal, dir := newTestJournal(t, nil)
+	h := NewHandler(reg, dataPolicyLoader(&p), nil, WithSessionHistory(dir), WithTraceJournal(journal))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"openai/gpt-4.1","messages":[{"role":"user","content":"`+canary+`"}]}`))
+	req.Header.Set("Authorization", "Bearer policy-agent:secret")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	_, raw := verifiedSegment(t, dir, "policy-agent")
+	if !bytes.Contains(raw, []byte(canary)) {
+		t.Fatal("explicit journal did not capture content")
+	}
+	entries, err := sessionhistory.ReadEntries(dir, "policy-agent", nil, 10)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("%v %v", entries, err)
+	}
+	data, _ := json.Marshal(entries)
+	if bytes.Contains(data, []byte(canary)) || entries[0].Response.Format != "metadata" {
+		t.Fatalf("journal enabled ordinary retention: %s", data)
 	}
 }

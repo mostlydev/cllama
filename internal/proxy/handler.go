@@ -641,6 +641,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, http.StatusBadRequest, "invalid data policy", agentID, "", start, nil)
 		return
 	}
+	if dataPolicyConstrained(policy) && (r.URL.RawQuery != "" || r.URL.ForceQuery) {
+		h.fail(w, http.StatusBadRequest, "data policy requirement not established: request_query", agentID, "", start, nil)
+		return
+	}
 	copyCtx := *ctx
 	copyCtx.DataPolicy = &policy
 	ctx = &copyCtx
@@ -965,7 +969,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			h.fail(w, http.StatusBadGateway, "failed to create upstream request", agentID, requestedModel, start, err)
 			return false, sawCooldown, ""
 		}
-		copyRequestHeaders(outReq.Header, r.Header)
+		copyDataPolicyHeaders(outReq.Header, r.Header, requestDataPolicy(r.Context()))
 		outReq.Header.Set("Content-Type", "application/json")
 		if upstream.Adapter {
 			// The adapter rewrites the body, so it must be able to read it.
@@ -976,7 +980,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		}
 
 		// Forward Anthropic-specific headers for the Anthropic path.
-		if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+		if strings.HasPrefix(r.URL.Path, "/v1/messages") && !dataPolicyConstrained(requestDataPolicy(r.Context())) {
 			for _, hdr := range []string{"Anthropic-Version", "Anthropic-Beta"} {
 				if v := r.Header.Get(hdr); v != "" {
 					outReq.Header.Set(hdr, v)
@@ -1449,7 +1453,7 @@ func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext
 		entry := sessionhistory.Entry{
 			Version:           1,
 			ClawID:            agentID,
-			TS:                start.UTC().Format(time.RFC3339),
+			TS:                start.UTC().Format(time.RFC3339Nano),
 			Path:              requestPath,
 			RequestedModel:    requestedModel,
 			EffectiveProvider: providerName,
