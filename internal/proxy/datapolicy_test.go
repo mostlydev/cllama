@@ -531,12 +531,15 @@ func TestDataPolicyRefusesOnlineModelVariant(t *testing.T) {
 	for _, body := range []map[string]any{
 		{"model": "openai/gpt-4o:online"},
 		{"model": "openai/gpt-4o", "models": []any{"anthropic/claude-sonnet-5:online"}},
+		{"model": "openai/gpt-4o:online:nitro"},
+		{"model": "openai/gpt-4o:nitro:ONLINE"},
+		{"model": "openai/gpt-4o", "models": []any{"x/y:floor:online:nitro"}},
 	} {
 		if !hasUnscopedFeature(body) {
 			t.Errorf("%v must count as a hosted feature", body)
 		}
 	}
-	if hasUnscopedFeature(map[string]any{"model": "openai/gpt-4o", "models": []any{"x/y"}}) {
+	if hasUnscopedFeature(map[string]any{"model": "openai/gpt-4o:nitro", "models": []any{"x/y:floor", "online/model"}}) {
 		t.Error("a plain model is not a hosted feature")
 	}
 }

@@ -187,14 +187,25 @@ func hasRetentionIneligibleModel(body map[string]any) bool {
 func dataPolicyConstrained(p agentctx.DataPolicy) bool {
 	return p.Training == "none" || p.Retention == "none" || !policyAllowsRegion(p, "global")
 }
+func onlineModelVariant(model string) bool {
+	parts := strings.Split(model, ":")
+	for _, suffix := range parts[1:] {
+		if strings.EqualFold(strings.TrimSpace(suffix), "online") {
+			return true
+		}
+	}
+	return false
+}
+
 func hasUnscopedFeature(x map[string]any) bool {
-	// OpenRouter enables its hosted web plugin for a ":online" model variant.
-	if model, _ := x["model"].(string); strings.HasSuffix(model, ":online") {
+	// OpenRouter enables its hosted web plugin for an "online" model variant;
+	// variant suffixes combine in any order (model:online:nitro).
+	if model, _ := x["model"].(string); onlineModelVariant(model) {
 		return true
 	}
 	if models, ok := x["models"].([]any); ok {
 		for _, m := range models {
-			if name, _ := m.(string); strings.HasSuffix(name, ":online") {
+			if name, _ := m.(string); onlineModelVariant(name) {
 				return true
 			}
 		}

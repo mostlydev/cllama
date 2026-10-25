@@ -643,6 +643,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, http.StatusForbidden, "invalid agent secret", agentID, "", start, err)
 		return
 	}
+	requestCtx, finishRequest, err := h.revocations.register(r.Context(), agentID)
+	if err != nil {
+		if !errors.Is(err, errAgentRevoked) {
+			h.logger.LogError(agentID, "", http.StatusServiceUnavailable, 0, fmt.Errorf("revocation storage unavailable at %s", h.revocations.dir))
+			h.fail(w, http.StatusServiceUnavailable, "agent admission unavailable", agentID, "", start, nil)
+		} else {
+			h.fail(w, http.StatusForbidden, "agent admission closed", agentID, "", start, nil)
+		}
+		return
+	}
+	defer func() { finishRequest(); h.clearRevokedSnapshot(agentID) }()
+	r = r.WithContext(requestCtx)
+	// Every authenticated, admitted request is traced, including data-policy
+	// refusals, so a coverage seal accounts for it.
+	seg, tw, r, ok := h.beginTrace(w, r, agentID, secret, ctx, start)
+	if !ok {
+		return
+	}
+	if seg != nil {
+		w = tw
+		defer h.finishTrace(seg, tw, r, agentID)
+	}
 	policy, policyErr := ctx.EffectiveDataPolicy()
 	if policyErr != nil {
 		h.fail(w, http.StatusBadRequest, "invalid data policy", agentID, "", start, nil)
@@ -655,31 +677,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	copyCtx := *ctx
 	copyCtx.DataPolicy = &policy
 	ctx = &copyCtx
-	requestCtx, finishRequest, err := h.revocations.register(r.Context(), agentID)
-	if err != nil {
-		if !errors.Is(err, errAgentRevoked) {
-			h.logger.LogError(agentID, "", http.StatusServiceUnavailable, 0, fmt.Errorf("revocation storage unavailable at %s", h.revocations.dir))
-			h.fail(w, http.StatusServiceUnavailable, "agent admission unavailable", agentID, "", start, nil)
-		} else {
-			h.fail(w, http.StatusForbidden, "agent admission closed", agentID, "", start, nil)
-		}
-		return
-	}
-	defer func() { finishRequest(); h.clearRevokedSnapshot(agentID) }()
-	requestCtx = context.WithValue(requestCtx, dataPolicyKey{}, policy)
+	// Derive from the traced request context so the journal segment survives.
+	r = r.WithContext(context.WithValue(r.Context(), dataPolicyKey{}, policy))
 	if !localContentAllowed(ctx) {
 		h.snapshots.Delete(agentID)
 		h.managedTurns.forget(agentID)
 		h.managedAnthropicTurns.forget(agentID)
-	}
-	r = r.WithContext(requestCtx)
-	seg, tw, r, ok := h.beginTrace(w, r, agentID, secret, ctx, start)
-	if !ok {
-		return
-	}
-	if seg != nil {
-		w = tw
-		defer h.finishTrace(seg, tw, r, agentID)
 	}
 	if h.policyEnabled(ctx) {
 		inBody, err := io.ReadAll(r.Body)
