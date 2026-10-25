@@ -8,8 +8,10 @@ import (
 // These exact model families and dated snapshots are documented by OpenAI.
 // Avoid guessing capabilities for an unknown sibling or an OpenAI-compatible
 // gateway merely because its model name happens to contain "gpt-6".
+// gpt-5.6-terra is listed because it rejected temperature on Responses at
+// effort high; its gpt-5.6 siblings stay out until there is evidence.
 func openAIReasoningFamily(model string) string {
-	for _, family := range []string{"gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"} {
+	for _, family := range []string{"gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra"} {
 		if model == family {
 			return family
 		}
@@ -40,7 +42,8 @@ func normalizeOpenAIResponses(candidate dispatchCandidate, translated map[string
 	}
 	reasoning, _ := translated["reasoning"].(map[string]any)
 	effort, _ := reasoning["effort"].(string)
-	if effort == "minimal" || (effort == "none" && (family == "gpt-6.1-sol" || family == "gpt-6-astra")) {
+	gpt6 := strings.HasPrefix(family, "gpt-6")
+	if gpt6 && (effort == "minimal" || (effort == "none" && (family == "gpt-6.1-sol" || family == "gpt-6-astra"))) {
 		return nil, &responsesAdapterRequestError{message: "reasoning_effort is not supported for the selected OpenAI model"}
 	}
 	if openAIModelAcceptsSampling(family, effort) {
