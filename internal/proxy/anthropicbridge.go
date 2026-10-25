@@ -127,7 +127,17 @@ func chatToAnthropicRequest(payload map[string]any) (map[string]any, []string, e
 			if enabled, ok := value.(bool); value != nil && (!ok || enabled) {
 				return nil, nil, anthropicAdapterError("anthropic adapter: logprobs is not supported")
 			}
-		case "top_logprobs", "seed", "reasoning_effort", "modalities", "audio", "prediction", "web_search_options", "functions", "function_call":
+		case "reasoning_effort":
+			// Anthropic's effort has no none or minimal level; reject them
+			// rather than run the caller at a different effort.
+			if value != nil {
+				effort, _ := value.(string)
+				if effort != "low" && effort != "medium" && effort != "high" {
+					return nil, nil, anthropicAdapterError("anthropic adapter: reasoning_effort must be low, medium or high")
+				}
+				out["output_config"] = map[string]any{"effort": effort}
+			}
+		case "top_logprobs", "seed", "modalities", "audio", "prediction", "web_search_options", "functions", "function_call":
 			if value != nil {
 				return nil, nil, anthropicAdapterError("anthropic adapter: %s is not supported", key)
 			}

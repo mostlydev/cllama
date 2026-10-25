@@ -127,6 +127,8 @@ docker run -p 8080:8080 -p 8081:8081 \
 | `GOOGLE_BASE_URL` | | Override for Google's OpenAI-compatible base URL |
 | `AI_GATEWAY_API_KEY` | | Vercel AI Gateway provider key override |
 | `AI_GATEWAY_BASE_URL` | `https://ai-gateway.vercel.sh/v1` | Override for Vercel AI Gateway's OpenAI-compatible base URL |
+| `META_API_KEY` | | Meta (`meta/<model>`, e.g. `meta/muse-spark-1.3`) provider key override |
+| `META_BASE_URL` | `https://api.meta.ai/v1` | Override for Meta's OpenAI-compatible base URL |
 
 Environment variables override keys saved via the web UI.
 
@@ -318,8 +320,10 @@ base64 data URLs), function tools, tool calls and tool results, `tool_choice`,
 the cache split preserved (`prompt_tokens_details.cached_tokens` and
 `cache_write_tokens`). Requests whose semantics Anthropic cannot honour, such as
 `response_format` JSON modes, audio or file parts, `n > 1`, `logprobs`,
-penalties, `seed`, `logit_bias`, `reasoning_effort` or unknown fields, are
-rejected with a 400 instead of being silently dropped.
+penalties, `seed`, `logit_bias` or unknown fields, are rejected with a 400
+instead of being silently dropped. `reasoning_effort` `low`, `medium` or `high`
+maps to Anthropic's `output_config.effort`; `none` and `minimal`, which have no
+Anthropic equivalent, are rejected rather than changed.
 
 Three request rewrites are logged as their own intervention events:
 

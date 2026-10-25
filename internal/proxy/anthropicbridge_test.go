@@ -440,3 +440,32 @@ func TestChatToAnthropicRequestForwardsToolResultImages(t *testing.T) {
 		t.Fatalf("tool result must keep text and image parts: %#v", result)
 	}
 }
+
+func TestChatToAnthropicRequestMapsReasoningEffort(t *testing.T) {
+	messages := []any{map[string]any{"role": "user", "content": "hi"}}
+	for _, effort := range []string{"low", "medium", "high"} {
+		out, _, err := chatToAnthropicRequest(map[string]any{"model": "claude-sonnet-5-5", "reasoning_effort": effort, "messages": messages})
+		if err != nil {
+			t.Fatalf("%s: %v", effort, err)
+		}
+		config, _ := out["output_config"].(map[string]any)
+		if config["effort"] != effort {
+			t.Errorf("%s: output_config = %#v", effort, out["output_config"])
+		}
+		if _, ok := out["reasoning_effort"]; ok {
+			t.Errorf("%s: chat reasoning_effort leaked upstream", effort)
+		}
+	}
+	for _, effort := range []any{"none", "minimal", "xhigh", 3} {
+		if _, _, err := chatToAnthropicRequest(map[string]any{"model": "claude-sonnet-5-5", "reasoning_effort": effort, "messages": messages}); err == nil {
+			t.Errorf("%v: unsupported effort must be rejected, not changed", effort)
+		}
+	}
+	out, _, err := chatToAnthropicRequest(map[string]any{"model": "claude-sonnet-5-5", "reasoning_effort": nil, "messages": messages})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := out["output_config"]; ok {
+		t.Error("null effort must leave the model default")
+	}
+}
