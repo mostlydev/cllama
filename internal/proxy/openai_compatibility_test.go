@@ -19,6 +19,10 @@ func TestCurrentOpenAIWorkerEncoding(t *testing.T) {
 		{"gpt-6-sol", "high", false, false},
 		{"gpt-6.1-sol", "none", false, true},
 		{"gpt-6-astra", "minimal", false, true},
+		{"gpt-5.6-terra", "high", false, false},
+		{"gpt-5.6-terra-2026-09-15", "high", false, false},
+		{"gpt-5.6-terra", "none", false, false},
+		{"gpt-5.6-terra", "minimal", false, false},
 	} {
 		t.Run(tc.model+"/"+tc.effort, func(t *testing.T) {
 			payload := map[string]any{"model": tc.model, "messages": []any{map[string]any{"role": "user", "content": "synthetic"}}, "max_tokens": 32768, "temperature": 0.7, "top_p": 0.9}
@@ -66,6 +70,11 @@ func TestCurrentOpenAICapabilityScope(t *testing.T) {
 	for _, model := range []string{"gpt-6.1-solitude", "gpt-6-unknown", "gpt-6.1-sol-pro", "gpt-6.1-sol-2026-99-99"} {
 		if responsesAPIRequired("openai", model) {
 			t.Errorf("unknown sibling matched: %s", model)
+		}
+	}
+	for _, model := range []string{"gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra-mini", "gpt-5.6-terra-2026-99-99"} {
+		if openAIReasoningFamily(model) != "" {
+			t.Errorf("sampling family guessed for %s", model)
 		}
 	}
 	t.Setenv(EnvResponsesAPIModels, "other/gpt-6.1-sol")

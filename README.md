@@ -297,6 +297,10 @@ adapter maps `max_tokens`/`max_completion_tokens` to `max_output_tokens`.
 See the [official OpenAI model guide](https://developers.openai.com/api/docs/guides/latest-model)
 for the API restrictions. Both direct and managed-tool rounds use these rules.
 
+`gpt-5.6-terra` and its dated snapshots also drop `temperature` and `top_p`
+with the same intervention, at every reasoning effort: Terra rejects
+temperature on Responses. The GPT6 effort rejections do not apply to Terra.
+
 ### Anthropic Messages adapter
 
 Runners that speak only OpenAI chat/completions (PicoClaw, for one) can use an
