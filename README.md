@@ -515,9 +515,9 @@ stronger guarantees than the selected service offers.
 Checks run on the final wire body, after translation, for every key attempt,
 format retry and model/provider fallback. A requirement without evidence returns
 HTTP 400 with fixed `data policy requirement not established: <dimension>` text,
-before that dispatch. Provider redirects and caller query strings are refused
-under constrained policy. Only Accept, Content-Type and Anthropic-Version caller
-headers are forwarded before trusted authentication/adapter headers are applied;
+before that dispatch. Provider redirects are always refused. Under constrained
+policy, caller query strings are refused, and only Accept, Content-Type and
+Anthropic-Version caller headers are forwarded before trusted authentication/adapter headers are applied;
 account selectors, alternative credentials and beta headers cannot change the
 attested account. Unsupported Vercel providerOptions are refused. Audit interventions record
 `data_policy_processing:<provider>:<enforced|attested|allowed>:<region>`,
