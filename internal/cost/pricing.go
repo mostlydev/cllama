@@ -90,12 +90,16 @@ func DefaultPricing() *Pricing {
 	claudeSonnet5 := Rate{InputPerMTok: 3.0, OutputPerMTok: 15.0}
 	claudeHaiku45 := Rate{InputPerMTok: 1.0, OutputPerMTok: 5.0}
 	gemini36Flash := Rate{InputPerMTok: 1.50, OutputPerMTok: 7.50}
+	// Gemini 3.8 Flash lists 0.75/3.75 through 2026-12-31 and 1.50/7.50 from
+	// 2027-01-01. Use the later rate as the static ceiling, as for Sonnet 5.
+	gemini38Flash := Rate{InputPerMTok: 1.50, OutputPerMTok: 7.50}
 
 	return &Pricing{rates: map[string]map[string]Rate{
 		"anthropic": {
 			"claude-fable-5":    claudeFable5,
 			"claude-opus-5":     claudeOpus5,
 			"claude-sonnet-5":   claudeSonnet5,
+			"claude-sonnet-5-5": {InputPerMTok: 2.0, OutputPerMTok: 10.0},
 			"claude-sonnet-4":   {InputPerMTok: 3.0, OutputPerMTok: 15.0},
 			"claude-sonnet-4-6": {InputPerMTok: 3.0, OutputPerMTok: 15.0},
 			"claude-haiku-3-5":  {InputPerMTok: 0.80, OutputPerMTok: 4.0},
@@ -138,8 +142,13 @@ func DefaultPricing() *Pricing {
 		// Google pricing is simplified to the standard <=200k-token text tier.
 		"google": {
 			"gemini-3.6-flash": gemini36Flash,
+			"gemini-3.8-flash": gemini38Flash,
 			"gemini-2.5-pro":   {InputPerMTok: 1.25, OutputPerMTok: 10.0},
 			"gemini-2.5-flash": {InputPerMTok: 0.30, OutputPerMTok: 2.50},
+		},
+		// Meta Muse Spark Standard mode.
+		"meta": {
+			"muse-spark-1.3": {InputPerMTok: 1.25, OutputPerMTok: 4.25},
 		},
 	}}
 }

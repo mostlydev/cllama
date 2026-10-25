@@ -783,3 +783,25 @@ func TestAddRuntimeProviderSavesToFile(t *testing.T) {
 		t.Errorf("key source = %q, want runtime", prov.Keys[0].Source)
 	}
 }
+
+func TestLoadFromEnvSeedsMetaProvider(t *testing.T) {
+	t.Setenv("META_API_KEY", "meta_test")
+
+	r := NewRegistry("")
+	r.LoadFromEnv()
+
+	p, err := r.Get("meta")
+	if err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	if p.APIKey != "meta_test" || p.BaseURL != "https://api.meta.ai/v1" || p.Auth != "bearer" || p.APIFormat != "openai" {
+		t.Fatalf("unexpected meta provider: key=%q base=%q auth=%q format=%q", p.APIKey, p.BaseURL, p.Auth, p.APIFormat)
+	}
+
+	t.Setenv("META_BASE_URL", "https://meta.example.test/v1")
+	r = NewRegistry("")
+	r.LoadFromEnv()
+	if p, err := r.Get("meta"); err != nil || p.BaseURL != "https://meta.example.test/v1" {
+		t.Fatalf("expected meta base URL override, got %v %v", p, err)
+	}
+}
