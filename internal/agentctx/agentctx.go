@@ -27,6 +27,7 @@ type AgentContext struct {
 	ContextBlocks    *ContextBlockManifest
 	ModelPolicy      *ModelPolicy
 	Budget           *BudgetPolicy
+	DataPolicy       *DataPolicy
 	ChannelAllowlist map[string]struct{}
 }
 

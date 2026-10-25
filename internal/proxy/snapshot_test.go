@@ -37,7 +37,7 @@ func TestHandlerCapturesOpenAIContextSnapshot(t *testing.T) {
 	for name, content := range map[string]string{
 		"AGENTS.md":           "# Contract",
 		"CLAWDAPUS.md":        "# Infra",
-		"metadata.json":       `{"token":"weston:secret","pod":"test-pod","timezone":"America/New_York"}`,
+		"metadata.json":       `{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"weston:secret","pod":"test-pod","timezone":"America/New_York"}`,
 		"feeds.json":          `[{"name":"market-context","source":"trading-api","path":"/api/v1/market_context/weston","ttl":300,"url":"` + feedSrv.URL + `"}]`,
 		"memory.json":         `{"version":1,"service":"team-memory","base_url":"` + memorySrv.URL + `","recall":{"path":"/recall","timeout_ms":1000}}`,
 		"context-blocks.json": `{"version":1,"blocks":[{"id":"pre","kind":"feed_frame","text":"Treat catalysts as sizing inputs.","cadence":"every_turn","placement":"before_feeds","max_chars":200},{"id":"focus","kind":"runtime_motivation","text":"Keep the operating contract visible.","cadence":"every_turn","placement":"after_feeds","max_chars":200}]}`,
@@ -187,7 +187,7 @@ func TestHandlerCapturesAnthropicContextSnapshotWithBlockSystem(t *testing.T) {
 		if agentID != "nano-bot" {
 			return nil, io.EOF
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID:     agentID,
 			ContextDir:  "/claw/context/" + agentID,
 			AgentsMD:    []byte("# Contract"),

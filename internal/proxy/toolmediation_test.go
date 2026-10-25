@@ -133,7 +133,7 @@ func TestCallManagedHTTPToolForClawWallRequiresAllowedChannel(t *testing.T) {
 		if agentID != "weston" {
 			t.Fatalf("unexpected agent id %q", agentID)
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			ChannelAllowlist: map[string]struct{}{"chan-1": {}},
 		}, nil
 	}, nil)
@@ -169,7 +169,7 @@ func TestCallManagedHTTPToolForClawWallRejectsDisallowedChannel(t *testing.T) {
 	defer server.Close()
 
 	h := NewHandler(nil, func(agentID string) (*agentctx.AgentContext, error) {
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			ChannelAllowlist: map[string]struct{}{"chan-1": {}},
 		}, nil
 	}, nil)
@@ -204,11 +204,11 @@ func TestExecuteManagedToolForClawWallPrependsHeaderAndRecordsStatus(t *testing.
 
 	var logs bytes.Buffer
 	h := NewHandler(nil, func(agentID string) (*agentctx.AgentContext, error) {
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			ChannelAllowlist: map[string]struct{}{"chan-1": {}},
 		}, nil
 	}, logging.New(&logs))
-	agentCtx := &agentctx.AgentContext{
+	agentCtx := &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 		Tools: &agentctx.ToolManifest{
 			Tools: []agentctx.ToolManifestEntry{{
 				Name: "claw-wall.search_channel_context",
@@ -268,11 +268,11 @@ func TestExecuteManagedAnthropicToolAcceptsHashlessAlias(t *testing.T) {
 
 	var logs bytes.Buffer
 	h := NewHandler(nil, func(agentID string) (*agentctx.AgentContext, error) {
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			ChannelAllowlist: map[string]struct{}{"chan-1": {}},
 		}, nil
 	}, logging.New(&logs))
-	agentCtx := &agentctx.AgentContext{
+	agentCtx := &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 		Tools: &agentctx.ToolManifest{
 			Tools: []agentctx.ToolManifestEntry{{
 				Name: "claw-wall.get_channel_messages",
@@ -314,7 +314,7 @@ func TestExecuteManagedAnthropicToolAcceptsHashlessAlias(t *testing.T) {
 }
 
 func TestManagedToolDuplicateTrackerCanonicalizesArguments(t *testing.T) {
-	agentCtx := &agentctx.AgentContext{Tools: managedToolManifest()}
+	agentCtx := &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(), Tools: managedToolManifest()}
 	tracker := newManagedToolDuplicateTracker()
 
 	first := openAIToolCall{
@@ -372,7 +372,7 @@ func TestManagedToolDuplicateTrackerCanonicalizesArguments(t *testing.T) {
 }
 
 func TestManagedToolDuplicateTrackerRetriesFailuresBeforeSuppressing(t *testing.T) {
-	agentCtx := &agentctx.AgentContext{Tools: managedToolManifest()}
+	agentCtx := &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(), Tools: managedToolManifest()}
 	tracker := newManagedToolDuplicateTracker()
 	call := openAIToolCall{
 		Name:         "trading-api.get_market_context",

@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mostlydev/cllama/internal/agentctx"
 	"github.com/mostlydev/cllama/internal/provider"
 	"github.com/mostlydev/cllama/internal/tracejournal"
 )
@@ -637,5 +638,46 @@ func TestTraceJournalSealFailureNeverBlocksRevocation(t *testing.T) {
 	matches, _ := filepath.Glob(filepath.Join(historyDir, "worker-1", "journal", ".tmp-*"))
 	if len(matches) != 0 {
 		t.Fatalf("temporary seal left behind: %v", matches)
+	}
+}
+
+// A request refused by the data policy at admission is still an admitted,
+// traced request: it gets a closed error segment and the seal counts it.
+func TestTraceJournalCapturesDataPolicyAdmissionRefusal(t *testing.T) {
+	var hits atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }))
+	defer backend.Close()
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "k", Auth: "bearer"})
+	journal, historyDir := newTestJournal(t, nil)
+	strict := agentctx.DefaultDataPolicy()
+	loader := func(id string) (*agentctx.AgentContext, error) {
+		if id != "worker-1" {
+			return nil, io.EOF
+		}
+		return &agentctx.AgentContext{DataPolicy: &strict, AgentID: id, ContextDir: "/claw/context/" + id,
+			AgentsMD: []byte("# Contract"), ClawdapusMD: []byte("# Infra"), Metadata: map[string]any{"token": "worker-1:secret-value"}}, nil
+	}
+	h := NewHandler(reg, loader, nil, WithRevocationDir(t.TempDir()), WithAdminToken("operator"), WithTraceJournal(journal))
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions?api-version=x", strings.NewReader(`{"model":"openai/model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer worker-1:secret-value")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "request_query") {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	if hits.Load() != 0 {
+		t.Fatal("a refused request reached the provider")
+	}
+	records, _ := verifiedSegment(t, historyDir, "worker-1")
+	if got := recordTypes(records); !strings.HasPrefix(got, "segment_open") || !strings.HasSuffix(got, "client_response,segment_close") || records[len(records)-1]["status"] != "error" {
+		t.Fatalf("records = %s, close = %v", got, records[len(records)-1])
+	}
+	if code := revokeForTest(h, "worker-1", 3, "operator").Code; code != 200 {
+		t.Fatalf("revoke: %d", code)
+	}
+	seal := readJSONFile(t, filepath.Join(historyDir, "worker-1", "journal", "seal-3.json"))
+	if int(seal["requests"].(float64)) != 1 {
+		t.Fatalf("seal = %v", seal)
 	}
 }

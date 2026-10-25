@@ -399,7 +399,10 @@ When `CLAW_SESSION_HISTORY_DIR` is set, cllama writes a durable JSONL session hi
 │   └── history.jsonl
 ```
 
-One file per agent. Each line is one entry, appended on every successful upstream completion (HTTP 2xx). Non-2xx responses are not recorded here — they appear only in the stdout audit log.
+One file per agent. Successful completions append one entry; managed mediation
+failures can also append an error entry, including prior tool-round accounting.
+Other refusals/errors remain in the audit log. With the default local policy,
+these entries contain metadata only.
 
 ### Entry fields
 
@@ -407,7 +410,7 @@ One file per agent. Each line is one entry, appended on every successful upstrea
 |---|---|
 | `version` | Schema version (`1`). |
 | `id` | Stable source-event ID for replay/deduplication. |
-| `ts` | RFC3339 timestamp of when the response was received. |
+| `ts` | RFC3339 timestamp (request start for direct history; completion for managed history). |
 | `claw_id` | Agent ID. |
 | `path` | Request path (e.g., `/v1/chat/completions`). |
 | `requested_model` | Model string as sent by the agent. |
@@ -417,7 +420,7 @@ One file per agent. Each line is one entry, appended on every successful upstrea
 | `stream` | Whether the response was streamed (SSE). |
 | `request_original` | Request body as received from the agent. |
 | `request_effective` | Request body as forwarded to the upstream (after credential swap and model rewrite). |
-| `response` | `{format, json?, text?}` — `format` is `"json"` or `"sse"`. JSON responses include `json` (parsed body); SSE responses include `text` (raw event stream). |
+| `response` | `{format, json?, text?}` — `format` is `"metadata"` by default; with local content retention enabled it is `"json"` or `"sse"`. JSON responses include `json` (parsed body); SSE responses include `text` (raw event stream). |
 | `usage` | `{prompt_tokens, completion_tokens}` extracted from the response. |
 | `usage.reported_cost_usd` | float | Provider-reported cost in USD; `omitempty` |
 
@@ -426,6 +429,119 @@ One file per agent. Each line is one entry, appended on every successful upstrea
 When orchestrated by Clawdapus, `claw up` automatically bind-mounts `.claw-session-history/` (relative to the pod file) into the cllama container at `/claw/session-history` whenever cllama is enabled for any service in the pod. No manual volume configuration is required.
 
 Session history is infrastructure-owned. Agents do not write to it and have no read API against it in Phase 1. The JSONL files are accessible to operators via the host filesystem for offline analysis and auditing.
+
+## Data policy and migration
+
+An absent `metadata.json.data_policy` now means US/EU processing only, no training,
+no upstream retention, and no ordinary local content retention. An existing API
+key alone does **not** establish those conditions. This is a fail-closed migration:
+configure a documented regional endpoint and any necessary account assurances,
+or explicitly relax the relevant requirement. cllama never rewrites a global
+endpoint to a regional endpoint on an operator's behalf.
+
+The compiler-owned metadata contract is:
+
+```json
+{
+  "data_policy": {
+    "version": 1,
+    "regions": ["eu", "us"],
+    "training": "none",
+    "retention": "none",
+    "local_retention": "none",
+    "attestations": [
+      {
+        "provider": "openai",
+        "endpoint": "https://us.api.openai.com/v1",
+        "guarantees": ["no-training", "zero-data-retention"]
+      }
+    ]
+  }
+}
+```
+
+That example requires an eligible US-residency project with zero-data-retention
+terms, and `OPENAI_BASE_URL=https://us.api.openai.com/v1`. It is a declaration of
+operator-verified terms, never an API that enables those terms. It applies to
+**every key** in that provider pool. A custom gateway needs its own exact endpoint
+attestation; an empty endpoint covers only the provider's recognized official
+origins. HTTPS is required except for local/private/in-pod HTTP targets.
+
+`regions` permits processing locations (lowercase country/region codes, or
+`["global"]` alone). `training` is `none|allowed`; upstream `retention` is
+`none|provider-default`; `local_retention` is `none|allowed`. An attestation may
+supply `processing:us`, `storage:us`, `no-training`, or `zero-data-retention`
+(and corresponding region codes). Storage evidence does not establish processing
+location. To permit Japan, add `jp` to `regions` **and** configure a route whose
+processing there is established; merely adding the code grants no capability.
+
+| Provider / endpoint | Processing evidence | No-training / retention evidence |
+|---|---|---|
+| OpenAI US/EU | Recognized `us.api.openai.com/v1` / `eu.api.openai.com/v1` | Account attestations; wire `store:false` alone is insufficient. |
+| Anthropic first party | Messages `inference_geo:us` is enforced for recognized Claude 4.6+ families; otherwise processing attestation | Account attestations; known Fable/Mythos 5 families are refused under no-retention. |
+| OpenRouter US/EU | Regional origins constrain shared endpoints; `processing:<region>` assurance must also cover BYOK and configured destinations. | Enforced `provider.data_collection:deny` and `provider.zdr:true`, plus account `zero-data-retention` assurance covering observability. Existing `only`, `allow_fallbacks`, and `require_parameters` stay intact. |
+| Vercel AI Gateway | Endpoint-bound processing attestation | Account no-training and zero-retention attestations plus enforced `providerOptions.gateway.zeroDataRetention:true` within eligible account/BYOK terms. |
+| xAI US | Recognized `us.api.x.ai/v1` | Account attestations; wire `store:false` is enforced. |
+| Gemini Developer API, Meta, custom gateways, remote Ollama | Endpoint-bound processing attestation | Endpoint-bound account/deployment attestations. Provider name alone proves nothing. |
+
+OpenAI's Japan endpoint currently establishes storage, **not** Japan processing.
+The Gemini Developer API does not by itself establish paid-tier or zero-retention
+eligibility. Regional and ZDR offerings may require separate account approval.
+`eu` remains the operator's EU requirement. OpenRouter's EU origin covers a wider
+European footprint (EEA/UK/Switzerland), so EU-only processing needs an attested
+matching deployment/subset; the hostname alone is insufficient. BYOK deployment
+location and observability destinations are operator-controlled even on regional
+origins.
+Sources: [OpenAI data controls](https://developers.openai.com/api/docs/guides/your-data),
+[Anthropic geography](https://platform.claude.com/docs/en/manage-claude/data-residency),
+[Anthropic retention](https://platform.claude.com/docs/en/manage-claude/api-and-data-retention),
+[OpenRouter routing](https://openrouter.ai/docs/guides/routing/provider-selection),
+[in-region boundaries](https://openrouter.ai/docs/guides/features/in-region-routing),
+[Vercel ZDR](https://vercel.com/docs/ai-gateway/security-and-compliance/zdr),
+[xAI security](https://docs.x.ai/developers/faq/security), and
+[Gemini ZDR](https://ai.google.dev/gemini-api/docs/zdr).
+
+No-retention refuses explicit provider state such as background requests, stored
+responses/conversations/files, extended cache options, provider-hosted MCP/web tools/plugins and
+known incompatible models. Contractual ZDR is not a promise that all transient
+technical caches or mandatory safety/legal exceptions disappear: for example,
+OpenAI documents ZDR-compatible encrypted prompt KV caching in its
+[prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
+Anthropic Messages permits recognized ephemeral default/5-minute KV cache
+markers under account assurance; longer/unknown markers are refused. Tool-level
+markers and nested stored-file sources are checked too. cllama does not manufacture
+stronger guarantees than the selected service offers.
+
+Checks run on the final wire body, after translation, for every key attempt,
+format retry and model/provider fallback. A requirement without evidence returns
+HTTP 400 with fixed `data policy requirement not established: <dimension>` text,
+before that dispatch. Provider redirects are always refused. Under constrained
+policy, caller query strings are refused, and only Accept, Content-Type and
+Anthropic-Version caller headers are forwarded before trusted authentication/adapter headers are applied;
+account selectors, alternative credentials and beta headers cannot change the
+attested account. Unsupported Vercel providerOptions are refused. Audit interventions record
+`data_policy_processing:<provider>:<enforced|attested|allowed>:<region>`,
+`data_policy_training:<provider>:<mode>`, `data_policy_retention:<provider>:<mode>`,
+or `data_policy_refused:<dimension>`. Separate `data_policy_control:<provider>:<control>`
+events identify gateway wire controls alongside account-based evidence. These
+contain no prompt or credential.
+An unsafe primary fails closed rather than silently choosing another model.
+
+With `local_retention:none`, new ordinary history entries keep accounting,
+models, status, timestamps and IDs, with `response:{"format":"metadata"}`;
+request/response bodies and tool traces are omitted. New context snapshots,
+cross-request tool continuity, feed content caching and automatic memory retain
+are suppressed, and so is the optional asynchronous policy `Score` call, which
+carries full request and response content (logged as
+`policy_score_suppressed:local_retention`). The policy sidecar's request and
+response gates and decoration still run: they decide the request, and their data
+flow is operator-owned service processing, outside provider-policy guarantees.
+Existing files are preserved. Explicit `CLLAMA_TRACE_JOURNAL=on`
+is a separate operator opt-in to **journal content only**: it continues to record
+bounded/redacted trace segments even when ordinary content retention is off.
+Revocation and cursor metadata remain available. This policy covers model-provider
+requests and proxy observability; it is not a deletion policy for mounted contracts,
+workload files, service business records or tool effects.
 
 ## Trace Journal
 

@@ -464,7 +464,7 @@ func policyContextLoader(agentID, token string, tools *agentctx.ToolManifest, ex
 		for k, v := range extraMetadata {
 			metadata[k] = v
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID:     id,
 			ContextDir:  "/claw/context/" + id,
 			AgentsMD:    []byte("# Contract"),

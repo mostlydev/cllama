@@ -53,7 +53,7 @@ func TestDualServerIntegrationSmoke(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# infra"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"tiverton:dummy123"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"tiverton:dummy123"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -221,7 +221,7 @@ func TestAPIHistoryEndpointAllowsAgentAndDedicatedReplayAuth(t *testing.T) {
 	for name, content := range map[string]string{
 		"AGENTS.md":     "# contract",
 		"CLAWDAPUS.md":  "# infra",
-		"metadata.json": `{"token":"tiverton:dummy123"}`,
+		"metadata.json": `{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"tiverton:dummy123"}`,
 	} {
 		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
@@ -309,7 +309,7 @@ func TestAPIHistoryEndpointSelfRouteAllowsAgentBearer(t *testing.T) {
 	for name, content := range map[string]string{
 		"AGENTS.md":     "# contract",
 		"CLAWDAPUS.md":  "# infra",
-		"metadata.json": `{"token":"tiverton:dummy123"}`,
+		"metadata.json": `{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"tiverton:dummy123"}`,
 	} {
 		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
@@ -410,7 +410,7 @@ func TestAPIHistoryEndpointAllowsAdminTokenAndRejectsWrongBearer(t *testing.T) {
 	for name, content := range map[string]string{
 		"AGENTS.md":     "# contract",
 		"CLAWDAPUS.md":  "# infra",
-		"metadata.json": `{"token":"tiverton:dummy123"}`,
+		"metadata.json": `{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"tiverton:dummy123"}`,
 	} {
 		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
@@ -498,7 +498,7 @@ func TestPublishedUIRevokesRequestOnAPIListener(t *testing.T) {
 	if err := os.Mkdir(agentDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	for name, body := range map[string]string{"AGENTS.md": "worker", "CLAWDAPUS.md": "worker", "metadata.json": `{"token":"worker-1:secret"}`} {
+	for name, body := range map[string]string{"AGENTS.md": "worker", "CLAWDAPUS.md": "worker", "metadata.json": `{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"worker-1:secret"}`} {
 		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(body), 0600); err != nil {
 			t.Fatal(err)
 		}

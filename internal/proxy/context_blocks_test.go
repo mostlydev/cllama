@@ -9,7 +9,7 @@ import (
 
 func TestRenderContextBlocksFiltersTrimsAndSplitsPlacements(t *testing.T) {
 	disabled := false
-	ctx := &agentctx.AgentContext{
+	ctx := &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 		ContextDir: "/claw/context/agent",
 		ContextBlocks: &agentctx.ContextBlockManifest{
 			Version: 1,

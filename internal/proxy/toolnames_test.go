@@ -7,7 +7,7 @@ import (
 )
 
 func TestResolveManagedToolAcceptsUniqueHashlessAlias(t *testing.T) {
-	agentCtx := &agentctx.AgentContext{
+	agentCtx := &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 		Tools: &agentctx.ToolManifest{
 			Tools: []agentctx.ToolManifestEntry{
 				{Name: "trading-api.get_quote"},
@@ -81,7 +81,7 @@ func TestResolveManagedToolCanonicalBeatsLegacyHashedShadow(t *testing.T) {
 	// A tool canonically named like another tool's legacy hashed form must win
 	// on canonical match; the legacy alias must not shadow it.
 	legacy := managedToolHashedNameForCanonical("svc.foo")
-	agentCtx := &agentctx.AgentContext{
+	agentCtx := &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 		Tools: &agentctx.ToolManifest{
 			Tools: []agentctx.ToolManifestEntry{
 				{Name: "svc.foo"},
@@ -99,7 +99,7 @@ func TestResolveManagedToolCanonicalBeatsLegacyHashedShadow(t *testing.T) {
 }
 
 func TestResolveManagedToolAcceptsLegacyHashedName(t *testing.T) {
-	agentCtx := &agentctx.AgentContext{
+	agentCtx := &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 		Tools: &agentctx.ToolManifest{
 			Tools: []agentctx.ToolManifestEntry{
 				{Name: "claw-wall.search_channel_context"},
@@ -117,7 +117,7 @@ func TestResolveManagedToolAcceptsLegacyHashedName(t *testing.T) {
 }
 
 func TestRewriteManagedToolChoiceUsesPresentedNames(t *testing.T) {
-	agentCtx := &agentctx.AgentContext{
+	agentCtx := &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 		Tools: &agentctx.ToolManifest{
 			Tools: []agentctx.ToolManifestEntry{
 				{Name: "trading-api.propose_trade"},
@@ -150,7 +150,7 @@ func TestRewriteManagedToolChoiceUsesPresentedNames(t *testing.T) {
 }
 
 func TestRewriteManagedToolChoiceKeepsHashOnCollision(t *testing.T) {
-	agentCtx := &agentctx.AgentContext{
+	agentCtx := &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 		Tools: &agentctx.ToolManifest{
 			Tools: []agentctx.ToolManifestEntry{
 				{Name: "svc.one"},
@@ -169,7 +169,7 @@ func TestRewriteManagedToolChoiceKeepsHashOnCollision(t *testing.T) {
 }
 
 func TestResolveManagedToolKeepsAmbiguousHashlessAliasUnresolved(t *testing.T) {
-	agentCtx := &agentctx.AgentContext{
+	agentCtx := &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 		Tools: &agentctx.ToolManifest{
 			Tools: []agentctx.ToolManifestEntry{
 				{Name: "svc.one"},

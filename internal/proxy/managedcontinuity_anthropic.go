@@ -472,3 +472,12 @@ func (s *managedAnthropicContinuityStore) restorePendingToolUseTurn(agentID stri
 	state.PendingToolUseTurn = cloneAnthropicToolUseContinuityTurn(turn)
 	s.touchLocked(agentID, state)
 }
+
+func (s *managedAnthropicContinuityStore) forget(agentID string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.agents, agentID)
+}

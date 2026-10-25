@@ -3008,7 +3008,7 @@ func TestDispatchCandidatesJSONFallsBackOnUpstream500(t *testing.T) {
 		{ProviderName: "openrouter", UpstreamModel: "anthropic/claude-haiku-4-5"},
 	}
 
-	resp, status, msg, err := h.dispatchCandidatesJSON(context.Background(), req, "agent-1", "openai/gpt-4o", payload, candidates, nil)
+	resp, status, msg, err := h.dispatchCandidatesJSON(context.WithValue(context.Background(), dataPolicyKey{}, *testPermissiveDataPolicy()), req, "agent-1", "openai/gpt-4o", payload, candidates, nil)
 	if err != nil {
 		t.Fatalf("dispatchCandidatesJSON returned error status=%d msg=%q err=%v", status, msg, err)
 	}
@@ -3062,7 +3062,7 @@ func TestDispatchCandidatesJSONFallsBackOnResponseReadError(t *testing.T) {
 		{ProviderName: "openrouter", UpstreamModel: "anthropic/claude-haiku-4-5"},
 	}
 
-	resp, status, msg, err := h.dispatchCandidatesJSON(context.Background(), req, "agent-1", "openai/gpt-4o", payload, candidates, nil)
+	resp, status, msg, err := h.dispatchCandidatesJSON(context.WithValue(context.Background(), dataPolicyKey{}, *testPermissiveDataPolicy()), req, "agent-1", "openai/gpt-4o", payload, candidates, nil)
 	if err != nil {
 		t.Fatalf("dispatchCandidatesJSON returned error status=%d msg=%q err=%v", status, msg, err)
 	}
@@ -3111,7 +3111,7 @@ func TestDispatchCandidatesJSONKeepsTerminalResponseReadErrorWithoutFallback(t *
 	}
 	candidates := []dispatchCandidate{{ProviderName: "openai", UpstreamModel: "gpt-4o"}}
 
-	resp, status, msg, err := h.dispatchCandidatesJSON(context.Background(), req, "agent-1", "openai/gpt-4o", payload, candidates, nil)
+	resp, status, msg, err := h.dispatchCandidatesJSON(context.WithValue(context.Background(), dataPolicyKey{}, *testPermissiveDataPolicy()), req, "agent-1", "openai/gpt-4o", payload, candidates, nil)
 	if err == nil {
 		t.Fatal("expected response read error")
 	}
@@ -4984,7 +4984,7 @@ func TestHandlerInjectsFeedsIntoOpenAI(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# I"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"weston:secret","pod":"test-pod","timezone":"America/New_York"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"weston:secret","pod":"test-pod","timezone":"America/New_York"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -5074,7 +5074,7 @@ func TestHandlerReportsSkippedFeedInjectionInSnapshotAndLogs(t *testing.T) {
 	for name, content := range map[string]string{
 		"AGENTS.md":     "# C",
 		"CLAWDAPUS.md":  "# I",
-		"metadata.json": `{"token":"weston:secret","pod":"test-pod","timezone":"UTC"}`,
+		"metadata.json": `{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"weston:secret","pod":"test-pod","timezone":"UTC"}`,
 		"feeds.json":    feedsJSON,
 	} {
 		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
@@ -5186,7 +5186,7 @@ func TestHandlerCommitsChannelContextCursorAfterSuccessfulResponse(t *testing.T)
 	for name, content := range map[string]string{
 		"AGENTS.md":     "# C",
 		"CLAWDAPUS.md":  "# I",
-		"metadata.json": `{"token":"weston:secret","timezone":"UTC"}`,
+		"metadata.json": `{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"weston:secret","timezone":"UTC"}`,
 		"feeds.json":    feedsJSON,
 	} {
 		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
@@ -5250,7 +5250,7 @@ func TestHandlerDoesNotCommitChannelContextCursorOnUpstreamFailure(t *testing.T)
 	for name, content := range map[string]string{
 		"AGENTS.md":     "# C",
 		"CLAWDAPUS.md":  "# I",
-		"metadata.json": `{"token":"weston:secret","timezone":"UTC"}`,
+		"metadata.json": `{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"weston:secret","timezone":"UTC"}`,
 		"feeds.json":    feedsJSON,
 	} {
 		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
@@ -5304,7 +5304,7 @@ func TestHandlerBootstrapsChannelContextEpochOnMismatch(t *testing.T) {
 	for name, content := range map[string]string{
 		"AGENTS.md":     "# C",
 		"CLAWDAPUS.md":  "# I",
-		"metadata.json": `{"token":"weston:secret","timezone":"UTC"}`,
+		"metadata.json": `{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"weston:secret","timezone":"UTC"}`,
 		"feeds.json":    feedsJSON,
 	} {
 		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
@@ -5373,7 +5373,7 @@ func TestHandlerDoesNotCommitChannelContextEpochWhenFeedFetchFails(t *testing.T)
 	for name, content := range map[string]string{
 		"AGENTS.md":     "# C",
 		"CLAWDAPUS.md":  "# I",
-		"metadata.json": `{"token":"weston:secret","timezone":"UTC"}`,
+		"metadata.json": `{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"weston:secret","timezone":"UTC"}`,
 		"feeds.json":    feedsJSON,
 	} {
 		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
@@ -5441,7 +5441,7 @@ func TestHandlerCommitsChannelContextEpochWithoutCursorUpdates(t *testing.T) {
 	for name, content := range map[string]string{
 		"AGENTS.md":     "# C",
 		"CLAWDAPUS.md":  "# I",
-		"metadata.json": `{"token":"weston:secret","timezone":"UTC"}`,
+		"metadata.json": `{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"weston:secret","timezone":"UTC"}`,
 		"feeds.json":    feedsJSON,
 	} {
 		if err := os.WriteFile(filepath.Join(agentDir, name), []byte(content), 0o644); err != nil {
@@ -5525,7 +5525,7 @@ func TestHandlerInjectsFeedsIntoAnthropic(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# I"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"nano-bot:secret456","timezone":"America/New_York"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"nano-bot:secret456","timezone":"America/New_York"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -5606,7 +5606,7 @@ func TestHandlerNoFeedsStillWorks(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(agentDir, "CLAWDAPUS.md"), []byte("# I"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"token":"bare-agent:secret","timezone":"UTC"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(agentDir, "metadata.json"), []byte(`{"data_policy":{"version":1,"regions":["global"],"training":"allowed","retention":"provider-default","local_retention":"allowed"},"token":"bare-agent:secret","timezone":"UTC"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -6050,7 +6050,7 @@ func TestHandlerInjectsMemoryRecallIntoOpenAIRequests(t *testing.T) {
 		if id != "tiverton" {
 			return nil, io.EOF
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID: "tiverton",
 			Metadata: map[string]any{
 				"token":    "tiverton:dummy123",
@@ -6152,7 +6152,7 @@ func TestHandlerAppliesRecallMemoryPolicyAndLogsRemovals(t *testing.T) {
 		if id != "tiverton" {
 			return nil, io.EOF
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID: "tiverton",
 			Metadata: map[string]any{
 				"token": "tiverton:dummy123",
@@ -6236,7 +6236,7 @@ func TestHandlerRetainsMemoryAfterSuccessfulTurn(t *testing.T) {
 		if id != "tiverton" {
 			return nil, io.EOF
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID: "tiverton",
 			Metadata: map[string]any{
 				"token":   "tiverton:dummy123",
@@ -6319,7 +6319,7 @@ func TestHandlerAppliesRetainMemoryPolicyAndLogsRedactions(t *testing.T) {
 		if id != "tiverton" {
 			return nil, io.EOF
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID: "tiverton",
 			Metadata: map[string]any{
 				"token": "tiverton:dummy123",
@@ -6401,7 +6401,7 @@ func TestHandlerLogsOversizedMemoryRecallResponseClearly(t *testing.T) {
 		if id != "tiverton" {
 			return nil, io.EOF
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID: "tiverton",
 			Metadata: map[string]any{
 				"token": "tiverton:dummy123",
@@ -6460,7 +6460,7 @@ func TestHandlerLogsSkippedMemoryRecallWithoutLatency(t *testing.T) {
 		if id != "tiverton" {
 			return nil, io.EOF
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID: "tiverton",
 			Metadata: map[string]any{
 				"token": "tiverton:dummy123",
@@ -6528,7 +6528,7 @@ func TestHandlerLogsTimedOutMemoryRecallWithoutGenericError(t *testing.T) {
 		if id != "tiverton" {
 			return nil, io.EOF
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID: "tiverton",
 			Metadata: map[string]any{
 				"token": "tiverton:dummy123",
@@ -6586,7 +6586,7 @@ func TestHandlerLogsFailedMemoryRetainWithoutGenericError(t *testing.T) {
 		if id != "tiverton" {
 			return nil, io.EOF
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID: "tiverton",
 			Metadata: map[string]any{
 				"token": "tiverton:dummy123",
@@ -6627,7 +6627,7 @@ func stubContextLoaderWithToken(agentID, token string) ContextLoader {
 		if id != agentID {
 			return nil, io.EOF
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID:     id,
 			ContextDir:  "/claw/context/" + id,
 			AgentsMD:    []byte("# Contract"),
@@ -6644,7 +6644,7 @@ func stubContextLoaderWithPolicy(agentID, token string, policy *agentctx.ModelPo
 		if id != agentID {
 			return nil, io.EOF
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID:     id,
 			ContextDir:  "/claw/context/" + id,
 			AgentsMD:    []byte("# Contract"),
@@ -6662,7 +6662,7 @@ func stubContextLoaderWithBudget(agentID, token string, budget *agentctx.BudgetP
 		if id != agentID {
 			return nil, io.EOF
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID:     id,
 			ContextDir:  "/claw/context/" + id,
 			AgentsMD:    []byte("# Contract"),
@@ -6680,7 +6680,7 @@ func stubContextLoaderWithTools(agentID, token string, tools *agentctx.ToolManif
 		if id != agentID {
 			return nil, io.EOF
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID:     id,
 			ContextDir:  "/claw/context/" + id,
 			AgentsMD:    []byte("# Contract"),

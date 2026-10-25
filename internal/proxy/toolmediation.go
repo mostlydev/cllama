@@ -268,7 +268,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 		}
 		if resp == nil {
 			if len(toolTrace) > 0 {
-				h.recordManagedFailure(agentID, lastProvider, requestedModel, lastUpstreamModel, r.URL.Path, requestOriginal, requestEffective, status, jsonErrorPayload(msg), usageAgg, toolTrace)
+				h.recordManagedFailure(agentID, agentCtx, lastProvider, requestedModel, lastUpstreamModel, r.URL.Path, requestOriginal, requestEffective, status, jsonErrorPayload(msg), usageAgg, toolTrace)
 			}
 			if streamKeepalive != nil && streamKeepalive.started {
 				streamKeepalive.writeOpenAIError(jsonErrorPayload(msg))
@@ -296,7 +296,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				}
 			}
 			if len(toolTrace) > 0 {
-				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, ensureJSONPayload(resp.Body), usageAgg, toolTrace)
+				h.recordManagedFailure(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, ensureJSONPayload(resp.Body), usageAgg, toolTrace)
 			}
 			if costInfo := usageAgg.costInfo(); costInfo != nil {
 				h.logger.LogResponseWithCost(agentID, requestedModel, resp.StatusCode, time.Since(start).Milliseconds(), costInfo)
@@ -312,7 +312,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			if downstreamStream {
 				sse, synthErr := synthesizeOpenAIStream(resp.Body, resp.UpstreamModel, usageAgg, downstreamIncludeUsage)
 				if synthErr != nil {
-					h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed stream"), usageAgg, toolTrace)
+					h.recordManagedFailure(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed stream"), usageAgg, toolTrace)
 					if streamKeepalive != nil && streamKeepalive.started {
 						streamKeepalive.writeOpenAIError(jsonErrorPayload("failed to synthesize managed stream"))
 						h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), synthErr)
@@ -330,7 +330,9 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 					return
 				}
 			}
-			h.managedTurns.ObserveTerminalAssistant(agentID, assistantMessage, hiddenMessages)
+			if localContentAllowed(agentCtx) {
+				h.managedTurns.ObserveTerminalAssistant(agentID, assistantMessage, hiddenMessages)
+			}
 			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
 			return
 		}
@@ -339,7 +341,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			if finalizingAfterDuplicate {
 				msg = "managed tool finalization requested tools after duplicate managed tool call streak"
 			}
-			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
+			h.recordManagedFailure(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
 			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
 			return
 		}
@@ -350,7 +352,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			if downstreamStream {
 				sse, synthErr := synthesizeOpenAIToolCallStream(resp.Body, resp.UpstreamModel, usageAgg, downstreamIncludeUsage)
 				if synthErr != nil {
-					h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed stream"), usageAgg, toolTrace)
+					h.recordManagedFailure(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed stream"), usageAgg, toolTrace)
 					if streamKeepalive != nil {
 						streamKeepalive.writeOpenAIError(jsonErrorPayload("failed to synthesize managed stream"))
 						h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), synthErr)
@@ -369,7 +371,9 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				}
 			}
 			if len(toolTrace) > 0 || len(hiddenMessages) > 0 {
-				h.managedTurns.ObserveNativeToolCallAssistant(agentID, assistantMessage, hiddenMessages)
+				if localContentAllowed(agentCtx) {
+					h.managedTurns.ObserveNativeToolCallAssistant(agentID, assistantMessage, hiddenMessages)
+				}
 				h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
 				return
 			}
@@ -485,7 +489,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 				}
 				msg := "managed tool mediation timed out"
 				finishToolRoundTrace(&roundTrace, roundStarted)
-				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, append(toolTrace, roundTrace))
+				h.recordManagedFailure(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, append(toolTrace, roundTrace))
 				if streamKeepalive != nil && streamKeepalive.started {
 					streamKeepalive.writeOpenAIError(jsonErrorPayload(msg))
 					h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), execErr)
@@ -527,7 +531,7 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 			if downstreamStream {
 				sse, synthErr := synthesizeOpenAIStream(terminalBody, resp.UpstreamModel, usageAgg, downstreamIncludeUsage)
 				if synthErr != nil {
-					h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed terminal stream"), usageAgg, toolTrace)
+					h.recordManagedFailure(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed terminal stream"), usageAgg, toolTrace)
 					h.fail(w, http.StatusBadGateway, "failed to synthesize managed terminal stream", agentID, requestedModel, start, synthErr)
 					return
 				}
@@ -540,7 +544,9 @@ func (h *Handler) handleManagedOpenAI(w http.ResponseWriter, r *http.Request, ag
 					return
 				}
 			}
-			h.managedTurns.ObserveTerminalAssistant(agentID, terminalAssistant, hiddenMessages)
+			if localContentAllowed(agentCtx) {
+				h.managedTurns.ObserveTerminalAssistant(agentID, terminalAssistant, hiddenMessages)
+			}
 			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusOK, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
 			return
 		}
@@ -603,7 +609,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 		}
 		if resp == nil {
 			if len(toolTrace) > 0 {
-				h.recordManagedFailure(agentID, lastProvider, requestedModel, lastUpstreamModel, r.URL.Path, requestOriginal, requestEffective, status, jsonErrorPayload(msg), usageAgg, toolTrace)
+				h.recordManagedFailure(agentID, agentCtx, lastProvider, requestedModel, lastUpstreamModel, r.URL.Path, requestOriginal, requestEffective, status, jsonErrorPayload(msg), usageAgg, toolTrace)
 			}
 			if streamKeepalive != nil && streamKeepalive.started {
 				streamKeepalive.writeAnthropicError(msg)
@@ -631,7 +637,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				}
 			}
 			if len(toolTrace) > 0 {
-				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, ensureJSONPayload(resp.Body), usageAgg, toolTrace)
+				h.recordManagedFailure(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, ensureJSONPayload(resp.Body), usageAgg, toolTrace)
 			}
 			if costInfo := usageAgg.costInfo(); costInfo != nil {
 				h.logger.LogResponseWithCost(agentID, requestedModel, resp.StatusCode, time.Since(start).Milliseconds(), costInfo)
@@ -647,7 +653,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			if downstreamStream {
 				sse, synthErr := synthesizeAnthropicStream(resp.Body, resp.UpstreamModel, usageAgg)
 				if synthErr != nil {
-					h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed stream"), usageAgg, toolTrace)
+					h.recordManagedFailure(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed stream"), usageAgg, toolTrace)
 					if streamKeepalive != nil && streamKeepalive.started {
 						streamKeepalive.writeAnthropicError("failed to synthesize managed stream")
 						h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), synthErr)
@@ -665,7 +671,9 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 					return
 				}
 			}
-			h.managedAnthropicTurns.ObserveTerminalAssistant(agentID, assistantMessage, hiddenMessages)
+			if localContentAllowed(agentCtx) {
+				h.managedAnthropicTurns.ObserveTerminalAssistant(agentID, assistantMessage, hiddenMessages)
+			}
 			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
 			return
 		}
@@ -674,7 +682,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			if finalizingAfterDuplicate {
 				msg = "managed tool finalization requested tools after duplicate managed tool call streak"
 			}
-			h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
+			h.recordManagedFailure(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, toolTrace)
 			h.fail(w, http.StatusBadGateway, msg, agentID, requestedModel, start, fmt.Errorf(msg))
 			return
 		}
@@ -685,7 +693,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			if downstreamStream {
 				sse, synthErr := synthesizeAnthropicToolUseStream(resp.Body, resp.UpstreamModel, usageAgg)
 				if synthErr != nil {
-					h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed stream"), usageAgg, toolTrace)
+					h.recordManagedFailure(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed stream"), usageAgg, toolTrace)
 					if streamKeepalive != nil {
 						streamKeepalive.writeAnthropicError("failed to synthesize managed stream")
 						h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), synthErr)
@@ -704,7 +712,9 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				}
 			}
 			if len(toolTrace) > 0 || len(hiddenMessages) > 0 {
-				h.managedAnthropicTurns.ObserveNativeToolUseAssistant(agentID, assistantMessage, hiddenMessages)
+				if localContentAllowed(agentCtx) {
+					h.managedAnthropicTurns.ObserveNativeToolUseAssistant(agentID, assistantMessage, hiddenMessages)
+				}
 				h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, resp.StatusCode, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
 				return
 			}
@@ -812,7 +822,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 				}
 				msg := "managed tool mediation timed out"
 				finishToolRoundTrace(&roundTrace, roundStarted)
-				h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, append(toolTrace, roundTrace))
+				h.recordManagedFailure(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload(msg), usageAgg, append(toolTrace, roundTrace))
 				if streamKeepalive != nil && streamKeepalive.started {
 					streamKeepalive.writeAnthropicError(msg)
 					h.logger.LogError(agentID, requestedModel, http.StatusBadGateway, time.Since(start).Milliseconds(), execErr)
@@ -849,7 +859,7 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 			if downstreamStream {
 				sse, synthErr := synthesizeAnthropicStream(terminalBody, resp.UpstreamModel, usageAgg)
 				if synthErr != nil {
-					h.recordManagedFailure(agentID, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed terminal stream"), usageAgg, toolTrace)
+					h.recordManagedFailure(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusBadGateway, jsonErrorPayload("failed to synthesize managed terminal stream"), usageAgg, toolTrace)
 					h.fail(w, http.StatusBadGateway, "failed to synthesize managed terminal stream", agentID, requestedModel, start, synthErr)
 					return
 				}
@@ -862,7 +872,9 @@ func (h *Handler) handleManagedAnthropic(w http.ResponseWriter, r *http.Request,
 					return
 				}
 			}
-			h.managedAnthropicTurns.ObserveTerminalAssistant(agentID, terminalAssistant, hiddenMessages)
+			if localContentAllowed(agentCtx) {
+				h.managedAnthropicTurns.ObserveTerminalAssistant(agentID, terminalAssistant, hiddenMessages)
+			}
 			h.recordManagedSuccess(agentID, agentCtx, resp.ProviderName, requestedModel, resp.UpstreamModel, r.URL.Path, requestOriginal, requestEffective, http.StatusOK, responseBytes, usageAgg, toolTrace, downstreamStream, time.Since(start).Milliseconds(), pendingCursor)
 			return
 		}
@@ -954,6 +966,11 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			}
 		}
 
+		checked, policyErr := h.policyUpstream(ctx, agentID, requestedModel, prov, upstream)
+		if policyErr != nil {
+			return dispatchJSONAttemptResult{ClientStatus: http.StatusBadRequest, ClientMessage: policyErr.Error(), Err: policyErr}
+		}
+		upstream = checked
 		targetURL, err := buildUpstreamURL(prov.BaseURL, upstream.Path, r.URL.RawQuery)
 		if err != nil {
 			return dispatchJSONAttemptResult{
@@ -973,7 +990,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 				Err:           err,
 			}
 		}
-		copyRequestHeaders(outReq.Header, r.Header)
+		copyDataPolicyHeaders(outReq.Header, r.Header, requestDataPolicy(ctx))
 		outReq.Header.Set("Content-Type", "application/json")
 		if upstream.Adapter {
 			// The adapter rewrites the reply, so it must arrive uncompressed.
@@ -3726,7 +3743,7 @@ func (h *Handler) recordManagedSuccess(agentID string, agentCtx *agentctx.AgentC
 		Version:           1,
 		Status:            "ok",
 		ClawID:            agentID,
-		TS:                time.Now().UTC().Format(time.RFC3339),
+		TS:                time.Now().UTC().Format(time.RFC3339Nano),
 		Path:              requestPath,
 		RequestedModel:    requestedModel,
 		EffectiveProvider: providerName,
@@ -3739,6 +3756,7 @@ func (h *Handler) recordManagedSuccess(agentID string, agentCtx *agentctx.AgentC
 		Usage:             usage.sessionUsage(),
 		ToolTrace:         toolTrace,
 	}
+	entry = metadataHistory(agentCtx, entry)
 	if err := entry.EnsureID(); err != nil {
 		h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("session history id: %w", err))
 		return
@@ -3771,7 +3789,7 @@ func responseHeaderForPolicy(stream bool) http.Header {
 	return header
 }
 
-func (h *Handler) recordManagedFailure(agentID string, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, responseBody []byte, usage managedUsageAggregate, toolTrace []sessionhistory.ToolRoundTrace) {
+func (h *Handler) recordManagedFailure(agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, responseBody []byte, usage managedUsageAggregate, toolTrace []sessionhistory.ToolRoundTrace) {
 	if h.sessionRecorder == nil {
 		return
 	}
@@ -3779,7 +3797,7 @@ func (h *Handler) recordManagedFailure(agentID string, providerName, requestedMo
 		Version:           1,
 		Status:            "error",
 		ClawID:            agentID,
-		TS:                time.Now().UTC().Format(time.RFC3339),
+		TS:                time.Now().UTC().Format(time.RFC3339Nano),
 		Path:              requestPath,
 		RequestedModel:    requestedModel,
 		EffectiveProvider: providerName,
@@ -3795,6 +3813,7 @@ func (h *Handler) recordManagedFailure(agentID string, providerName, requestedMo
 		Usage:     usage.sessionUsage(),
 		ToolTrace: toolTrace,
 	}
+	entry = metadataHistory(agentCtx, entry)
 	if err := entry.EnsureID(); err != nil {
 		h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("session history id: %w", err))
 		return

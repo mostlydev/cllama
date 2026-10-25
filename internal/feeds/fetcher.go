@@ -87,9 +87,15 @@ func (f *Fetcher) Fetch(ctx context.Context, agentID string, entry FeedEntry) (F
 	key := f.cacheKey(agentID, entry.URL)
 	now := f.now()
 
-	f.mu.RLock()
+	f.mu.Lock()
 	cached, hasCached := f.cache[key]
-	f.mu.RUnlock()
+	if entry.NoCache {
+		// A no-retention request cannot reuse a previous content cache, even as
+		// a stale fallback after an upstream error.
+		delete(f.cache, key)
+		cached, hasCached = nil, false
+	}
+	f.mu.Unlock()
 
 	if !entry.NoCache && hasCached && now.Before(cached.expiresAt) {
 		if f.logger != nil {

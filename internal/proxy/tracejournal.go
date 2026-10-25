@@ -164,7 +164,7 @@ func (h *Handler) tracedDo(req *http.Request, info tracejournal.UpstreamInfo) (*
 		return nil, err
 	}
 	started := time.Now()
-	resp, err := h.client.Do(req)
+	resp, err := h.doProviderHTTP(req)
 	return seg.FinishUpstream(call, started, resp, err)
 }
 

@@ -201,6 +201,9 @@ func (h *Handler) recallMemory(reqCtx context.Context, agentID string, agentCtx 
 }
 
 func (h *Handler) retainMemory(agentID string, agentCtx *agentctx.AgentContext, entry sessionhistory.Entry) {
+	if !localContentAllowed(agentCtx) {
+		return
+	}
 	if agentCtx == nil || agentCtx.Memory == nil || agentCtx.Memory.Retain == nil {
 		if agentCtx != nil && agentCtx.Memory != nil {
 			h.logger.LogMemoryOp(agentID, entry.RequestedModel, logging.MemoryOpInfo{

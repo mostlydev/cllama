@@ -228,6 +228,9 @@ func (h *Handler) fetchFeeds(reqCtx context.Context, agentID string, agentCtx *a
 	results := make([]feeds.FeedResult, 0, len(entries))
 	channelMetadataByFeed := make(map[string]channelContextMetadata)
 	for _, entry := range entries {
+		if !localContentAllowed(agentCtx) {
+			entry.NoCache = true
+		}
 		var channelContextDecision channelContextPrepareDecision
 		channelFeed := isChannelContextFeed(entry)
 		channelAwarenessFeed := isChannelAwarenessFeed(entry)
@@ -507,6 +510,13 @@ func (h *Handler) scorePolicyResponse(agentID string, agentCtx *agentctx.AgentCo
 	if !h.policyEnabled(agentCtx) {
 		return
 	}
+	// Scoring is optional and asynchronous, and it carries full request and
+	// response content. Under local_retention none it is skipped; the gates,
+	// which decide the request, still run.
+	if !localContentAllowed(agentCtx) {
+		h.logger.LogIntervention(agentID, requestedModel, "policy_score_suppressed:local_retention")
+		return
+	}
 	req := PolicyScoreRequest{
 		PolicyRequestMeta: h.policyMeta(agentID, agentCtx, format, mode, stream, requestedModel),
 		RequestBody:       string(requestEffective),
@@ -645,6 +655,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { finishRequest(); h.clearRevokedSnapshot(agentID) }()
 	r = r.WithContext(requestCtx)
+	// Every authenticated, admitted request is traced, including data-policy
+	// refusals, so a coverage seal accounts for it.
 	seg, tw, r, ok := h.beginTrace(w, r, agentID, secret, ctx, start)
 	if !ok {
 		return
@@ -652,6 +664,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if seg != nil {
 		w = tw
 		defer h.finishTrace(seg, tw, r, agentID)
+	}
+	policy, policyErr := ctx.EffectiveDataPolicy()
+	if policyErr != nil {
+		h.fail(w, http.StatusBadRequest, "invalid data policy", agentID, "", start, nil)
+		return
+	}
+	if dataPolicyConstrained(policy) && (r.URL.RawQuery != "" || r.URL.ForceQuery) {
+		h.fail(w, http.StatusBadRequest, "data policy requirement not established: request_query", agentID, "", start, nil)
+		return
+	}
+	copyCtx := *ctx
+	copyCtx.DataPolicy = &policy
+	ctx = &copyCtx
+	// Derive from the traced request context so the journal segment survives.
+	r = r.WithContext(context.WithValue(r.Context(), dataPolicyKey{}, policy))
+	if !localContentAllowed(ctx) {
+		h.snapshots.Delete(agentID)
+		h.managedTurns.forget(agentID)
+		h.managedAnthropicTurns.forget(agentID)
 	}
 	if h.policyEnabled(ctx) {
 		inBody, err := io.ReadAll(r.Body)
@@ -702,7 +733,7 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 	}
 	managedTool := hasManagedTools(agentCtx)
 	h.logToolManifestState(agentID, requestedModel, agentCtx)
-	if managedTool {
+	if managedTool && localContentAllowed(agentCtx) {
 		// Continuity reinjection must happen before memory recall and feed/time
 		// injection so both the recall backend and the upstream model see the
 		// effective transcript that produced the runner-visible assistant reply.
@@ -722,6 +753,9 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		return
 	}
 	requestInfo := requestTelemetry("openai", payload, dynamicContext)
+	if !localContentAllowed(agentCtx) {
+		requestInfo = &logging.RequestInfo{}
+	}
 	resolution, err := h.resolveOpenAIExecution(agentCtx, requestedModel)
 	if err != nil {
 		status := http.StatusBadGateway
@@ -731,7 +765,9 @@ func (h *Handler) handleOpenAI(w http.ResponseWriter, r *http.Request, agentID s
 		h.fail(w, status, err.Error(), agentID, requestedModel, start, err)
 		return
 	}
-	h.captureContextSnapshot(agentID, "openai", requestedModel, payload, resolution, feedCtx.Blocks, contextBlocks.Snapshots, memoryRecall, timeContext, managedTool, 1)
+	if localContentAllowed(agentCtx) {
+		h.captureContextSnapshot(agentID, "openai", requestedModel, payload, resolution, feedCtx.Blocks, contextBlocks.Snapshots, memoryRecall, timeContext, managedTool, 1)
+	}
 
 	if h.accumulator != nil && h.pricing != nil && isStreamingChatCompletions(r.URL.Path, payload) {
 		ensureStreamUsage(payload)
@@ -790,7 +826,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	}
 	managedTool := hasManagedTools(agentCtx)
 	h.logToolManifestState(agentID, requestedModel, agentCtx)
-	if managedTool {
+	if managedTool && localContentAllowed(agentCtx) {
 		// Anthropic continuity reinjection follows the same rule as OpenAI:
 		// hidden mediated turns must be restored before recall/feed injection so
 		// the effective transcript seen by recall and the upstream model is the
@@ -813,6 +849,9 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		}
 	}
 	requestInfo := requestTelemetry("anthropic", payload, dynamicContext)
+	if !localContentAllowed(agentCtx) {
+		requestInfo = &logging.RequestInfo{}
+	}
 	resolution, err := h.resolveAnthropicExecution(agentCtx, requestedModel)
 	if err != nil {
 		status := http.StatusBadGateway
@@ -822,7 +861,9 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		h.fail(w, status, err.Error(), agentID, requestedModel, start, err)
 		return
 	}
-	h.captureContextSnapshot(agentID, "anthropic", requestedModel, payload, resolution, feedCtx.Blocks, contextBlocks.Snapshots, memoryRecall, timeContext, managedTool, 1)
+	if localContentAllowed(agentCtx) {
+		h.captureContextSnapshot(agentID, "anthropic", requestedModel, payload, resolution, feedCtx.Blocks, contextBlocks.Snapshots, memoryRecall, timeContext, managedTool, 1)
+	}
 	if resolution.Intervention != "" {
 		h.logger.LogIntervention(agentID, requestedModel, resolution.Intervention)
 	}
@@ -915,6 +956,12 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			return true, sawCooldown, "provider_key_unavailable"
 		}
 
+		checked, policyErr := h.policyUpstream(r.Context(), agentID, requestedModel, prov, upstream)
+		if policyErr != nil {
+			h.fail(w, http.StatusBadRequest, policyErr.Error(), agentID, requestedModel, start, nil)
+			return false, sawCooldown, ""
+		}
+		upstream = checked
 		targetURL, err := buildUpstreamURL(prov.BaseURL, upstream.Path, r.URL.RawQuery)
 		if err != nil {
 			h.fail(w, http.StatusBadGateway, "invalid provider URL", agentID, requestedModel, start, err)
@@ -932,7 +979,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			h.fail(w, http.StatusBadGateway, "failed to create upstream request", agentID, requestedModel, start, err)
 			return false, sawCooldown, ""
 		}
-		copyRequestHeaders(outReq.Header, r.Header)
+		copyDataPolicyHeaders(outReq.Header, r.Header, requestDataPolicy(r.Context()))
 		outReq.Header.Set("Content-Type", "application/json")
 		if upstream.Adapter {
 			// The adapter rewrites the body, so it must be able to read it.
@@ -943,7 +990,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		}
 
 		// Forward Anthropic-specific headers for the Anthropic path.
-		if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+		if strings.HasPrefix(r.URL.Path, "/v1/messages") && !dataPolicyConstrained(requestDataPolicy(r.Context())) {
 			for _, hdr := range []string{"Anthropic-Version", "Anthropic-Beta"} {
 				if v := r.Header.Get(hdr); v != "" {
 					outReq.Header.Set(hdr, v)
@@ -1122,7 +1169,7 @@ func (h *Handler) doUpstreamRequest(req *http.Request, cancel context.CancelFunc
 	// streamBody, so a header-only stream can consume up to two intervals.
 	timeout := streamFirstByteTimeoutDuration()
 	if !downstreamStream || timeout <= 0 {
-		resp, err := h.client.Do(req)
+		resp, err := h.doProviderHTTP(req)
 		return seg.FinishUpstream(call, started, resp, err)
 	}
 
@@ -1132,7 +1179,7 @@ func (h *Handler) doUpstreamRequest(req *http.Request, cancel context.CancelFunc
 	}
 	ch := make(chan result, 1)
 	go func() {
-		resp, err := h.client.Do(req)
+		resp, err := h.doProviderHTTP(req)
 		ch <- result{resp: resp, err: err}
 	}()
 
@@ -1416,7 +1463,7 @@ func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext
 		entry := sessionhistory.Entry{
 			Version:           1,
 			ClawID:            agentID,
-			TS:                start.UTC().Format(time.RFC3339),
+			TS:                start.UTC().Format(time.RFC3339Nano),
 			Path:              requestPath,
 			RequestedModel:    requestedModel,
 			EffectiveProvider: providerName,
@@ -1432,6 +1479,7 @@ func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext
 				ReportedCostUSD:  sessionHistoryCostUSD(usage, costUSD, costKnown),
 			},
 		}
+		entry = metadataHistory(agentCtx, entry)
 		if err := entry.EnsureID(); err != nil {
 			h.logger.LogError(agentID, requestedModel, 0, 0, fmt.Errorf("session history id: %w", err))
 			return
@@ -1578,6 +1626,10 @@ func copyRequestHeaders(dst, src http.Header) {
 	for k, vals := range src {
 		if isHopByHopHeader(k) ||
 			strings.EqualFold(k, "Authorization") ||
+			// An Anthropic- or Gemini-format runner authenticates to cllama
+			// with these; never pass the agent's cllama secret upstream.
+			strings.EqualFold(k, "X-Api-Key") ||
+			strings.EqualFold(k, "X-Goog-Api-Key") ||
 			strings.EqualFold(k, "Accept-Encoding") ||
 			strings.EqualFold(k, "X-Claw-Consumer-Session-Epoch") ||
 			strings.EqualFold(k, "X-Cllama-Policy-Origin") {
