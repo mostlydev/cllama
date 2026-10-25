@@ -417,7 +417,7 @@ One file per agent. Each line is one entry, appended on every successful upstrea
 | `stream` | Whether the response was streamed (SSE). |
 | `request_original` | Request body as received from the agent. |
 | `request_effective` | Request body as forwarded to the upstream (after credential swap and model rewrite). |
-| `response` | `{format, json?, text?}` — `format` is `"json"` or `"sse"`. JSON responses include `json` (parsed body); SSE responses include `text` (raw event stream). |
+| `response` | `{format, json?, text?}` — `format` is `"metadata"` by default; with local content retention enabled it is `"json"` or `"sse"`. JSON responses include `json` (parsed body); SSE responses include `text` (raw event stream). |
 | `usage` | `{prompt_tokens, completion_tokens}` extracted from the response. |
 | `usage.reported_cost_usd` | float | Provider-reported cost in USD; `omitempty` |
 
@@ -426,6 +426,101 @@ One file per agent. Each line is one entry, appended on every successful upstrea
 When orchestrated by Clawdapus, `claw up` automatically bind-mounts `.claw-session-history/` (relative to the pod file) into the cllama container at `/claw/session-history` whenever cllama is enabled for any service in the pod. No manual volume configuration is required.
 
 Session history is infrastructure-owned. Agents do not write to it and have no read API against it in Phase 1. The JSONL files are accessible to operators via the host filesystem for offline analysis and auditing.
+
+## Data policy and migration
+
+An absent `metadata.json.data_policy` now means US/EU processing only, no training,
+no upstream retention, and no ordinary local content retention. An existing API
+key alone does **not** establish those conditions. This is a fail-closed migration:
+configure a documented regional endpoint and any necessary account assurances,
+or explicitly relax the relevant requirement. cllama never rewrites a global
+endpoint to a regional endpoint on an operator's behalf.
+
+The compiler-owned metadata contract is:
+
+```json
+{
+  "data_policy": {
+    "version": 1,
+    "regions": ["eu", "us"],
+    "training": "none",
+    "retention": "none",
+    "local_retention": "none",
+    "attestations": [
+      {
+        "provider": "openai",
+        "endpoint": "https://us.api.openai.com/v1",
+        "guarantees": ["no-training", "zero-data-retention"]
+      }
+    ]
+  }
+}
+```
+
+That example requires an eligible US-residency project with zero-data-retention
+terms, and `OPENAI_BASE_URL=https://us.api.openai.com/v1`. It is a declaration of
+operator-verified terms, never an API that enables those terms. It applies to
+**every key** in that provider pool. A custom gateway needs its own exact endpoint
+attestation; an empty endpoint covers only the provider's recognized official
+origins. HTTPS is required except for local/private/in-pod HTTP targets.
+
+`regions` permits processing locations (lowercase country/region codes, or
+`["global"]` alone). `training` is `none|allowed`; upstream `retention` is
+`none|provider-default`; `local_retention` is `none|allowed`. An attestation may
+supply `processing:us`, `storage:us`, `no-training`, or `zero-data-retention`
+(and corresponding region codes). Storage evidence does not establish processing
+location. To permit Japan, add `jp` to `regions` **and** configure a route whose
+processing there is established; merely adding the code grants no capability.
+
+| Provider / endpoint | Processing evidence | No-training / retention evidence |
+|---|---|---|
+| OpenAI US/EU | Recognized `us.api.openai.com/v1` / `eu.api.openai.com/v1` | Account attestations; wire `store:false` alone is insufficient. |
+| Anthropic first party | Messages `inference_geo:us` is enforced for recognized Claude 4.6+ families; otherwise processing attestation | Account attestations; known Fable/Mythos 5 families are refused under no-retention. |
+| OpenRouter US/EU | Recognized `us.openrouter.ai/api/v1` / `eu.openrouter.ai/api/v1`, subject to regional-service entitlement | Enforced `provider.data_collection:deny` and `provider.zdr:true`; existing `only`, `allow_fallbacks`, and `require_parameters` stay intact. |
+| Vercel AI Gateway | Endpoint-bound processing attestation | Account no-training attestation plus enforced `providerOptions.gateway.zeroDataRetention:true`. |
+| xAI US | Recognized `us.api.x.ai/v1` | Account attestations; wire `store:false` is enforced. |
+| Gemini Developer API, Meta, custom gateways, remote Ollama | Endpoint-bound processing attestation | Endpoint-bound account/deployment attestations. Provider name alone proves nothing. |
+
+OpenAI's Japan endpoint currently establishes storage, **not** Japan processing.
+The Gemini Developer API does not by itself establish paid-tier or zero-retention
+eligibility. Regional and ZDR offerings may require separate account approval.
+OpenRouter's EU offering uses its documented Europe footprint, which includes
+EEA/UK/Switzerland; `eu` here is that vendor region, not a legal EU-only warranty.
+Sources: [OpenAI data controls](https://developers.openai.com/api/docs/guides/your-data),
+[Anthropic geography](https://platform.claude.com/docs/en/manage-claude/data-residency),
+[Anthropic retention](https://platform.claude.com/docs/en/manage-claude/api-and-data-retention),
+[OpenRouter routing](https://openrouter.ai/docs/guides/routing/provider-selection),
+[Vercel ZDR](https://vercel.com/docs/ai-gateway/security-and-compliance/zdr),
+[xAI security](https://docs.x.ai/developers/faq/security), and
+[Gemini ZDR](https://ai.google.dev/gemini-api/docs/zdr).
+
+No-retention refuses explicit provider state such as background requests, stored
+responses/conversations/files, extended cache options, provider-hosted tools and
+known incompatible models. Contractual ZDR is not a promise that all transient
+technical caches or mandatory safety/legal exceptions disappear: for example,
+OpenAI documents ZDR-compatible encrypted prompt KV caching in its
+[prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
+cllama does not manufacture stronger guarantees than the selected service offers.
+
+Checks run on the final wire body, after translation, for every key attempt,
+format retry and model/provider fallback. A requirement without evidence returns
+HTTP 400 with fixed `data policy requirement not established: <dimension>` text,
+before that dispatch. Provider redirects are refused. Audit interventions record
+`data_policy_processing:<provider>:<enforced|attested|allowed>:<region>`,
+`data_policy_training:<provider>:<mode>`, `data_policy_retention:<provider>:<mode>`,
+or `data_policy_refused:<dimension>`; these contain no prompt or credential.
+An unsafe primary fails closed rather than silently choosing another model.
+
+With `local_retention:none`, new ordinary history entries keep accounting,
+models, status, timestamps and IDs, with `response:{"format":"metadata"}`;
+request/response bodies and tool traces are omitted. New context snapshots,
+cross-request tool continuity, feed content caching and automatic memory retain
+are suppressed. Existing files are preserved. Explicit `CLLAMA_TRACE_JOURNAL=on`
+is a separate operator opt-in to **journal content only**: it continues to record
+bounded/redacted trace segments even when ordinary content retention is off.
+Revocation and cursor metadata remain available. This policy covers model-provider
+requests and proxy observability; it is not a deletion policy for mounted contracts,
+workload files, service business records or tool effects.
 
 ## Trace Journal
 

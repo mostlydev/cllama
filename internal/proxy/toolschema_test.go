@@ -255,7 +255,7 @@ func TestValidateManagedToolArgsExtraPropertiesIgnored(t *testing.T) {
 }
 
 func schemaValidationAgentContext(serverURL string) *agentctx.AgentContext {
-	return &agentctx.AgentContext{
+	return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 		Tools: &agentctx.ToolManifest{
 			Tools: []agentctx.ToolManifestEntry{{
 				Name: "trading-api.propose_trade",

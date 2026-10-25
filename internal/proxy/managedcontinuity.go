@@ -530,3 +530,12 @@ func cloneRawMessages(in []json.RawMessage) []json.RawMessage {
 	}
 	return out
 }
+
+func (s *managedOpenAIContinuityStore) forget(agentID string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.agents, agentID)
+}

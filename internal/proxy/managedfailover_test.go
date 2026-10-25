@@ -41,7 +41,7 @@ func stubContextLoaderWithToolsAndPolicy(agentID, token string, tools *agentctx.
 		if id != agentID {
 			return nil, io.EOF
 		}
-		return &agentctx.AgentContext{
+		return &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 			AgentID:     id,
 			ContextDir:  "/claw/context/" + id,
 			AgentsMD:    []byte("# Contract"),
@@ -219,7 +219,7 @@ func TestManagedDispatchPreservesCooldownAcrossResponseBodyReadFallback(t *testi
 		{ProviderName: "missing", UpstreamModel: "fallback-model"},
 	}
 
-	resp, status, msg, err := h.dispatchCandidatesJSON(context.Background(), req, "agent-1", "openai/gpt-4o", payload, candidates, nil)
+	resp, status, msg, err := h.dispatchCandidatesJSON(context.WithValue(context.Background(), dataPolicyKey{}, *testPermissiveDataPolicy()), req, "agent-1", "openai/gpt-4o", payload, candidates, nil)
 	if err == nil {
 		t.Fatal("expected exhausted candidate error")
 	}

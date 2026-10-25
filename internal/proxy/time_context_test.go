@@ -8,7 +8,7 @@ import (
 )
 
 func TestCurrentTimeLineUsesMetadataTimezone(t *testing.T) {
-	ctx := &agentctx.AgentContext{
+	ctx := &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 		Metadata: map[string]any{
 			"timezone": "America/New_York",
 		},
@@ -24,7 +24,7 @@ func TestCurrentTimeLineUsesMetadataTimezone(t *testing.T) {
 func TestCurrentTimeLineFallsBackToEnvTimezone(t *testing.T) {
 	t.Setenv("TZ", "America/Chicago")
 
-	ctx := &agentctx.AgentContext{
+	ctx := &agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy(),
 		Metadata: map[string]any{
 			"timezone": "Mars/Olympus",
 		},
@@ -40,7 +40,7 @@ func TestCurrentTimeLineFallsBackToEnvTimezone(t *testing.T) {
 func TestCurrentTimeLineFallsBackToUTC(t *testing.T) {
 	t.Setenv("TZ", "")
 
-	got := currentTimeLine(&agentctx.AgentContext{}, time.Date(2026, 3, 25, 14, 15, 0, 0, time.UTC))
+	got := currentTimeLine(&agentctx.AgentContext{DataPolicy: testPermissiveDataPolicy()}, time.Date(2026, 3, 25, 14, 15, 0, 0, time.UTC))
 	want := "Current time: 2026-03-25 2:15 PM UTC"
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
