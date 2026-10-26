@@ -477,7 +477,7 @@ processing there is established; merely adding the code grants no capability.
 
 | Provider / endpoint | Processing evidence | No-training / retention evidence |
 |---|---|---|
-| OpenAI US/EU | Recognized `us.api.openai.com/v1` / `eu.api.openai.com/v1` | Account attestations; wire `store:false` alone is insufficient. |
+| OpenAI US/EU | Recognized `us.api.openai.com/v1` / `eu.api.openai.com/v1` | Account attestations; wire `store:false` and `prompt_cache_retention:"in_memory"` (official endpoints, so an omitted value never falls back to the extended cache) are applied but alone are insufficient. |
 | Anthropic first party | Messages `inference_geo:us` is enforced for recognized Claude 4.6+ families; otherwise processing attestation | Account attestations; known Fable/Mythos 5 families are refused under no-retention. |
 | OpenRouter US/EU | Regional origins constrain shared endpoints; `processing:<region>` assurance must also cover BYOK and configured destinations. | Enforced `provider.data_collection:deny` and `provider.zdr:true`, plus account `zero-data-retention` assurance covering observability. Existing `only`, `allow_fallbacks`, and `require_parameters` stay intact. |
 | Vercel AI Gateway | Endpoint-bound processing attestation | Account no-training and zero-retention attestations plus enforced `providerOptions.gateway.zeroDataRetention:true` within eligible account/BYOK terms. |

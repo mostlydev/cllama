@@ -581,3 +581,29 @@ func TestPolicyScoreSuppressedWithoutLocalRetention(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// Omitting prompt_cache_retention leaves OpenAI's default, which may be the
+// extended cache; under retention none official endpoints pin in_memory.
+func TestDataPolicyPinsOpenAIInMemoryPromptCache(t *testing.T) {
+	p := policyForEndpoint("openai", "", "us")
+	p.Attestations[0].Guarantees = []string{"no-training", "processing:us", "zero-data-retention"}
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
+		got, err := enforceProviderDataPolicy(p, &provider.Provider{Name: "openai", BaseURL: "https://api.openai.com/v1"}, upstreamEncoding{Path: path, Body: []byte(`{"model":"gpt-6-sol"}`)})
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		var body map[string]any
+		_ = json.Unmarshal(got.Body, &body)
+		if body["prompt_cache_retention"] != "in_memory" || !strings.Contains(strings.Join(got.Mutations, ","), "data_policy_control:openai:prompt_cache_in_memory") {
+			t.Fatalf("%s: body %v mutations %v", path, body, got.Mutations)
+		}
+	}
+	if _, err := enforceProviderDataPolicy(p, &provider.Provider{Name: "openai", BaseURL: "https://api.openai.com/v1"}, upstreamEncoding{Path: "/v1/responses", Body: []byte(`{"model":"gpt-6-sol","prompt_cache_retention":"24h"}`)}); err == nil {
+		t.Fatal("an explicit extended cache must still be refused")
+	}
+	permissive := *testPermissiveDataPolicy()
+	got, err := enforceProviderDataPolicy(permissive, &provider.Provider{Name: "openai", BaseURL: "https://api.openai.com/v1"}, upstreamEncoding{Path: "/v1/responses", Body: []byte(`{"model":"gpt-6-sol"}`)})
+	if err != nil || strings.Contains(string(got.Body), "prompt_cache_retention") {
+		t.Fatalf("provider-default retention must leave the cache choice alone: %s %v", got.Body, err)
+	}
+}

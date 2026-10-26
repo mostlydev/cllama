@@ -501,6 +501,12 @@ func enforceProviderDataPolicy(p agentctx.DataPolicy, prov *provider.Provider, u
 	if p.Retention == "none" && (upstream.Path == "/v1/chat/completions" || upstream.Path == "/v1/responses") && (prov.Name == "openai" || prov.Name == "xai" || prov.Name == "openrouter" || prov.Name == "vercel") {
 		body["store"] = false
 	}
+	// Omitting prompt_cache_retention lets OpenAI pick its own default, which
+	// can be the extended 24h cache. Official endpoints get in_memory
+	// explicitly; an explicit longer value was already refused above.
+	if p.Retention == "none" && official && prov.Name == "openai" && (upstream.Path == "/v1/chat/completions" || upstream.Path == "/v1/responses") {
+		body["prompt_cache_retention"] = "in_memory"
+	}
 	var err error
 	upstream.Body, err = json.Marshal(body)
 	if err != nil {
@@ -527,6 +533,9 @@ func enforceProviderDataPolicy(p agentctx.DataPolicy, prov *provider.Provider, u
 		if !policyAllowsRegion(p, "global") && region != "" {
 			mutations = append(mutations, "data_policy_control:openrouter:regional_"+region)
 		}
+	}
+	if official && prov.Name == "openai" && p.Retention == "none" {
+		mutations = append(mutations, "data_policy_control:openai:prompt_cache_in_memory")
 	}
 	if official && prov.Name == "vercel" && p.Retention == "none" {
 		mutations = append(mutations, "data_policy_control:vercel:zero_data_retention")
