@@ -33,7 +33,29 @@ type Error struct {
 	// Terminal means retrying cannot help until the operator signs in again.
 	Terminal bool
 	Detail   string
+	// Stage is a fixed label for the step that failed. It is chosen here,
+	// never taken from a vendor reply, so it is safe to log.
+	Stage string
+	// Status is the token endpoint's HTTP status, when it answered.
+	Status int
 }
+
+// Stages of the credential step, for diagnostics.
+const (
+	StageSigninRequired    = "signin_required"
+	StageLock              = "lock"
+	StageRefreshTransport  = "refresh_transport"
+	StageRefreshHTTP       = "refresh_http"
+	StageRefreshMalformed  = "refresh_malformed"
+	StageRefreshNoRotation = "refresh_no_rotation"
+	StageSave              = "save"
+)
+
+var (
+	errTokenUnreachable = errors.New("token endpoint unreachable")
+	errTokenUnreadable  = errors.New("token endpoint reply unreadable")
+	errTokenMalformed   = errors.New("token endpoint reply malformed")
+)
 
 func (e *Error) Error() string {
 	msg := e.Reason
@@ -126,19 +148,19 @@ func (c *Client) tokenRequest(ctx context.Context, form url.Values) (*tokenRespo
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		// A transport error can echo the request; never the form body.
-		return nil, 0, "", errors.New("token endpoint unreachable")
+		return nil, 0, "", errTokenUnreachable
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAuthResponseBytes))
 	if err != nil {
-		return nil, resp.StatusCode, "", errors.New("token endpoint reply unreadable")
+		return nil, resp.StatusCode, "", errTokenUnreadable
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, resp.StatusCode, authErrorCode(body), nil
 	}
 	var out tokenResponse
 	if err := json.Unmarshal(body, &out); err != nil || out.AccessToken == "" {
-		return nil, resp.StatusCode, "", errors.New("token endpoint reply malformed")
+		return nil, resp.StatusCode, "", errTokenMalformed
 	}
 	return &out, resp.StatusCode, "", nil
 }
@@ -157,7 +179,7 @@ var terminalRefreshCodes = map[string]bool{
 // saved as needing sign-in; on a transient failure it is left untouched.
 func (c *Client) Refresh(ctx context.Context, rec *Record) (*Record, error) {
 	if !rec.Usable() {
-		return nil, &Error{Reason: ReasonSigninRequired, Terminal: true}
+		return nil, &Error{Reason: ReasonSigninRequired, Terminal: true, Stage: StageSigninRequired}
 	}
 	form := url.Values{
 		"grant_type":    {"refresh_token"},
@@ -167,7 +189,11 @@ func (c *Client) Refresh(ctx context.Context, rec *Record) (*Record, error) {
 	}
 	tok, status, code, err := c.tokenRequest(ctx, form)
 	if err != nil {
-		return nil, &Error{Reason: ReasonUnavailable, Detail: err.Error()}
+		stage := StageRefreshMalformed
+		if errors.Is(err, errTokenUnreachable) {
+			stage = StageRefreshTransport
+		}
+		return nil, &Error{Reason: ReasonUnavailable, Detail: err.Error(), Stage: stage, Status: status}
 	}
 	if tok == nil {
 		if terminalRefreshCodes[code] {
@@ -177,14 +203,14 @@ func (c *Client) Refresh(ctx context.Context, rec *Record) (*Record, error) {
 			next.AccessToken = ""
 			next.RefreshToken = ""
 			if serr := c.Store.Save(&next); serr != nil {
-				return nil, &Error{Reason: ReasonSigninRequired, Code: code, Terminal: true, Detail: "record not saved"}
+				return nil, &Error{Reason: ReasonSigninRequired, Code: code, Terminal: true, Detail: "record not saved", Stage: StageRefreshHTTP, Status: status}
 			}
-			return nil, &Error{Reason: ReasonSigninRequired, Code: code, Terminal: true}
+			return nil, &Error{Reason: ReasonSigninRequired, Code: code, Terminal: true, Stage: StageRefreshHTTP, Status: status}
 		}
-		return nil, &Error{Reason: ReasonUnavailable, Code: code, Detail: "token endpoint returned HTTP " + strconv.Itoa(status)}
+		return nil, &Error{Reason: ReasonUnavailable, Code: code, Detail: "token endpoint returned HTTP " + strconv.Itoa(status), Stage: StageRefreshHTTP, Status: status}
 	}
 	if tok.RefreshToken == "" {
-		return nil, &Error{Reason: ReasonUnavailable, Detail: "refresh reply carried no replacement refresh token"}
+		return nil, &Error{Reason: ReasonUnavailable, Detail: "refresh reply carried no replacement refresh token", Stage: StageRefreshNoRotation, Status: status}
 	}
 	next := *rec
 	next.AccessToken = tok.AccessToken
@@ -200,12 +226,12 @@ func (c *Client) Refresh(ctx context.Context, rec *Record) (*Record, error) {
 		next.Reason = "plan usage is no longer granted"
 		next.AccessToken = ""
 		_ = c.Store.Save(&next)
-		return nil, &Error{Reason: ReasonSigninRequired, Terminal: true, Detail: next.Reason}
+		return nil, &Error{Reason: ReasonSigninRequired, Terminal: true, Detail: next.Reason, Stage: StageSigninRequired}
 	}
 	// The old refresh token is spent. A record that cannot be saved must not
 	// be used: the next process would replay the spent token.
 	if err := c.Store.Save(&next); err != nil {
-		return nil, &Error{Reason: ReasonUnavailable, Detail: "refreshed sign-in could not be saved"}
+		return nil, &Error{Reason: ReasonUnavailable, Detail: "refreshed sign-in could not be saved", Stage: StageSave}
 	}
 	return &next, nil
 }

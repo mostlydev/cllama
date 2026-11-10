@@ -298,6 +298,55 @@ status below and `error.code` set to the reason.
 The last two never move a request to another billing path. A sign-in is never marked dead by
 a rejected request: only a refused refresh ends it.
 
+**Why it could not serve.** Several different faults share one reason, so each failed
+plan attempt also writes a `plan_failure` log event that names the cause:
+
+```json
+{"type":"plan_failure","claw_id":"worker","model":"chatgpt/gpt-5.6-terra","provider":"chatgpt",
+ "reason":"subscription_unavailable","branch":"stream_terminal_event","stage":"inference",
+ "status_code":200,"stream_event":"response.failed","stream_events":2,
+ "upstream_error_code":"server_error"}
+```
+
+| Field | Meaning |
+|---|---|
+| `reason` | The routing reason, or `http_<status>` / `transport_error` / `responses_adapter_error` when the ordinary handling decided |
+| `stage` | `token` for the sign-in step, `inference` for the model call |
+| `branch` | The code path that decided, from the list below |
+| `status_code` | HTTP status of the vendor's reply, when one arrived. For `stage: token` it is the token endpoint's |
+| `upstream_error_code`, `upstream_error_type` | The vendor's machine-readable code and type |
+| `body_shape` | Top-level form of an error body: `error`, `detail`, `other_object`, `not_json_object` or `empty` |
+| `stream_event` | The event that ended a stream: `response.failed`, `response.incomplete` or `error` |
+| `stream_last_event`, `stream_events` | The last event read and how many were read, when a stream ended without completing |
+| `content_type` | Media type of a 2xx reply that was not an event stream |
+
+| Branch | What happened |
+|---|---|
+| `credential_signin_required` | No usable sign-in on record |
+| `credential_lock` | The sign-in lock could not be taken |
+| `credential_refresh_transport` | The token endpoint could not be reached |
+| `credential_refresh_http` | The token endpoint refused the refresh; see `status_code` and `upstream_error_code` |
+| `credential_refresh_malformed` | The token endpoint's reply could not be read |
+| `credential_refresh_no_rotation` | The refresh reply carried no replacement refresh token |
+| `credential_save` | The refreshed sign-in could not be saved |
+| `transport` | The model call got no reply |
+| `http_429_limit`, `http_429_rate` | The plan's usage limit, or an ordinary rate limit |
+| `http_401_after_refresh` | A freshly refreshed token was refused as well |
+| `http_401_refresh_failed` | The token was refused and the refresh failed; a `stage: token` event precedes it |
+| `http_403`, `http_400_unsupported` | Not eligible, or an unsupported feature |
+| `http_other` | Any other error status, left to the ordinary handling |
+| `not_event_stream` | A 2xx reply that was not an event stream |
+| `stream_terminal_event` | The stream ended in a failure event |
+| `stream_ended_early`, `stream_interrupted`, `stream_too_large` | The stream stopped before `response.completed` |
+| `adapter_error` | A completed reply could not be translated |
+| `response_read_error` / `response_too_large` | Managed dispatch could not read the reply or it exceeded the response limit |
+| `scrub_failed` | The reply could not be buffered for the token scrub |
+
+A vendor reply is untrusted text, so none of it is logged as given. Codes, types, event names
+and media types are recorded only when they are on a fixed list in `internal/proxy/plandiag.go`;
+anything else is recorded as `unlisted`. No body, message, header value, token or account
+identifier is written. The event changes no routing decision.
+
 **Records.** Every upstream attempt in the trace journal carries `credential`, either
 `subscription` or `api_key`, beside the provider and model. Each `response` log event carries
 `provider` and `credential`. Plan-served requests are recorded at zero cost.

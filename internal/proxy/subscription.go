@@ -173,13 +173,21 @@ type planVerdict struct {
 	Action planAction
 	Reason string
 	Code   string
+	// Diag is recorded when the verdict is a failure. It is also set on a
+	// pass verdict for an error status the plan rules do not classify.
+	Diag planDiag
+	// Refresh describes a refresh that failed after a 401.
+	Refresh planDiag
 }
 
 // peekErrorCode reads a bounded prefix of an error body, restores it, and
-// returns the vendor's error code.
-func peekErrorCode(resp *http.Response) string {
+// returns the vendor's error code and type, and a fixed label for the body's
+// top-level form. The vendor documents admission refusals shaped as
+// {"detail": ...} beside the usual {"error": {...}}; the label says which
+// arrived without recording any of its text.
+func peekErrorCode(resp *http.Response) (code, kind, shape string) {
 	if resp.Body == nil {
-		return ""
+		return "", "", "empty"
 	}
 	original := resp.Body
 	prefix, _ := io.ReadAll(io.LimitReader(original, upstreamErrorPeekLimit))
@@ -189,13 +197,31 @@ func peekErrorCode(resp *http.Response) string {
 	}{Reader: io.MultiReader(bytes.NewReader(prefix), original), Closer: original}
 	var shaped struct {
 		Error struct {
-			Code string `json:"code"`
+			Code any `json:"code"`
+			Type any `json:"type"`
 		} `json:"error"`
 	}
-	if json.Unmarshal(prefix, &shaped) != nil {
-		return ""
+	if len(bytes.TrimSpace(prefix)) == 0 {
+		return "", "", "empty"
 	}
-	return shaped.Error.Code
+	var top map[string]json.RawMessage
+	if json.Unmarshal(prefix, &top) != nil {
+		return "", "", "not_json_object"
+	}
+	switch {
+	case top["error"] != nil:
+		shape = "error"
+	case top["detail"] != nil:
+		shape = "detail"
+	default:
+		shape = "other_object"
+	}
+	if json.Unmarshal(prefix, &shaped) != nil {
+		return "", "", shape
+	}
+	code, _ = shaped.Error.Code.(string)
+	kind, _ = shaped.Error.Type.(string)
+	return code, kind, shape
 }
 
 func (h *Handler) coolPlan(lease provider.KeyLease) {
@@ -215,22 +241,25 @@ func (h *Handler) planResponseVerdict(ctx context.Context, resp *http.Response, 
 	if usedToken == "" || (resp.StatusCode >= 200 && resp.StatusCode < 300) {
 		return planVerdict{}
 	}
-	code := peekErrorCode(resp)
+	code, kind, shape := peekErrorCode(resp)
+	diag := func(branch string) planDiag {
+		return planDiag{Branch: branch, Stage: planStageInference, Status: resp.StatusCode, Code: code, Kind: kind, Shape: shape}
+	}
 	switch resp.StatusCode {
 	case http.StatusTooManyRequests:
 		if code == planLimitCode {
 			h.coolPlan(lease)
-			return planVerdict{Action: planAdvance, Reason: subscription.ReasonLimitReached, Code: code}
+			return planVerdict{Action: planAdvance, Reason: subscription.ReasonLimitReached, Code: code, Diag: diag(planBranchLimit)}
 		}
 		// An ordinary rate limit is not the plan's usage limit.
 		until := time.Now().UTC().Add(parseCooldownDuration(resp))
 		_ = h.registry.MarkCooldown(lease.ProviderName, lease.KeyID, "rate_limit", until)
 		h.logger.LogProviderPool(lease.ProviderName, lease.KeyID, "cooldown", "rate_limit", until.Format(time.RFC3339))
-		return planVerdict{Action: planAdvance, Reason: "rate_limit", Code: code}
+		return planVerdict{Action: planAdvance, Reason: "rate_limit", Code: code, Diag: diag(planBranchRateLimit)}
 	case http.StatusUnauthorized:
 		if *reauthorized {
 			// A fresh token was refused too. That is not proof of revocation.
-			return planVerdict{Action: planAdvance, Reason: subscription.ReasonUnavailable, Code: code}
+			return planVerdict{Action: planAdvance, Reason: subscription.ReasonUnavailable, Code: code, Diag: diag(planBranch401Repeated)}
 		}
 		*reauthorized = true
 		if _, err := h.subs.Reauthorize(ctx, lease.ProviderName, usedToken); err != nil {
@@ -239,17 +268,20 @@ func (h *Handler) planResponseVerdict(ctx context.Context, resp *http.Response, 
 				reason = subscription.ReasonUnavailable
 			}
 			h.logger.LogProviderPool(lease.ProviderName, lease.KeyID, "signin", reason, "")
-			return planVerdict{Action: planAdvance, Reason: reason, Code: code}
+			// The inference reply and the refresh failure are two facts; the
+			// refresh one is logged by the caller through Refresh.
+			d := diag(planBranch401RefreshFail)
+			return planVerdict{Action: planAdvance, Reason: reason, Code: code, Diag: d, Refresh: credentialDiag(err)}
 		}
 		return planVerdict{Action: planRetry}
 	case http.StatusForbidden:
-		return planVerdict{Action: planFail, Reason: subscription.ReasonNotEligible, Code: code}
+		return planVerdict{Action: planFail, Reason: subscription.ReasonNotEligible, Code: code, Diag: diag(planBranch403)}
 	case http.StatusBadRequest:
 		if code == planUnsupportedCode {
-			return planVerdict{Action: planFail, Reason: subscription.ReasonUnsupported, Code: code}
+			return planVerdict{Action: planFail, Reason: subscription.ReasonUnsupported, Code: code, Diag: diag(planBranch400Unsupported)}
 		}
 	}
-	return planVerdict{}
+	return planVerdict{Diag: diag(planBranchHTTPOther)}
 }
 
 // planStreamError is a plan-route reply that opened as a success and did not
@@ -257,6 +289,15 @@ func (h *Handler) planResponseVerdict(ctx context.Context, resp *http.Response, 
 type planStreamError struct {
 	Code   string
 	Detail string
+	// The rest is for diagnostics. Branch is a fixed label; the vendor
+	// strings are reduced to listed values when they are logged.
+	Branch      string
+	Status      int
+	Kind        string
+	Event       string
+	LastEvent   string
+	Events      int
+	ContentType string
 }
 
 func (e *planStreamError) Error() string {
@@ -277,7 +318,7 @@ func collapsePlanStream(resp *http.Response) error {
 	if !isSSE(resp.Header) {
 		// A success that is not an event stream carries no completion proof.
 		resp.Body.Close()
-		return &planStreamError{Detail: "reply was not an event stream"}
+		return &planStreamError{Detail: "reply was not an event stream", Branch: planBranchNotEventStream, Status: resp.StatusCode, ContentType: planMediaType(resp.Header)}
 	}
 	defer resp.Body.Close()
 	reader := bufio.NewReaderSize(io.LimitReader(resp.Body, maxPlanStreamBytes+1), 64<<10)
@@ -285,7 +326,12 @@ func collapsePlanStream(resp *http.Response) error {
 		data      bytes.Buffer
 		completed json.RawMessage
 		total     int
+		events    int
+		lastEvent string
 	)
+	failed := func(branch, detail string) *planStreamError {
+		return &planStreamError{Detail: detail, Branch: branch, Status: resp.StatusCode, LastEvent: lastEvent, Events: events}
+	}
 	flush := func() error {
 		defer data.Reset()
 		if data.Len() == 0 {
@@ -297,30 +343,52 @@ func collapsePlanStream(resp *http.Response) error {
 			Code     string          `json:"code"`
 			Error    *struct {
 				Code string `json:"code"`
+				Type any    `json:"type"`
 			} `json:"error"`
 		}
 		if json.Unmarshal(data.Bytes(), &event) != nil {
 			return nil
 		}
+		events++
+		lastEvent = event.Type
 		switch event.Type {
 		case "response.completed":
 			completed = append(json.RawMessage(nil), event.Response...)
 		case "response.failed", "response.incomplete", "error":
-			code := event.Code
-			if event.Error != nil && event.Error.Code != "" {
-				code = event.Error.Code
+			code, kind := event.Code, ""
+			if event.Error != nil {
+				kind, _ = event.Error.Type.(string)
+				if event.Error.Code != "" {
+					code = event.Error.Code
+				}
 			}
-			if code == "" && len(event.Response) > 0 {
-				var failed struct {
+			if len(event.Response) > 0 {
+				var inner struct {
 					Error *struct {
 						Code string `json:"code"`
+						Type any    `json:"type"`
 					} `json:"error"`
+					Incomplete any `json:"incomplete_details"`
 				}
-				if json.Unmarshal(event.Response, &failed) == nil && failed.Error != nil {
-					code = failed.Error.Code
+				if json.Unmarshal(event.Response, &inner) == nil {
+					if inner.Error != nil {
+						if code == "" {
+							code = inner.Error.Code
+						}
+						if kind == "" {
+							kind, _ = inner.Error.Type.(string)
+						}
+					}
+					// An incomplete response gives its cause as a reason, not
+					// an error. It is recorded only; routing ignores it.
+					if code == "" {
+						if details, ok := inner.Incomplete.(map[string]any); ok {
+							kind, _ = details["reason"].(string)
+						}
+					}
 				}
 			}
-			return &planStreamError{Code: code, Detail: event.Type}
+			return &planStreamError{Code: code, Detail: event.Type, Branch: planBranchStreamTerminal, Status: resp.StatusCode, Kind: kind, Event: event.Type, Events: events}
 		}
 		return nil
 	}
@@ -328,7 +396,7 @@ func collapsePlanStream(resp *http.Response) error {
 		line, err := reader.ReadBytes('\n')
 		total += len(line)
 		if total > maxPlanStreamBytes {
-			return &planStreamError{Detail: "stream too large"}
+			return failed(planBranchStreamTooLarge, "stream too large")
 		}
 		trimmed := bytes.TrimRight(line, "\r\n")
 		switch {
@@ -352,11 +420,11 @@ func collapsePlanStream(resp *http.Response) error {
 				}
 				break
 			}
-			return &planStreamError{Detail: "stream interrupted"}
+			return failed(planBranchStreamCut, "stream interrupted")
 		}
 	}
 	if completed == nil {
-		return &planStreamError{Detail: "stream ended before completion"}
+		return failed(planBranchStreamEnded, "stream ended before completion")
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(completed))
 	resp.ContentLength = int64(len(completed))
@@ -462,7 +530,7 @@ func (h *Handler) scrubPlanBody(resp *http.Response) error {
 		return err
 	}
 	if len(body) > maxPlanStreamBytes {
-		return &planStreamError{Detail: "reply too large"}
+		return &planStreamError{Detail: "reply too large", Branch: planBranchScrub, Status: resp.StatusCode}
 	}
 	for _, secret := range h.subs.Secrets() {
 		if len(secret) >= 8 {

@@ -89,7 +89,7 @@ func (m *Manager) Secrets() []string {
 }
 
 func signinRequired(detail string) error {
-	return &Error{Reason: ReasonSigninRequired, Terminal: true, Detail: detail}
+	return &Error{Reason: ReasonSigninRequired, Terminal: true, Detail: detail, Stage: StageSigninRequired}
 }
 
 // Token returns a current access token for a plan provider, refreshing it
@@ -125,7 +125,7 @@ func (m *Manager) token(ctx context.Context, provider, rejected string) (string,
 		return "", signinRequired("not signed in")
 	}
 	if err != nil {
-		return "", &Error{Reason: ReasonSigninRequired, Terminal: true, Detail: "sign-in record unreadable"}
+		return "", &Error{Reason: ReasonSigninRequired, Terminal: true, Detail: "sign-in record unreadable", Stage: StageSigninRequired}
 	}
 	m.remember(rec)
 	if !rec.Usable() || !rec.HasScope(c.Plan.PlanScope) {
@@ -137,7 +137,7 @@ func (m *Manager) token(ctx context.Context, provider, rejected string) (string,
 
 	unlock, err := c.Store.Lock(ctx, provider)
 	if err != nil {
-		return "", &Error{Reason: ReasonUnavailable, Detail: "sign-in lock unavailable"}
+		return "", &Error{Reason: ReasonUnavailable, Detail: "sign-in lock unavailable", Stage: StageLock}
 	}
 	defer unlock()
 	// Another process may have refreshed while this one waited.

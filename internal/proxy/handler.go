@@ -975,6 +975,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		planToken, planErr := h.planCredential(r.Context(), prov)
 		if planErr != nil {
 			reason := planReasonOf(planErr)
+			h.logPlanFailure(agentID, requestedModel, candidate.ProviderName, reason, credentialDiag(planErr))
 			h.logCandidateFallback(agentID, requestedModel, reason)
 			return true, sawCooldown, reason
 		}
@@ -1031,6 +1032,9 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		resp, err := h.doUpstreamRequest(outReq, cancel, attemptStream, upstreamTraceInfo(candidate, upstream))
 		if err != nil {
 			cancel()
+			if planToken != "" {
+				h.logPlanFailure(agentID, requestedModel, candidate.ProviderName, candidateFallbackReason(err), planDiag{Branch: planBranchTransport, Stage: planStageInference})
+			}
 			if !canFallback {
 				status, msg := upstreamDispatchFailure(err)
 				h.fail(w, status, msg, agentID, requestedModel, start, err)
@@ -1049,6 +1053,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			// A sign-in is not a key: its replies are classified by the plan
 			// rules, and the pool entry is never marked dead.
 			verdict := h.planResponseVerdict(r.Context(), resp, lease, planToken, &reauthorized)
+			h.logPlanVerdict(agentID, requestedModel, candidate.ProviderName, verdict, resp.StatusCode)
 			switch verdict.Action {
 			case planRetry:
 				resp.Body.Close()
@@ -1138,6 +1143,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 					resp.Body.Close()
 					cancel()
 					if verdict, ok := h.planStreamVerdict(err, lease); ok {
+						h.logPlanFailure(agentID, requestedModel, candidate.ProviderName, verdict.Reason, streamDiag(err))
 						if verdict.Action == planFail {
 							h.subs.NoteFailure(agentID, verdict.Reason)
 							h.failPlan(w, verdict.Reason, agentID, requestedModel, start)
@@ -1145,6 +1151,9 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 						}
 						h.logCandidateFallback(agentID, requestedModel, verdict.Reason)
 						return true, sawCooldown, verdict.Reason
+					}
+					if planToken != "" {
+						h.logPlanFailure(agentID, requestedModel, candidate.ProviderName, "responses_adapter_error", planDiag{Branch: planBranchAdapter, Stage: planStageInference, Status: resp.StatusCode})
 					}
 					if canFallback {
 						h.logCandidateFallback(agentID, requestedModel, "responses_adapter_error")
@@ -1157,6 +1166,7 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			if planToken != "" {
 				if err := h.scrubPlanBody(resp); err != nil {
 					cancel()
+					h.logPlanFailure(agentID, requestedModel, candidate.ProviderName, subscription.ReasonUnavailable, planDiag{Branch: planBranchScrub, Stage: planStageInference, Status: resp.StatusCode})
 					h.logCandidateFallback(agentID, requestedModel, subscription.ReasonUnavailable)
 					return true, sawCooldown, subscription.ReasonUnavailable
 				}
