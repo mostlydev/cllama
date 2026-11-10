@@ -298,3 +298,42 @@ func TestLearnedShapesAreBounded(t *testing.T) {
 		t.Fatalf("hints = %d, want %d", len(hints.m), maxModelHints)
 	}
 }
+
+func TestModelHintDoesNotLearnFailedResponseWith200(t *testing.T) {
+	for _, path := range []string{"direct", "managed"} {
+		t.Run(path, func(t *testing.T) {
+			rig := newShapeRig(t, "openai")
+			rig.backend.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Path == "/v1/chat/completions" {
+					w.WriteHeader(400)
+					_, _ = io.WriteString(w, rejectsMaxTok)
+					return
+				}
+				_, _ = io.WriteString(w, `{"object":"response","status":"failed","error":{"code":"server_error"},"output":[]}`)
+			})
+			status, _ := rig.send(path, futureRef)
+			if status != 502 {
+				t.Fatalf("status = %d", status)
+			}
+			candidate, _ := rig.h.openAICandidateFromRef(futureRef)
+			if got := rig.h.hinted(candidate); got.ViaResponses || got.DropSampling {
+				t.Fatal("failed response taught a future request to use the speculative shape")
+			}
+		})
+	}
+}
+
+func TestDisabledModelHintDoesNotRetryEndpointSignal(t *testing.T) {
+	t.Setenv(EnvResponsesAPIDisabled, "true")
+	for _, path := range []string{"direct", "managed"} {
+		t.Run(path, func(t *testing.T) {
+			rig := newShapeRig(t, "openai")
+			rig.chatFail = `{"error":{"message":"use /v1/responses"}}`
+			status, _ := rig.send(path, futureRef)
+			if status != 400 || len(rig.calls()) != 1 {
+				t.Fatalf("disabled adapter retried: status=%d calls=%v", status, rig.calls())
+			}
+		})
+	}
+}

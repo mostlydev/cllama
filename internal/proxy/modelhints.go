@@ -117,7 +117,7 @@ func unsupportedParameter(resp *http.Response) string {
 // chatRejectsMaxTokens reports whether OpenAI's chat completions endpoint
 // refused max_tokens for this model. That does not prove the model is
 // Responses-only: some chat models only want max_completion_tokens. Moving
-// the request to the Responses API on the same provider, key and model is
+// the request to the Responses API on the same provider, credential class and model is
 // still correct for OpenAI, where the adapter translates the field and
 // current families need the Responses API for tool calls anyway. Other
 // providers are left alone: an OpenAI-compatible endpoint need not offer it.
@@ -159,7 +159,7 @@ func dropSampling(translated map[string]any) bool {
 // candidate, so a request is re-sent at most twice: once to move to the
 // Responses API and once to drop sampling controls.
 func (h *Handler) relearnShape(candidate dispatchCandidate, upstream upstreamEncoding, requestPath string, resp *http.Response) (dispatchCandidate, bool) {
-	if !responsesAdapterEligible(requestPath) {
+	if boolEnv(EnvResponsesAPIDisabled) || !responsesAdapterEligible(requestPath) {
 		return candidate, false
 	}
 	if !upstream.Adapter {

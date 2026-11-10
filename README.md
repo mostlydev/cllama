@@ -263,6 +263,14 @@ docker compose run --rm -p 127.0.0.1:1455:1455 cllama auth login chatgpt --liste
 The running proxy reads the saved sign-in on each request, so a new sign-in takes effect
 without a restart.
 
+**Live verification (2026-11-10).** A collaborating test operator verified an existing
+ChatGPT sign-in with Hermes task-home workers: first turn, exact-session resume,
+separate-home control, and plan-only calls on `chatgpt/gpt-5.6-terra` and
+`chatgpt/gpt-6.1-terra`. All 23 responses used the subscription, with no API-key fallback.
+A separate empty-store control failed with `subscription_signin_required` and no upstream
+request. The test did not copy the sign-in store or perform a new sign-in. This verifies
+those inference paths; it does not establish all account, refresh, or quota-limit cases.
+
 **Where the sign-in lives.** `<CLAW_AUTH_DIR>/subscriptions/chatgpt.json`, in a directory
 with mode 0700 and a file with mode 0600, both owned by the proxy's user. cllama refuses a
 directory or record that is a link, is owned by another user or is readable by others. The
@@ -446,7 +454,8 @@ Selection is per declared provider/model:
 - **Extend** with `CLLAMA_RESPONSES_API_MODELS`.
 - **Learn from the vendor:** a model this build does not know needs no code
   change. Two rejections change a request's shape, each retried once on the same
-  provider, key and model and logged as `responses_api_adapter_retry`:
+  provider, credential class and model and logged as `responses_api_adapter_retry`
+  (normal key-pool eligibility still applies):
   - chat completions answers 400 with a message naming `/v1/responses`, or, for
     provider `openai`, with `error.code` `unsupported_parameter` and
     `error.param` `max_tokens`: the request moves to the Responses adapter;

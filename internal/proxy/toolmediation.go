@@ -1109,10 +1109,6 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 		default:
 			// Same recovery as the direct dispatch path: upstream may declare a
 			// model responses-only that the built-in list does not know yet.
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				// The vendor served this shape; later requests start with it.
-				h.hints.learn(hintBaseURL, candidate)
-			}
 			if next, ok := h.relearnShape(candidate, upstream, r.URL.Path, resp); ok {
 				matchingReasoning, droppedReasoning := responsesReasoningForCandidate(reasoningReplay, next)
 				if adapted, adaptErr := adaptChatBodyToResponsesForCandidate(outBody, matchingReasoning, next); adaptErr == nil {
@@ -1238,6 +1234,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 				responsesReasoning = reasoning
 			}
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				h.hints.learn(hintBaseURL, candidate)
 				h.subs.CountServed(agentID, credentialClassFor(candidate.ProviderName))
 			}
 			return dispatchJSONAttemptResult{

@@ -1118,10 +1118,6 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			// list does not know about yet. Retry it through the adapter once
 			// rather than handing the agent a rejection that reads like a
 			// credentials or provider-pool problem.
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				// The vendor served this shape; later requests start with it.
-				h.hints.learn(hintBaseURL, candidate)
-			}
 			if next, ok := h.relearnShape(candidate, upstream, r.URL.Path, resp); ok {
 				if adapted, adaptErr := adaptChatBodyToResponsesForCandidate(outBody, nil, next); adaptErr == nil {
 					resp.Body.Close()
@@ -1179,6 +1175,10 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 					h.logCandidateFallback(agentID, requestedModel, subscription.ReasonUnavailable)
 					return true, sawCooldown, subscription.ReasonUnavailable
 				}
+			}
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				// Learn only after the response passed adapter validation.
+				h.hints.learn(hintBaseURL, candidate)
 			}
 			// Success or non-retryable status: forward response back, no key state change.
 			fallbackReason := h.forwardResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start, pendingCursor)
