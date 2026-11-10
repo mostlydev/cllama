@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -769,12 +770,13 @@ func TestRevocationAckReportsServedCredentials(t *testing.T) {
 // and is not counted as served; a stream read to its end is.
 func TestCutStreamIsNotCountedAsServed(t *testing.T) {
 	t.Setenv(EnvStreamIdleTimeoutMS, "60")
-	stall := true
+	var stall atomic.Bool
+	stall.Store(true)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"par\"}}]}\n\n")
 		w.(http.Flusher).Flush()
-		if stall {
+		if stall.Load() {
 			time.Sleep(400 * time.Millisecond)
 			return
 		}
@@ -795,7 +797,7 @@ func TestCutStreamIsNotCountedAsServed(t *testing.T) {
 	if served := subs.Served()["worker"]; len(served) != 0 {
 		t.Fatalf("a stalled stream was counted as served: %v", served)
 	}
-	stall = false
+	stall.Store(false)
 	chat()
 	if served := subs.Served()["worker"]; served["api_key"] != 1 {
 		t.Fatalf("a completed stream must be counted once: %v", served)
