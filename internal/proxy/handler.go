@@ -1162,13 +1162,8 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 				}
 			}
 			// Success or non-retryable status: forward response back, no key state change.
-			served := resp.StatusCode >= 200 && resp.StatusCode < 300
 			fallbackReason := h.forwardResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start, pendingCursor)
 			cancel()
-			// One count per completed upstream call, by the class that made it.
-			if served && fallbackReason == "" {
-				h.subs.CountServed(agentID, credentialClassFor(candidate.ProviderName))
-			}
 			if fallbackReason != "" {
 				if canFallback {
 					h.logCandidateFallback(agentID, requestedModel, fallbackReason)
@@ -1427,6 +1422,7 @@ func (h *Handler) forwardManagedToolAwareResponse(w http.ResponseWriter, resp *h
 		return
 	}
 
+	h.countServed(agentID, providerName, resp.StatusCode)
 	h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, responseBytes, start, pendingCursor)
 }
 
@@ -1448,6 +1444,7 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 		if !ok {
 			return ""
 		}
+		h.countServed(agentID, providerName, resp.StatusCode)
 		h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, responseBytes, start, pendingCursor)
 		return ""
 	}
@@ -1481,8 +1478,18 @@ func (h *Handler) streamResponse(w http.ResponseWriter, resp *http.Response, age
 	}
 
 	captured := responseBuf.Bytes()
+	h.countServed(agentID, providerName, resp.StatusCode)
 	h.recordResponse(agentID, agentCtx, providerName, requestedModel, upstreamModel, requestPath, requestOriginal, requestEffective, resp.StatusCode, resp.Header, captured, start, pendingCursor)
 	return ""
+}
+
+// countServed counts one completed upstream call for an agent, by the class
+// of credential that made it. The direct path calls it only where a reply
+// has been read to its end; the managed-tool path counts at its own dispatch.
+func (h *Handler) countServed(agentID, providerName string, statusCode int) {
+	if statusCode >= 200 && statusCode < 300 {
+		h.subs.CountServed(agentID, credentialClassFor(providerName))
+	}
 }
 
 func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext, providerName, requestedModel, upstreamModel string, requestPath string, requestOriginal []byte, requestEffective []byte, statusCode int, responseHeader http.Header, captured []byte, start time.Time, pendingCursor *pendingChannelCursorCommit) {

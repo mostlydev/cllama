@@ -764,3 +764,40 @@ func TestRevocationAckReportsServedCredentials(t *testing.T) {
 		t.Fatalf("repeat ack differs: %v vs %v", again, ack)
 	}
 }
+
+// A stream that stalls after its headers were sent is not a completed call
+// and is not counted as served; a stream read to its end is.
+func TestCutStreamIsNotCountedAsServed(t *testing.T) {
+	t.Setenv(EnvStreamIdleTimeoutMS, "60")
+	stall := true
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"par\"}}]}\n\n")
+		w.(http.Flusher).Flush()
+		if stall {
+			time.Sleep(400 * time.Millisecond)
+			return
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer backend.Close()
+	reg := provider.NewRegistry("")
+	reg.Set("openai", &provider.Provider{Name: "openai", BaseURL: backend.URL + "/v1", APIKey: "sk-api-key", Auth: "bearer"})
+	subs := subscription.NewManager(t.TempDir())
+	policy := &agentctx.ModelPolicy{Mode: "clamp", Allowed: []agentctx.AllowedModel{{Slot: "primary", Ref: "openai/gpt-4o"}}}
+	h := NewHandler(reg, stubContextLoaderWithPolicy("worker", "worker:secret", policy), logging.New(io.Discard), WithSubscriptions(subs))
+	chat := func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"openai/gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Authorization", "Bearer worker:secret")
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	chat()
+	if served := subs.Served()["worker"]; len(served) != 0 {
+		t.Fatalf("a stalled stream was counted as served: %v", served)
+	}
+	stall = false
+	chat()
+	if served := subs.Served()["worker"]; served["api_key"] != 1 {
+		t.Fatalf("a completed stream must be counted once: %v", served)
+	}
+}
