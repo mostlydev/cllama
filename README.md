@@ -277,6 +277,24 @@ further rejection. Same-build plan regression and empty-store control passed. Th
 retry was not observed live and remains covered by synthetic tests. No agent accessed the
 sign-in store; cllama may have refreshed its own record during these tests.
 
+**Which models the plan offers.** A read-only command lists the models the signed-in account
+may use, by name:
+
+```bash
+cllama auth catalog chatgpt --json
+```
+
+```json
+{"provider": "chatgpt", "complete": true, "ids": ["gpt-5.6-terra", "gpt-6.1-terra"], "read_at": "2026-11-10T21:00:00Z"}
+```
+
+It reads OpenAI's model list with the plan's own sign-in, refreshing it first if it is due,
+and returns the entries OpenAI marks for listing. The token goes to the plan's inference
+origin only and redirects are not followed. The output holds no token and no account detail.
+If the list cannot be read whole, the command prints nothing and fails with a fixed reason
+such as `subscription_signin_required` or `subscription_unavailable`. A compiler uses it to
+resolve a plan model family; the API-key model list is not a substitute for it.
+
 **Where the sign-in lives.** `<CLAW_AUTH_DIR>/subscriptions/chatgpt.json`, in a directory
 with mode 0700 and a file with mode 0600, both owned by the proxy's user. cllama refuses a
 directory or record that is a link, is owned by another user or is readable by others. The
