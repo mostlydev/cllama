@@ -105,6 +105,14 @@ func shapePlanResponsesRequest(body map[string]any) ([]string, error) {
 				return nil, &responsesAdapterRequestError{message: fmt.Sprintf("tool type %q is not supported on a plan route", typ)}
 			}
 		}
+		// How a tool_choice names one function inside a namespace is not
+		// documented for this route. Forcing a tool is refused rather than
+		// sent in a shape that may select nothing.
+		if choice, ok := body["tool_choice"].(map[string]any); ok {
+			if _, named := choice["name"]; named {
+				return nil, &responsesAdapterRequestError{message: "a tool_choice that names a tool is not supported on a plan route"}
+			}
+		}
 		body["tools"] = []any{map[string]any{
 			"type":        "namespace",
 			"name":        planToolNamespace,

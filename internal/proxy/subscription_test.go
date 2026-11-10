@@ -652,6 +652,29 @@ func TestPlanRouteNamespacesFunctionTools(t *testing.T) {
 	assertInterventionLogged(t, rig.logs.Bytes(), "subscription_tools_namespaced")
 }
 
+// Forced-tool semantics are never silently changed: a named choice is
+// refused, while auto and required pass through.
+func TestPlanRouteRefusesNamedToolChoice(t *testing.T) {
+	tools := func() []any { return []any{map[string]any{"type": "function", "name": "ping"}} }
+	if _, err := shapePlanResponsesRequest(map[string]any{"tools": tools(), "tool_choice": map[string]any{"type": "function", "name": "ping"}}); err == nil {
+		t.Fatal("a named tool_choice must be refused")
+	}
+	for _, choice := range []string{"auto", "required", "none"} {
+		body := map[string]any{"tools": tools(), "tool_choice": choice}
+		if _, err := shapePlanResponsesRequest(body); err != nil || body["tool_choice"] != choice {
+			t.Fatalf("tool_choice %q: %v %v", choice, err, body["tool_choice"])
+		}
+	}
+	rig := newPlanRig(t, planRef, keyRef)
+	rig.signIn("plan-access-0-canary", time.Hour)
+	w := rig.chat(`{"model":"chatgpt/gpt-5.6-terra","messages":[{"role":"user","content":"go"}],
+		"tools":[{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{}}}}],
+		"tool_choice":{"type":"function","function":{"name":"ping"}}}`)
+	if w.Code != http.StatusBadRequest || rig.planHits != 0 || rig.keyHits != 0 {
+		t.Fatalf("status %d, plan hits %d, key hits %d: %s", w.Code, rig.planHits, rig.keyHits, w.Body.String())
+	}
+}
+
 func TestPlanRouteRefusesHostedTools(t *testing.T) {
 	body := map[string]any{"tools": []any{map[string]any{"type": "web_search"}}}
 	if _, err := shapePlanResponsesRequest(body); err == nil {
