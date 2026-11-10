@@ -20,6 +20,7 @@ const authUsage = `usage:
   cllama auth login <plan> [--listen addr] [--port n] [--timeout d]
   cllama auth status [--json]
   cllama auth logout <plan> [--forget]
+  cllama auth catalog <plan> --json
 
 Plans: %s
 
@@ -109,6 +110,38 @@ func runAuth(args []string, stdout, stderr io.Writer) error {
 			fmt.Fprintln(stdout, line)
 		}
 		return nil
+
+	case "catalog":
+		// The models this sign-in may use, by name. The sign-in is used here
+		// and stays here: the output holds no token and no account detail.
+		fs := flag.NewFlagSet("auth catalog", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		asJSON := fs.Bool("json", false, "print JSON")
+		if err := fs.Parse(rest); err != nil {
+			return err
+		}
+		plan, err := planFor()
+		if err != nil {
+			return err
+		}
+		if !*asJSON || fs.NArg() != 0 {
+			return errors.New("usage: cllama auth catalog <plan> --json")
+		}
+		catalog, err := subscription.NewManager(cfg.AuthDir).Catalog(ctx, plan.Provider)
+		if err != nil {
+			reason := subscription.ReasonOf(err)
+			if reason == "" {
+				reason = subscription.ReasonUnavailable
+			}
+			// A fixed reason only: the error may wrap vendor or transport text.
+			return fmt.Errorf("auth catalog: %s", reason)
+		}
+		out, err := json.MarshalIndent(catalog, "", "  ")
+		if err != nil {
+			return err
+		}
+		_, err = stdout.Write(append(out, '\n'))
+		return err
 
 	case "logout":
 		fs := flag.NewFlagSet("auth logout", flag.ContinueOnError)
