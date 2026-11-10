@@ -252,13 +252,13 @@ func TestManagedPlanFailureNamesItsBranch(t *testing.T) {
 		expire bool
 		branch string
 	}{
-		"adapter":        {reply: sseReply(planSSE(`{"type":"response.completed","response":{"object":"response","status":"completed","output":"invalid"}}`)), branch: "adapter_error"},
-		"response limit": {reply: sseReply(planCompleted(strings.Repeat("x", maxManagedLLMResponseBytes))), branch: "response_too_large"},
-		"credential":     {expire: true, branch: "credential_refresh_http"},
-		"http":           {reply: jsonReply(401, `{"error":{"code":"invalid_token"}}`), branch: "http_401_after_refresh"},
-		"not a stream":   {reply: jsonReply(200, `{}`), branch: "not_event_stream"},
-		"terminal event": {reply: sseReply(planSSE(`{"type":"response.failed","response":{"error":{"code":"server_error"}}}`)), branch: "stream_terminal_event"},
-		"cut":            {reply: sseReply(planSSE(`{"type":"response.created"}`)), branch: "stream_ended_early"},
+		"malformed completed": {reply: sseReply(planSSE(`{"type":"response.completed","response":{"object":"response","status":"completed","output":"invalid"}}`)), branch: "stream_invalid_completed"},
+		"response limit":      {reply: sseReply(planCompleted(strings.Repeat("x", maxManagedLLMResponseBytes))), branch: "response_too_large"},
+		"credential":          {expire: true, branch: "credential_refresh_http"},
+		"http":                {reply: jsonReply(401, `{"error":{"code":"invalid_token"}}`), branch: "http_401_after_refresh"},
+		"not a stream":        {reply: jsonReply(200, `{}`), branch: "not_event_stream"},
+		"terminal event":      {reply: sseReply(planSSE(`{"type":"response.failed","response":{"error":{"code":"server_error"}}}`)), branch: "stream_terminal_event"},
+		"cut":                 {reply: sseReply(planSSE(`{"type":"response.created"}`)), branch: "stream_ended_early"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -356,12 +356,20 @@ func TestPlanReplyWithoutContentType(t *testing.T) {
 		branch string
 		events float64
 	}{
-		"completed stream": {body: planCompleted("from the plan"), served: true},
-		"empty body":       {body: "", branch: "stream_ended_early"},
-		"json object":      {body: fmt.Sprintf(completedResponse, "not a stream"), branch: "stream_ended_early"},
-		"html page":        {body: "<html><body>data: sign in</body></html>\n", branch: "stream_ended_early"},
-		"cut stream":       {body: planSSE(`{"type":"response.created"}`), branch: "stream_ended_early", events: 1},
-		"failed stream":    {body: planSSE(`{"type":"response.failed","response":{"error":{"code":"server_error"}}}`), branch: "stream_terminal_event", events: 1},
+		"invalid completed null":           {body: planSSE(`{"type":"response.completed","response":null}`), branch: "stream_invalid_completed", events: 1},
+		"invalid completed empty_object":   {body: planSSE(`{"type":"response.completed","response":{}}`), branch: "stream_invalid_completed", events: 1},
+		"invalid completed array":          {body: planSSE(`{"type":"response.completed","response":[]}`), branch: "stream_invalid_completed", events: 1},
+		"invalid completed number":         {body: planSSE(`{"type":"response.completed","response":42}`), branch: "stream_invalid_completed", events: 1},
+		"invalid completed missing_output": {body: planSSE(`{"type":"response.completed","response":{"object":"response","status":"completed"}}`), branch: "stream_invalid_completed", events: 1},
+		"invalid completed wrong_status":   {body: planSSE(`{"type":"response.completed","response":{"object":"response","status":"failed","output":[]}}`), branch: "stream_invalid_completed", events: 1},
+		"invalid completed null_output":    {body: planSSE(`{"type":"response.completed","response":{"object":"response","status":"completed","output":null}}`), branch: "stream_invalid_completed", events: 1},
+		"invalid completed wrong_object":   {body: planSSE(`{"type":"response.completed","response":{"object":"other","status":"completed","output":[]}}`), branch: "stream_invalid_completed", events: 1},
+		"completed stream":                 {body: planCompleted("from the plan"), served: true},
+		"empty body":                       {body: "", branch: "stream_ended_early"},
+		"json object":                      {body: fmt.Sprintf(completedResponse, "not a stream"), branch: "stream_ended_early"},
+		"html page":                        {body: "<html><body>data: sign in</body></html>\n", branch: "stream_ended_early"},
+		"cut stream":                       {body: planSSE(`{"type":"response.created"}`), branch: "stream_ended_early", events: 1},
+		"failed stream":                    {body: planSSE(`{"type":"response.failed","response":{"error":{"code":"server_error"}}}`), branch: "stream_terminal_event", events: 1},
 	}
 	for name, tc := range cases {
 		for _, path := range []string{"direct", "managed"} {

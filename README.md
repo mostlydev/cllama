@@ -339,6 +339,7 @@ plan attempt also writes a `plan_failure` log event that names the cause:
 | `not_event_stream` | A 2xx reply that declared a type other than an event stream. It is refused unread |
 | `stream_terminal_event` | The stream ended in a failure event |
 | `stream_ended_early`, `stream_interrupted`, `stream_too_large` | The stream stopped before `response.completed` |
+| `stream_invalid_completed` | A completion event lacks a response object, completed status or output array |
 | `adapter_error` | A completed reply could not be translated |
 | `response_read_error` / `response_too_large` | Managed dispatch could not read the reply or it exceeded the response limit |
 | `scrub_failed` | The reply could not be buffered for the token scrub |

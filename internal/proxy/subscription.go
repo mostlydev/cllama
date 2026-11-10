@@ -359,6 +359,15 @@ func collapsePlanStream(resp *http.Response) error {
 		lastEvent = event.Type
 		switch event.Type {
 		case "response.completed":
+			// The generic adapter deliberately passes non-response JSON through.
+			// A plan completion must first prove it carries a completed response.
+			var result map[string]any
+			if json.Unmarshal(event.Response, &result) != nil || result["object"] != "response" || result["status"] != "completed" {
+				return failed(planBranchInvalidCompleted, "invalid completed response")
+			}
+			if _, ok := result["output"].([]any); !ok {
+				return failed(planBranchInvalidCompleted, "completed response has no output array")
+			}
 			completed = append(json.RawMessage(nil), event.Response...)
 		case "response.failed", "response.incomplete", "error":
 			code, kind := event.Code, ""
