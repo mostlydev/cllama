@@ -4,7 +4,7 @@
 
 `cllama` is the reference implementation of the [cllama proxy standard](https://github.com/mostlydev/clawdapus/blob/master/docs/CLLAMA_SPEC.md) — a context-aware, bidirectional LLM governance proxy that enforces **credential starvation** on untrusted agent workloads.
 
-It is a single Go binary with zero dependencies. 15 MB distroless image. Two ports: `:8080` for the OpenAI-compatible API, `:8081` for the operator dashboard. Every agent request is identity-verified, provider-routed, cost-tracked, and audit-logged — transparently. The agent never knows the proxy exists.
+It is a single static Go binary. 15 MB distroless image. Two ports: `:8080` for the OpenAI-compatible API, `:8081` for the operator dashboard. Every agent request is identity-verified, provider-routed, cost-tracked, and audit-logged — transparently. The agent never knows the proxy exists.
 
 ```mermaid
 flowchart LR
@@ -71,7 +71,7 @@ docker build -t ghcr.io/mostlydev/cllama:latest .
 docker build --build-arg CLLAMA_VERSION=v0.X.Y --build-arg CLLAMA_REVISION=$(git rev-parse HEAD) -t ghcr.io/mostlydev/cllama:v0.X.Y .
 ```
 
-Zero external dependencies. Go standard library only.
+One dependency outside the Go standard library: `golang.org/x/sys`.
 
 ---
 
