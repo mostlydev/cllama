@@ -686,6 +686,52 @@ When orchestrated by Clawdapus, `claw up` automatically bind-mounts `.claw-sessi
 
 Session history is infrastructure-owned. Agents do not write to it and have no read API against it in Phase 1. The JSONL files are accessible to operators via the host filesystem for offline analysis and auditing.
 
+## Hosted capabilities
+
+Some request features ask the vendor to act on the agent's behalf: search the web, run
+code, read stored files, call a remote server. That is authority, not data handling, so
+cllama refuses them unless the agent's compiled context grants them by name. The check is
+separate from the data policy: relaxing the data policy grants nothing, and a grant never
+gets past a data policy that refuses.
+
+It reads the final body sent to the provider, on every key attempt, shape retry and fallback
+candidate, on both the direct and the managed-tool path. Nothing in the request can grant
+itself anything.
+
+| Capability | What asks for it | Grantable |
+|---|---|---|
+| `web_search` | Tool type `web_search` or `web_search_*`, `web_search_options`, a model with the `:online` variant | Yes |
+| `code_interpreter` | Tool type `code_interpreter` or `code_execution_*` | Yes |
+| `file_search` | Tool type `file_search` | Yes |
+| `image_generation` | Tool type `image_generation` | Yes |
+| `mcp` | Tool type `mcp`, `mcp_servers`, or any tool entry naming a remote server | No: it would grant any destination |
+| `plugins` | The `plugins` field | No |
+| `unlisted` | Any other tool type, a tool entry that is not an object, a `tools` value that is not a list, a namespace with anything but function or custom members | No |
+
+Not hosted, and untouched: `function` and `custom` tools, a tool definition with no type, a
+namespace whose members are all function or custom tools, and tools the agent's own runtime
+executes (Anthropic's dated `bash_`, `text_editor_`, `computer_` and `memory_` schemas, and
+OpenAI's `computer_use_preview`).
+
+The grant is `hosted_capabilities` in the agent's `metadata.json`, a list of grantable names:
+
+```json
+{"hosted_capabilities": ["web_search"]}
+```
+
+Absent means none. A value that is not a list of grantable names makes the context invalid
+and every request from that agent is refused with `invalid hosted capability grant`; it is
+never read as a partial grant. A grant is account-wide for that provider: `file_search` and
+`code_interpreter` reach whatever the provider account holds, and are not a managed-tool
+permission or a per-agent ACL.
+
+A refused request gets HTTP 400 `hosted capability not granted: <capability>`, makes no
+upstream call, and logs an `intervention` event `hosted_capability_refused:<capability>`.
+
+**Upgrading.** Before this, a hosted feature was refused only under a constrained data
+policy. An agent with a fully permissive data policy that uses one of these features now
+needs the grant.
+
 ## Data policy and migration
 
 An absent `metadata.json.data_policy` now means US/EU processing only, no training,

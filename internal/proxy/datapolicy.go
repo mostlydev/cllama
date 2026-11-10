@@ -567,14 +567,25 @@ func (h *Handler) policyUpstream(ctx context.Context, agentID, model string, pro
 	out, err := enforceProviderDataPolicy(requestDataPolicy(ctx), prov, u)
 	if err != nil {
 		h.logger.LogIntervention(agentID, model, "data_policy_refused:"+err.(*dataPolicyError).dimension)
-	} else {
-		for _, m := range out.Mutations {
-			if strings.HasPrefix(m, "data_policy_") {
-				h.logger.LogIntervention(agentID, model, m)
-			}
+		return out, err
+	}
+	// Hosted capabilities are judged on their own, on the body the data
+	// policy left: a relaxed data policy grants nothing, and a grant never
+	// gets past a data policy that refuses.
+	if hostedErr := enforceHostedCapabilities(requestHostedGrants(ctx), out.Body); hostedErr != nil {
+		reason := "request"
+		if refused, ok := hostedErr.(*hostedCapabilityError); ok {
+			reason = refused.capability
+		}
+		h.logger.LogIntervention(agentID, model, "hosted_capability_refused:"+reason)
+		return out, hostedErr
+	}
+	for _, m := range out.Mutations {
+		if strings.HasPrefix(m, "data_policy_") {
+			h.logger.LogIntervention(agentID, model, m)
 		}
 	}
-	return out, err
+	return out, nil
 }
 
 // Redirects are not an authorized fallback route: the target has not passed

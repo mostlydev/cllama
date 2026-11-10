@@ -683,8 +683,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	copyCtx := *ctx
 	copyCtx.DataPolicy = &policy
 	ctx = &copyCtx
+	hostedGrants, grantErr := ctx.HostedCapabilities()
+	if grantErr != nil {
+		h.fail(w, http.StatusBadRequest, "invalid hosted capability grant", agentID, "", start, nil)
+		return
+	}
 	// Derive from the traced request context so the journal segment survives.
 	r = r.WithContext(context.WithValue(r.Context(), dataPolicyKey{}, policy))
+	r = r.WithContext(context.WithValue(r.Context(), hostedGrantKey{}, hostedGrants))
 	if !localContentAllowed(ctx) {
 		h.snapshots.Delete(agentID)
 		h.managedTurns.forget(agentID)
