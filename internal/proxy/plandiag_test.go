@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -334,5 +335,98 @@ func TestPlanDiagnosticsMalformedAdvisoryCannotChangeRouting(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func bareReply(status int, body string) func(http.ResponseWriter, *http.Request, int) {
+	return func(w http.ResponseWriter, r *http.Request, hit int) {
+		// A nil entry stops net/http from sniffing a type into the header.
+		w.Header()["Content-Type"] = nil
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}
+}
+
+// The vendor's live reply carries no Content-Type. It is read as a stream,
+// and only a completed response makes it a success.
+func TestPlanReplyWithoutContentType(t *testing.T) {
+	cases := map[string]struct {
+		body   string
+		served bool
+		branch string
+		events float64
+	}{
+		"completed stream": {body: planCompleted("from the plan"), served: true},
+		"empty body":       {body: "", branch: "stream_ended_early"},
+		"json object":      {body: fmt.Sprintf(completedResponse, "not a stream"), branch: "stream_ended_early"},
+		"html page":        {body: "<html><body>data: sign in</body></html>\n", branch: "stream_ended_early"},
+		"cut stream":       {body: planSSE(`{"type":"response.created"}`), branch: "stream_ended_early", events: 1},
+		"failed stream":    {body: planSSE(`{"type":"response.failed","response":{"error":{"code":"server_error"}}}`), branch: "stream_terminal_event", events: 1},
+	}
+	for name, tc := range cases {
+		for _, path := range []string{"direct", "managed"} {
+			t.Run(name+"/"+path, func(t *testing.T) {
+				rig := newPlanRig(t, planRef, keyRef)
+				rig.signIn("plan-access-0-canary", time.Hour)
+				rig.planReply = bareReply(200, tc.body)
+				if path == "direct" {
+					if w := rig.chat(""); w.Code != 200 {
+						t.Fatalf("status %d: %s", w.Code, w.Body)
+					}
+				} else {
+					var candidates []dispatchCandidate
+					for _, ref := range []string{planRef, keyRef} {
+						candidate, err := rig.h.openAICandidateFromRef(ref)
+						if err != nil {
+							t.Fatal(err)
+						}
+						candidates = append(candidates, candidate)
+					}
+					ctx := context.WithValue(context.Background(), dataPolicyKey{}, *testPermissiveDataPolicy())
+					req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+					payload := map[string]any{"model": planRef, "messages": []any{map[string]any{"role": "user", "content": "hello"}}}
+					if resp, status, msg, err := rig.h.dispatchCandidatesJSON(ctx, req, "worker", planRef, payload, candidates, nil); err != nil || resp == nil {
+						t.Fatalf("dispatch: %d %s %v", status, msg, err)
+					}
+				}
+				served := rig.subs.Served()["worker"]
+				events := rig.planFailures()
+				if tc.served {
+					if rig.keyHits != 0 || served["subscription"] != 1 || served["api_key"] != 0 || len(events) != 0 {
+						t.Fatalf("plan did not serve: key hits %d, served %v, failures %v", rig.keyHits, served, events)
+					}
+					return
+				}
+				if rig.keyHits != 1 || served["subscription"] != 0 || served["api_key"] != 1 {
+					t.Fatalf("unproven reply counted as plan-served: key hits %d, served %v", rig.keyHits, served)
+				}
+				if len(events) != 1 || events[0]["branch"] != tc.branch || events[0]["content_type"] != "none" || events[0]["stream_bytes"] != float64(len(tc.body)) {
+					t.Fatalf("events = %v, want branch %s over %d bytes", events, tc.branch, len(tc.body))
+				}
+				if tc.events > 0 && events[0]["stream_events"] != tc.events {
+					t.Fatalf("stream_events = %v", events[0]["stream_events"])
+				}
+			})
+		}
+	}
+}
+
+// A 2xx that declares another type is refused without being read.
+func TestPlanReplyDeclaringAnotherTypeIsRefusedUnread(t *testing.T) {
+	rig := newPlanRig(t, planRef)
+	rig.signIn("plan-access-0-canary", time.Hour)
+	rig.planReply = func(w http.ResponseWriter, r *http.Request, hit int) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, planCompleted("a stream under the wrong label"))
+	}
+	if w := rig.chat(""); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d", w.Code)
+	}
+	events := rig.planFailures()
+	if len(events) != 1 || events[0]["branch"] != "not_event_stream" || events[0]["content_type"] != "application/json" {
+		t.Fatalf("events = %v", events)
+	}
+	if _, ok := events[0]["stream_bytes"]; ok {
+		t.Fatalf("an unread reply recorded bytes: %v", events[0])
 	}
 }

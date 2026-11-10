@@ -136,6 +136,8 @@ type planDiag struct {
 	ContentType string
 	// Shape classifies an error body by its top-level form, a fixed label.
 	Shape string
+	// Bytes counts what was read of a stream that did not complete.
+	Bytes int
 }
 
 // credentialDiag describes a failure of the sign-in step. The error's detail
@@ -172,6 +174,7 @@ func streamDiag(err error) planDiag {
 		d.LastEvent = e.LastEvent
 		d.Events = e.Events
 		d.ContentType = e.ContentType
+		d.Bytes = e.Bytes
 	}
 	return d
 }
@@ -195,6 +198,7 @@ func (h *Handler) logPlanFailure(agentID, model, providerName, reason string, d 
 		StreamEvents:    d.Events,
 		ContentType:     d.ContentType,
 		BodyShape:       d.Shape,
+		StreamBytes:     d.Bytes,
 	})
 }
 

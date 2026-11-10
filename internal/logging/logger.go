@@ -64,6 +64,7 @@ type entry struct {
 	StreamEvents    *int   `json:"stream_events,omitempty"`
 	ContentType     string `json:"content_type,omitempty"`
 	BodyShape       string `json:"body_shape,omitempty"`
+	StreamBytes     *int   `json:"stream_bytes,omitempty"`
 
 	// Revocation events contain IDs and counters only.
 	RevocationGeneration *uint64 `json:"revocation_generation,omitempty"`
@@ -281,6 +282,9 @@ type PlanFailureInfo struct {
 	ContentType     string
 	// BodyShape is the top-level form of an error body: a fixed label.
 	BodyShape string
+	// StreamBytes is how much of an unfinished stream was read. Set only
+	// with a stream branch; zero is recorded, since an empty reply is a finding.
+	StreamBytes int
 }
 
 // LogPlanFailure records one plan-route failure with its cause.
@@ -295,6 +299,9 @@ func (l *Logger) LogPlanFailure(clawID, model string, info PlanFailureInfo) {
 	}
 	if info.StreamEvents > 0 {
 		e.StreamEvents = ptrInt(info.StreamEvents)
+	}
+	if len(info.Branch) > 7 && info.Branch[:7] == "stream_" {
+		e.StreamBytes = ptrInt(info.StreamBytes)
 	}
 	l.log(e)
 }
