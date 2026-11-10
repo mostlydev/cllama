@@ -270,6 +270,12 @@ separate-home control, and plan-only calls on `chatgpt/gpt-5.6-terra` and
 A separate empty-store control failed with `subscription_signin_required` and no upstream
 request. The test did not copy the sign-in store or perform a new sign-in. This verifies
 those inference paths; it does not establish all account, refresh, or quota-limit cases.
+The same workflow also verified `openai/gpt-6.1-terra` through an API key: 11 successful
+responses across first turn, exact-session resume and separate-home control, after one
+initial `max_tokens` rejection. Later calls reused the learned Responses shape with no
+further rejection. Same-build plan regression and empty-store control passed. The sampling
+retry was not observed live and remains covered by synthetic tests. No agent accessed the
+sign-in store; cllama may have refreshed its own record during these tests.
 
 **Where the sign-in lives.** `<CLAW_AUTH_DIR>/subscriptions/chatgpt.json`, in a directory
 with mode 0700 and a file with mode 0600, both owned by the proxy's user. cllama refuses a
