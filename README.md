@@ -409,6 +409,45 @@ Google's restriction cited here is specifically for Antigravity credentials; it 
 rule out Google API keys or separately authorized enterprise integrations.
 
 
+## Price table export
+
+cllama costs requests with a price table compiled into the binary. A read-only command
+prints it:
+
+```bash
+cllama prices --json
+```
+
+It reads no configuration, environment, credentials or files and makes no network call, so
+a compiler can run the pinned image once and use the same prices the proxy will charge with.
+
+```json
+{
+  "schema": 1,
+  "cllama": {"version": "v0.16.0", "revision": "<commit>"},
+  "currency": "USD",
+  "unit": "per_million_tokens",
+  "entries": [
+    {"provider": "openai", "model": "gpt-5.6-terra", "input": 2, "output": 12,
+     "max_input": 4, "max_output": 18, "long_context_threshold_tokens": 272000, "tiers": "all"}
+  ]
+}
+```
+
+- Entries are sorted by provider, then model, so the output is stable for a build.
+- `input` and `output` are base rates. `max_input` and `max_output` are the highest rates the
+  entry encodes, including its long-context multipliers. Compare a price bound with those.
+- `tiers` is `all` when the entry encodes every tier the table knows for the model, and
+  `base_only` when it is knowingly simplified to the base tier (Google's models, here and
+  through OpenRouter). A `base_only` entry is an estimate, not a ceiling.
+- An ID equal to `model` is priced exactly. The proxy also costs a longer ID by its longest
+  matching entry; that is an estimate, and a consumer that needs an exact price must compare
+  IDs for equality.
+- The command prints nothing and fails if any rate is negative or not finite.
+
+These are listed prices kept up to date by hand. They are not a billing cap. A model the
+table does not list is unpriced: the proxy serves it and records its cost as unknown.
+
 ## Operator Dashboard
 
 Built-in web UI on `:8081`. No JavaScript frameworks, no build step — Go templates compiled into the binary.

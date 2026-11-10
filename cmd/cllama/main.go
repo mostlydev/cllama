@@ -56,6 +56,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) > 0 && args[0] == "auth" {
 		return runAuth(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "prices" {
+		return runPrices(args[1:], stdout, stderr)
+	}
 	fs := flag.NewFlagSet("cllama", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	healthcheck := fs.Bool("healthcheck", false, "check API server health and exit")
