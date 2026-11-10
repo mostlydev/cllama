@@ -82,6 +82,23 @@ func DefaultPricing() *Pricing {
 		LongContextInputMultiplier:  2.0,
 		LongContextOutputMultiplier: 1.5,
 	}
+	// GPT-6.1 Terra and Sol, from OpenAI's Standard price table as read on
+	// 2026-11-10: short context up to 272K input tokens, long context above.
+	// Long-context rates are listed as 2.00/7.50 (Terra) and 4.00/15.00 (Sol).
+	gpt61Terra := Rate{
+		InputPerMTok:                1.0,
+		OutputPerMTok:               5.0,
+		LongContextThresholdTokens:  gpt56LongContextThreshold,
+		LongContextInputMultiplier:  2.0,
+		LongContextOutputMultiplier: 1.5,
+	}
+	gpt61Sol := Rate{
+		InputPerMTok:                2.0,
+		OutputPerMTok:               10.0,
+		LongContextThresholdTokens:  gpt56LongContextThreshold,
+		LongContextInputMultiplier:  2.0,
+		LongContextOutputMultiplier: 1.5,
+	}
 	claudeFable5 := Rate{InputPerMTok: 10.0, OutputPerMTok: 50.0}
 	claudeOpus5 := Rate{InputPerMTok: 5.0, OutputPerMTok: 25.0}
 	// Anthropic offers Sonnet 5 at 2/10 through 2026-08-31. Use the
@@ -122,6 +139,10 @@ func DefaultPricing() *Pricing {
 			"gpt-5.6-sol":   gpt56Sol,
 			"gpt-5.6-terra": gpt56Terra,
 			"gpt-5.6-luna":  gpt56Luna,
+			// Exact entries only: there is no gpt-6.1 catch-all, so a sibling
+			// this table does not list stays unpriced.
+			"gpt-6.1-terra": gpt61Terra,
+			"gpt-6.1-sol":   gpt61Sol,
 			// GPT-5 Pro uses uniform pricing across its context window; dated
 			// snapshots inherit this rate through the existing prefix lookup.
 			"gpt-5-pro": {InputPerMTok: 15.0, OutputPerMTok: 120.0},
