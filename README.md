@@ -247,7 +247,9 @@ cllama auth status [--json]
 cllama auth logout chatgpt [--forget]
 ```
 
-`login` starts a listener on `127.0.0.1:1455`, prints the authorization URL, and waits. It
+`login` starts a listener on `127.0.0.1:1455`, prints the authorization URL, and waits. The
+callback response is allowed to finish before the command exits, so the browser can show
+the sign-in outcome. It
 saves the sign-in only after it has checked the returned state, exchanged the code with PKCE,
 verified the signed ID token (issuer, audience, expiry, nonce) and confirmed that plan usage
 was granted. When cllama runs in a container, run the command in a one-off container of the

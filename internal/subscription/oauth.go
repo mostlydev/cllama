@@ -362,6 +362,11 @@ func (c *Client) Login(ctx context.Context, opts LoginOptions) (*Record, error) 
 	defer timer.Stop()
 	select {
 	case res := <-done:
+		// The handler sent its result before net/http finished flushing the
+		// page. Drain it before Close can cut the browser connection short.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = srv.Shutdown(shutdownCtx)
+		cancel()
 		return res.rec, res.err
 	case <-timer.C:
 		return nil, errors.New("timed out waiting for the sign-in callback")

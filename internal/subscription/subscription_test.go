@@ -217,7 +217,10 @@ func callback(t *testing.T, run *loginRun, q url.Values) (int, string) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("callback response was cut short: %v", err)
+	}
 	return resp.StatusCode, string(body)
 }
 
@@ -685,5 +688,22 @@ func TestInvalidClientPreservesRegistrationAndTokens(t *testing.T) {
 	}
 	if saved.RefreshToken != original.RefreshToken || saved.State != StateActive || saved.ClientID != original.ClientID {
 		t.Fatal("configuration failure destroyed registration or credential")
+	}
+}
+
+// Login returns its result from inside the HTTP handler. Repeated callbacks
+// must still receive the full page before the listener is torn down.
+func TestLoginCallbackResponseFullyDelivered(t *testing.T) {
+	f := newFakeIssuer(t)
+	c := newTestClient(t, f)
+	for i := 0; i < 100; i++ {
+		run := startLogin(t, c, f)
+		status, body := callback(t, run, url.Values{"state": {run.authURL.Query().Get("state")}, "code": {"good-code"}, "client_id": {"dynamic_agent_client"}})
+		if status != http.StatusBadRequest || !strings.Contains(body, "Return to the terminal.") {
+			t.Fatalf("callback %d: incomplete page (%d): %q", i, status, body)
+		}
+		if res := <-run.done; res.err == nil {
+			t.Fatalf("callback %d unexpectedly succeeded", i)
+		}
 	}
 }
