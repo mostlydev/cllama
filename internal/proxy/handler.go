@@ -1162,8 +1162,13 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 				}
 			}
 			// Success or non-retryable status: forward response back, no key state change.
+			served := resp.StatusCode >= 200 && resp.StatusCode < 300
 			fallbackReason := h.forwardResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start, pendingCursor)
 			cancel()
+			// One count per completed upstream call, by the class that made it.
+			if served && fallbackReason == "" {
+				h.subs.CountServed(agentID, credentialClassFor(candidate.ProviderName))
+			}
 			if fallbackReason != "" {
 				if canFallback {
 					h.logCandidateFallback(agentID, requestedModel, fallbackReason)
@@ -1560,9 +1565,6 @@ func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext
 
 	latency := time.Since(start).Milliseconds()
 	credential := credentialClassFor(providerName)
-	if statusCode >= 200 && statusCode < 300 {
-		h.subs.CountServed(agentID, credential)
-	}
 	h.logger.LogServedResponse(agentID, requestedModel, statusCode, latency, costInfo, providerName, credential)
 	h.scorePolicyResponse(agentID, agentCtx, policyFormatForPath(requestPath), policyMode(agentCtx), isSSE(responseHeader), requestedModel, requestEffective, statusCode, responseHeader, captured)
 }

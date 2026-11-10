@@ -595,6 +595,16 @@ func TestManagedPlanDispatchSecurity(t *testing.T) {
 			if scenario == "refresh" && (rig.tokenHits != 1 || rig.planHits != 2) {
 				t.Fatalf("refresh %d plan %d", rig.tokenHits, rig.planHits)
 			}
+			// The managed loop counts each completed upstream call once, by
+			// the class that made it; a failed attempt is never counted.
+			served := rig.subs.Served()["worker"]
+			wantPlan, wantKey := 1, 0
+			if expectedKeyHits == 1 {
+				wantPlan, wantKey = 0, 1
+			}
+			if served["subscription"] != wantPlan || served["api_key"] != wantKey {
+				t.Fatalf("served %v, want subscription=%d api_key=%d", served, wantPlan, wantKey)
+			}
 		})
 	}
 }

@@ -320,7 +320,7 @@ naming the proxy process. A caller that recorded another `boot_id` when the iden
 knows the proxy restarted in between and the counts are partial.
 
 `state` is `signed_in`, `not_signed_in` or `signin_required`. `served_by` counts completed
-requests since the proxy started, so it resets on restart; the trace journal is the durable
+upstream calls since the proxy started, one per call, including each round of a managed-tool turn, so it resets on restart; the trace journal is the durable
 record.
 
 **Other vendors' plans.** The provider kind is general, but a plan is added only where the

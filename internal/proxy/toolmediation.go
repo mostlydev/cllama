@@ -1213,6 +1213,9 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 				capturedBody = converted
 				responsesReasoning = reasoning
 			}
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				h.subs.CountServed(agentID, credentialClassFor(candidate.ProviderName))
+			}
 			return dispatchJSONAttemptResult{
 				Response: &capturedResponse{
 					StatusCode:         resp.StatusCode,
