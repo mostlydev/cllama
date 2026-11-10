@@ -55,6 +55,16 @@ type entry struct {
 	UpstreamErrorType  string `json:"upstream_error_type,omitempty"`
 	UpstreamErrorParam string `json:"upstream_error_param,omitempty"`
 
+	// plan_failure event fields. Every string is a fixed label or has passed
+	// the proxy's diagnostic sanitizer; none is free vendor text.
+	PlanBranch      string `json:"branch,omitempty"`
+	PlanStage       string `json:"stage,omitempty"`
+	StreamEvent     string `json:"stream_event,omitempty"`
+	StreamLastEvent string `json:"stream_last_event,omitempty"`
+	StreamEvents    *int   `json:"stream_events,omitempty"`
+	ContentType     string `json:"content_type,omitempty"`
+	BodyShape       string `json:"body_shape,omitempty"`
+
 	// Revocation events contain IDs and counters only.
 	RevocationGeneration *uint64 `json:"revocation_generation,omitempty"`
 	AdmittedBeforeRevoke *uint64 `json:"admitted_before_revoke,omitempty"`
@@ -251,6 +261,42 @@ func (l *Logger) LogUpstreamError(clawID, model, provider string, status int, co
 	l.log(entry{TS: time.Now().UTC().Format(time.RFC3339), ClawID: clawID,
 		Type: "upstream_error", Model: model, Provider: provider, StatusCode: ptrInt(status),
 		UpstreamErrorCode: code, UpstreamErrorType: kind, UpstreamErrorParam: param})
+}
+
+// PlanFailureInfo says why a plan route did not serve a request. The caller
+// supplies fixed labels and sanitized vendor codes only.
+type PlanFailureInfo struct {
+	Provider string
+	Reason   string
+	// Branch names the internal branch that chose the reason.
+	Branch string
+	// Stage is "token" for the sign-in step and "inference" for the model call.
+	Stage           string
+	Status          int
+	Code            string
+	Kind            string
+	StreamEvent     string
+	StreamLastEvent string
+	StreamEvents    int
+	ContentType     string
+	// BodyShape is the top-level form of an error body: a fixed label.
+	BodyShape string
+}
+
+// LogPlanFailure records one plan-route failure with its cause.
+func (l *Logger) LogPlanFailure(clawID, model string, info PlanFailureInfo) {
+	e := entry{TS: time.Now().UTC().Format(time.RFC3339), ClawID: clawID,
+		Type: "plan_failure", Model: model, Provider: info.Provider, Reason: info.Reason,
+		PlanBranch: info.Branch, PlanStage: info.Stage,
+		UpstreamErrorCode: info.Code, UpstreamErrorType: info.Kind,
+		StreamEvent: info.StreamEvent, StreamLastEvent: info.StreamLastEvent, ContentType: info.ContentType, BodyShape: info.BodyShape}
+	if info.Status > 0 {
+		e.StatusCode = ptrInt(info.Status)
+	}
+	if info.StreamEvents > 0 {
+		e.StreamEvents = ptrInt(info.StreamEvents)
+	}
+	l.log(e)
 }
 
 func (l *Logger) LogResponseWithCost(clawID, model string, statusCode int, latencyMS int64, ci *CostInfo) {

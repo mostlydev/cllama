@@ -979,6 +979,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 		planToken, planErr := h.planCredential(ctx, prov)
 		if planErr != nil {
 			reason := planReasonOf(planErr)
+			h.logPlanFailure(agentID, requestedModel, candidate.ProviderName, reason, credentialDiag(planErr))
 			h.logCandidateFallback(agentID, requestedModel, reason)
 			return dispatchJSONAttemptResult{AdvanceToNextCandidate: true, FallbackReason: reason}
 		}
@@ -1027,6 +1028,9 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 		resp, err := h.tracedDo(outReq, upstreamTraceInfo(candidate, upstream))
 		if err != nil {
 			cancel()
+			if planToken != "" {
+				h.logPlanFailure(agentID, requestedModel, candidate.ProviderName, "transport_error", planDiag{Branch: planBranchTransport, Stage: planStageInference})
+			}
 			if !canFallback {
 				return dispatchJSONAttemptResult{
 					ClientStatus:  http.StatusBadGateway,
@@ -1048,6 +1052,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			classification = classifyResponse(resp)
 		} else {
 			verdict := h.planResponseVerdict(ctx, resp, lease, planToken, &reauthorized)
+			h.logPlanVerdict(agentID, requestedModel, candidate.ProviderName, verdict, resp.StatusCode)
 			switch verdict.Action {
 			case planRetry:
 				resp.Body.Close()
@@ -1140,6 +1145,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 					resp.Body.Close()
 					cancel()
 					verdict, _ := h.planStreamVerdict(streamErr, lease)
+					h.logPlanFailure(agentID, requestedModel, candidate.ProviderName, verdict.Reason, streamDiag(streamErr))
 					if verdict.Action == planFail {
 						h.subs.NoteFailure(agentID, verdict.Reason)
 						status, _ := planFailure(verdict.Reason)
@@ -1152,6 +1158,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			if planToken != "" {
 				if scrubErr := h.scrubPlanBody(resp); scrubErr != nil {
 					cancel()
+					h.logPlanFailure(agentID, requestedModel, candidate.ProviderName, subscription.ReasonUnavailable, planDiag{Branch: planBranchScrub, Stage: planStageInference, Status: resp.StatusCode})
 					h.logCandidateFallback(agentID, requestedModel, subscription.ReasonUnavailable)
 					return dispatchJSONAttemptResult{AdvanceToNextCandidate: true, FallbackReason: subscription.ReasonUnavailable, Err: scrubErr}
 				}
