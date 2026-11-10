@@ -706,9 +706,10 @@ itself anything.
 | `image_generation` | Tool type `image_generation` | Yes |
 | `mcp` | Tool type `mcp`, `mcp_servers`, or any tool entry naming a remote server | No: it would grant any destination |
 | `plugins` | The `plugins` field | No |
-| `unlisted` | Any other tool type, a tool entry that is not an object, a `tools` value that is not a list, a namespace with anything but function or custom members | No |
+| `unlisted` | Any other tool type, a tool entry that is not an object, an entry with no type that is not a named definition with a schema, a `tools` value that is not a list, a namespace with anything but function or custom members | No |
 
-Not hosted, and untouched: `function` and `custom` tools, a tool definition with no type, a
+Not hosted, and untouched: `function` and `custom` tools, a definition with no type that has a
+name and an `input_schema` or `parameters` object, a
 namespace whose members are all function or custom tools, and tools the agent's own runtime
 executes (Anthropic's dated `bash_`, `text_editor_`, `computer_` and `memory_` schemas, and
 OpenAI's `computer_use_preview`).

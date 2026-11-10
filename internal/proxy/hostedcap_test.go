@@ -180,6 +180,9 @@ var hostedRequests = map[string]struct {
 	"unknown hosted type":    {tools(map[string]any{"type": "browser_agent"}), "", "unlisted"},
 	"type not a string":      {tools(map[string]any{"type": []any{"function"}}), "", "unlisted"},
 	"tools not a list":       {map[string]any{"tools": map[string]any{"type": "web_search"}}, "tools", "unlisted"},
+	"untyped empty object":   {tools(map[string]any{}), "", "unlisted"},
+	"untyped without schema": {tools(map[string]any{"name": "search_the_web"}), "", "unlisted"},
+	"untyped without a name": {tools(map[string]any{"input_schema": map[string]any{"type": "object"}}), "", "unlisted"},
 	"client tool look-alike": {tools(map[string]any{"type": "bash_agent"}), "", "unlisted"},
 	"computer look-alike":    {tools(map[string]any{"type": "computer_agent_hosted"}), "", "unlisted"},
 	"namespace member with a remote server": {tools(map[string]any{"type": "namespace", "name": "n", "tools": []any{

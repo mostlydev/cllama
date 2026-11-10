@@ -49,8 +49,19 @@ func hostedToolCapability(tool map[string]any) string {
 		return "mcp"
 	}
 	switch {
-	case typ == "" || typ == "function" || typ == "custom":
+	case typ == "function" || typ == "custom":
 		return ""
+	case typ == "":
+		// A definition with no type is the agent's own only when it looks
+		// like one: a name and a schema object. Anything else with no type
+		// is not assumed to be client-side.
+		name, _ := tool["name"].(string)
+		_, anthropic := tool["input_schema"].(map[string]any)
+		_, bare := tool["parameters"].(map[string]any)
+		if name != "" && (anthropic || bare) {
+			return ""
+		}
+		return hostedUnlisted
 	case typ == "namespace":
 		members, ok := tool["tools"].([]any)
 		if !ok {
