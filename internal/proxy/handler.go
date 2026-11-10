@@ -60,6 +60,7 @@ type Handler struct {
 	policyEvaluator              PolicyEvaluator
 	policyFailMode               string
 	subs                         *subscription.Manager
+	hints                        modelHints
 	// bootID names this proxy process in revocation acknowledgements.
 	bootID string
 }
@@ -892,6 +893,7 @@ func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, age
 		_, downstreamIncludeUsage = requestedOpenAIStreamOptions(payload)
 	}
 	for i, candidate := range candidates {
+		candidate = h.hinted(candidate)
 		canFallback := i+1 < len(candidates)
 		payload["model"] = candidate.UpstreamModel
 		outBody, err := json.Marshal(payload)
@@ -972,6 +974,8 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			}
 			return true, sawCooldown, "provider_key_unavailable"
 		}
+		// planCredential repoints a plan provider; hints key on the configured endpoint.
+		hintBaseURL := prov.BaseURL
 		planToken, planErr := h.planCredential(r.Context(), prov)
 		if planErr != nil {
 			reason := planReasonOf(planErr)
@@ -1114,10 +1118,11 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 			// list does not know about yet. Retry it through the adapter once
 			// rather than handing the agent a rejection that reads like a
 			// credentials or provider-pool problem.
-			if !upstream.Adapter && responsesAdapterEligible(r.URL.Path) && responsesOnlyUpstreamSignal(resp) {
-				if adapted, adaptErr := adaptChatBodyToResponsesForCandidate(outBody, nil, candidate); adaptErr == nil {
+			if next, ok := h.relearnShape(candidate, upstream, r.URL.Path, resp); ok {
+				if adapted, adaptErr := adaptChatBodyToResponsesForCandidate(outBody, nil, next); adaptErr == nil {
 					resp.Body.Close()
 					cancel()
+					candidate = next
 					h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter_retry")
 					for _, mutation := range adapted.Mutations {
 						h.logger.LogIntervention(agentID, requestedModel, mutation)
@@ -1170,6 +1175,10 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 					h.logCandidateFallback(agentID, requestedModel, subscription.ReasonUnavailable)
 					return true, sawCooldown, subscription.ReasonUnavailable
 				}
+			}
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				// Learn only after the response passed adapter validation.
+				h.hints.learn(hintBaseURL, candidate)
 			}
 			// Success or non-retryable status: forward response back, no key state change.
 			fallbackReason := h.forwardResponse(w, resp, agentID, agentCtx, candidate.ProviderName, requestedModel, candidate.UpstreamModel, r.URL.Path, requestOriginal, outBody, start, pendingCursor)

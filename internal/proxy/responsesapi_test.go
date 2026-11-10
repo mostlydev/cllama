@@ -444,7 +444,9 @@ func TestManagedMediationRetriesThroughAdapterOnResponsesOnlyUpstreamSignal(t *t
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected the retry to succeed with 200, got %d: %s", w.Code, w.Body.String())
 	}
-	want := []string{"/v1/chat/completions", "/v1/responses", "/v1/chat/completions", "/v1/responses"}
+	// The first round discovers the shape; once the vendor has served it,
+	// the second round goes straight to the Responses API.
+	want := []string{"/v1/chat/completions", "/v1/responses", "/v1/responses"}
 	if len(paths) != len(want) {
 		t.Fatalf("expected dispatch sequence %v, got %v", want, paths)
 	}

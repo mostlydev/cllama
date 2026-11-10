@@ -902,6 +902,7 @@ func (h *Handler) dispatchCandidatesJSONWithReasoning(ctx context.Context, r *ht
 	lastReason := ""
 	start := time.Now()
 	for i, candidate := range candidates {
+		candidate = h.hinted(candidate)
 		canFallback := i+1 < len(candidates)
 		payload["model"] = candidate.UpstreamModel
 		outBody, err := json.Marshal(payload)
@@ -976,6 +977,8 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 				FallbackReason:         "provider_key_unavailable",
 			}
 		}
+		// planCredential repoints a plan provider; hints key on the configured endpoint.
+		hintBaseURL := prov.BaseURL
 		planToken, planErr := h.planCredential(ctx, prov)
 		if planErr != nil {
 			reason := planReasonOf(planErr)
@@ -1106,11 +1109,12 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 		default:
 			// Same recovery as the direct dispatch path: upstream may declare a
 			// model responses-only that the built-in list does not know yet.
-			if !upstream.Adapter && responsesAdapterEligible(r.URL.Path) && responsesOnlyUpstreamSignal(resp) {
-				matchingReasoning, droppedReasoning := responsesReasoningForCandidate(reasoningReplay, candidate)
-				if adapted, adaptErr := adaptChatBodyToResponsesForCandidate(outBody, matchingReasoning, candidate); adaptErr == nil {
+			if next, ok := h.relearnShape(candidate, upstream, r.URL.Path, resp); ok {
+				matchingReasoning, droppedReasoning := responsesReasoningForCandidate(reasoningReplay, next)
+				if adapted, adaptErr := adaptChatBodyToResponsesForCandidate(outBody, matchingReasoning, next); adaptErr == nil {
 					resp.Body.Close()
 					cancel()
+					candidate = next
 					h.logger.LogIntervention(agentID, requestedModel, "responses_api_adapter_retry")
 					for _, mutation := range adapted.Mutations {
 						h.logger.LogIntervention(agentID, requestedModel, mutation)
@@ -1230,6 +1234,7 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 				responsesReasoning = reasoning
 			}
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				h.hints.learn(hintBaseURL, candidate)
 				h.subs.CountServed(agentID, credentialClassFor(candidate.ProviderName))
 			}
 			return dispatchJSONAttemptResult{

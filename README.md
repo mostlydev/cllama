@@ -263,6 +263,20 @@ docker compose run --rm -p 127.0.0.1:1455:1455 cllama auth login chatgpt --liste
 The running proxy reads the saved sign-in on each request, so a new sign-in takes effect
 without a restart.
 
+**Live verification (2026-11-10).** A collaborating test operator verified an existing
+ChatGPT sign-in with Hermes task-home workers: first turn, exact-session resume,
+separate-home control, and plan-only calls on `chatgpt/gpt-5.6-terra` and
+`chatgpt/gpt-6.1-terra`. All 23 responses used the subscription, with no API-key fallback.
+A separate empty-store control failed with `subscription_signin_required` and no upstream
+request. The test did not copy the sign-in store or perform a new sign-in. This verifies
+those inference paths; it does not establish all account, refresh, or quota-limit cases.
+The same workflow also verified `openai/gpt-6.1-terra` through an API key: 11 successful
+responses across first turn, exact-session resume and separate-home control, after one
+initial `max_tokens` rejection. Later calls reused the learned Responses shape with no
+further rejection. Same-build plan regression and empty-store control passed. The sampling
+retry was not observed live and remains covered by synthetic tests. No agent accessed the
+sign-in store; cllama may have refreshed its own record during these tests.
+
 **Where the sign-in lives.** `<CLAW_AUTH_DIR>/subscriptions/chatgpt.json`, in a directory
 with mode 0700 and a file with mode 0600, both owned by the proxy's user. cllama refuses a
 directory or record that is a link, is owned by another user or is readable by others. The
@@ -444,12 +458,28 @@ Selection is per declared provider/model:
   dated snapshots. GPT6 tool calling uses Responses; unknown sibling names
   and other providers are unaffected.
 - **Extend** with `CLLAMA_RESPONSES_API_MODELS`.
-- **Recover automatically:** when upstream rejects a request with a message
-  naming `/v1/responses`, that request is retried once through the adapter and
-  emits `responses_api_adapter_retry`. This covers models OpenAI moves before
-  the built-in list catches up, instead of surfacing a rejection that reads like
-  a credentials problem.
-- **Disable** with `CLLAMA_RESPONSES_API_DISABLED=1`.
+- **Learn from the vendor:** a model this build does not know needs no code
+  change. Two rejections change a request's shape, each retried once on the same
+  provider, credential class and model and logged as `responses_api_adapter_retry`
+  (normal key-pool eligibility still applies):
+  - chat completions answers 400 with a message naming `/v1/responses`, or, for
+    provider `openai`, with `error.code` `unsupported_parameter` and
+    `error.param` `max_tokens`: the request moves to the Responses adapter;
+  - the Responses API answers 400 `unsupported_parameter` for `temperature` or
+    `top_p`: both are removed, logged as `responses_adapter_dropped_sampling`.
+
+  Only the structured `code` and `param` are read for the second and third
+  signals; any other rejection is forwarded unchanged. Once the vendor has
+  served a shape, it is remembered in memory for that provider endpoint and
+  model, so later requests start with it; every use is still logged. Nothing is
+  persisted, and a restart learns again.
+
+  A `max_tokens` rejection does not prove a model is Responses-only: some chat
+  models only want `max_completion_tokens`. cllama moves such a model to the
+  Responses API all the same, where it already translates the field. Providers
+  other than `openai` are not moved on that signal, because an
+  OpenAI-compatible endpoint need not offer the Responses API.
+- **Disable** with `CLLAMA_RESPONSES_API_DISABLED=1`. This also turns off learned shapes.
 
 Two behaviours are worth knowing:
 
