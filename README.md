@@ -722,9 +722,11 @@ The grant is `hosted_capabilities` in the agent's `metadata.json`, a list of gra
 
 Absent means none. A value that is not a list of grantable names makes the context invalid
 and every request from that agent is refused with `invalid hosted capability grant`; it is
-never read as a partial grant. A grant is account-wide for that provider: `file_search` and
-`code_interpreter` reach whatever the provider account holds, and are not a managed-tool
-permission or a per-agent ACL.
+never read as a partial grant. A grant applies across the agent's already-authorized model
+providers and fallbacks, subject to each route's support and data policy. It does not authorize
+a new model provider. `file_search` and `code_interpreter` can use provider-account resources;
+the grant does not constrain individual file stores or containers and is not a managed-tool
+permission or a per-home ACL.
 
 A refused request gets HTTP 400 `hosted capability not granted: <capability>`, makes no
 upstream call, and logs an `intervention` event `hosted_capability_refused:<capability>`.
