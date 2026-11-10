@@ -330,9 +330,17 @@ vendor's terms document this use. As of November 2026:
 |---|---|---|
 | OpenAI | Documents plan usage for open-source, locally hosted apps | Built |
 | Anthropic | Plan sign-in is for unmodified Claude Code; third-party harnesses and credential intermediation are not permitted | Not a proxy provider. A worker that runs Claude Code itself is separate work |
-| Google | Terms forbid third-party tools using its coding-assistant sign-in | Not built |
+| Google | Antigravity terms forbid third-party tools using Antigravity OAuth credentials | Not built |
 | xAI | Documents native sign-in for its own tools; its terms do not establish permission to relay a plan | Not built |
 | Meta | Coding-plan keys are restricted to the specified harness | Not built |
+
+Primary sources checked for these positions: [Anthropic Claude Code terms](https://code.claude.com/docs/en/legal-and-compliance),
+[Google Antigravity terms](https://antigravity.google/terms),
+[xAI native sign-in documentation](https://docs.x.ai/build/enterprise) and [consumer terms](https://x.ai/legal/terms-of-service),
+and [Meta developer terms](https://dev.meta.ai/legal/terms-of-service).
+Google's restriction cited here is specifically for Antigravity credentials; it does not
+rule out Google API keys or separately authorized enterprise integrations.
+
 
 ## Operator Dashboard
 
