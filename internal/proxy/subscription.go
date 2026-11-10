@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -486,4 +488,33 @@ func (h *Handler) scrubPlanBody(resp *http.Response) error {
 	resp.ContentLength = int64(len(body))
 	resp.Header.Del("Content-Length")
 	return nil
+}
+
+// revocationAck is the acknowledgement of a revocation. Beside the durable
+// record it reports, for the revoked identity, how many requests each
+// credential class served and its last plan-route failure. The counts are
+// held in memory by this process: boot_id names the process, so a caller
+// that saw another boot_id when the identity started knows they are partial.
+type revocationAck struct {
+	revocationRecord
+	BootID          string         `json:"boot_id"`
+	ServedBy        map[string]int `json:"served_by,omitempty"`
+	LastPlanFailure string         `json:"last_plan_failure,omitempty"`
+}
+
+func (h *Handler) revokeAck(record revocationRecord) revocationAck {
+	ack := revocationAck{revocationRecord: record, BootID: h.bootID}
+	if served := h.subs.Served()[record.AgentID]; len(served) > 0 {
+		ack.ServedBy = served
+	}
+	ack.LastPlanFailure = h.subs.Failures()[record.AgentID]
+	return ack
+}
+
+func newBootID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
 }

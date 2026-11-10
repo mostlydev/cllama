@@ -314,6 +314,11 @@ curl -H "Authorization: Bearer $CLLAMA_UI_TOKEN" http://localhost:8081/subscript
 }
 ```
 
+A revocation acknowledgement carries the same two per-identity values for the revoked
+identity, as `served_by` and `last_plan_failure`, together with `boot_id`, a random value
+naming the proxy process. A caller that recorded another `boot_id` when the identity started
+knows the proxy restarted in between and the counts are partial.
+
 `state` is `signed_in`, `not_signed_in` or `signin_required`. `served_by` counts completed
 requests since the proxy started, so it resets on restart; the trace journal is the durable
 record.

@@ -702,3 +702,55 @@ func TestDataPolicySeesInsideNamespaces(t *testing.T) {
 		t.Fatal("a namespace without members must not be accepted")
 	}
 }
+
+// The revocation acknowledgement reports, for the revoked identity, which
+// credential class served its requests, and names the proxy process so a
+// caller can tell complete counts from partial ones.
+func TestRevocationAckReportsServedCredentials(t *testing.T) {
+	rig := newPlanRig(t, planRef, keyRef)
+	WithRevocationDir(t.TempDir())(rig.h)
+	WithAdminToken("operator")(rig.h)
+	rig.signIn("plan-access-0-canary", time.Hour)
+	if w := rig.chat(""); w.Code != http.StatusOK {
+		t.Fatalf("plan reply: %d", w.Code)
+	}
+	rig.planReply = func(w http.ResponseWriter, r *http.Request, hit int) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"code":"subscription_sharing_usage_limit_exceeded"}}`)
+	}
+	if w := rig.chat(""); w.Code != http.StatusOK {
+		t.Fatalf("key reply: %d", w.Code)
+	}
+
+	revoke := func() map[string]any {
+		req := httptest.NewRequest(http.MethodPost, "/internal/agents/worker/revoke", strings.NewReader(`{"generation":1}`))
+		req.SetPathValue("agentID", "worker")
+		req.Header.Set("Authorization", "Bearer operator")
+		w := httptest.NewRecorder()
+		rig.h.HandleRevoke(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("revoke: %d %s", w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "canary") {
+			t.Fatalf("acknowledgement holds a token: %s", w.Body.String())
+		}
+		var ack map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &ack); err != nil {
+			t.Fatal(err)
+		}
+		return ack
+	}
+	ack := revoke()
+	served, _ := ack["served_by"].(map[string]any)
+	if ack["state"] != "revoked" || ack["agent_id"] != "worker" || served["subscription"] != float64(1) || served["api_key"] != float64(1) {
+		t.Fatalf("ack: %v", ack)
+	}
+	if ack["last_plan_failure"] != "subscription_limit_reached" || len(fmt.Sprint(ack["boot_id"])) != 32 {
+		t.Fatalf("ack: %v", ack)
+	}
+	// A repeated acknowledgement from the same process reports the same.
+	again := revoke()
+	if fmt.Sprint(again["served_by"]) != fmt.Sprint(ack["served_by"]) || again["boot_id"] != ack["boot_id"] {
+		t.Fatalf("repeat ack differs: %v vs %v", again, ack)
+	}
+}

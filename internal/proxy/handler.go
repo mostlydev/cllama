@@ -60,6 +60,8 @@ type Handler struct {
 	policyEvaluator              PolicyEvaluator
 	policyFailMode               string
 	subs                         *subscription.Manager
+	// bootID names this proxy process in revocation acknowledgements.
+	bootID string
 }
 
 const (
@@ -185,6 +187,7 @@ func NewHandler(registry *provider.Registry, contextLoader ContextLoader, logger
 	}
 	h := &Handler{
 		registry:                     registry,
+		bootID:                       newBootID(),
 		revocations:                  newRevocationFence(""),
 		loadContext:                  contextLoader,
 		client:                       &http.Client{},
