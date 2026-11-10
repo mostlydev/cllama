@@ -430,6 +430,21 @@ func (h *Handler) scrubPlanBody(resp *http.Response) error {
 	for _, secret := range h.subs.Secrets() {
 		if len(secret) >= 8 {
 			body = bytes.ReplaceAll(body, []byte(secret), []byte(planRedaction))
+			// Response headers reach the worker too. Drop any header whose
+			// name or value echoes a credential, including nonstandard debug
+			// headers; a body-only scrub leaves that disclosure path open.
+			for name, values := range resp.Header {
+				if strings.Contains(name, secret) {
+					delete(resp.Header, name)
+					continue
+				}
+				for _, value := range values {
+					if strings.Contains(value, secret) {
+						delete(resp.Header, name)
+						break
+					}
+				}
+			}
 		}
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(body))

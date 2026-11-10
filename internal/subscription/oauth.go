@@ -150,7 +150,6 @@ var terminalRefreshCodes = map[string]bool{
 	"refresh_token_expired":     true,
 	"refresh_token_invalidated": true,
 	"refresh_token_reused":      true,
-	"invalid_client":            true,
 }
 
 // Refresh spends the record's refresh token and saves the replacement set.

@@ -662,3 +662,28 @@ func TestLockWaitEndsWithContext(t *testing.T) {
 		t.Fatalf("want deadline, got %v", err)
 	}
 }
+
+func TestInvalidClientPreservesRegistrationAndTokens(t *testing.T) {
+	f := newFakeIssuer(t)
+	f.refreshReply = func(w http.ResponseWriter) bool {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"invalid_client"}`)
+		return true
+	}
+	c := newTestClient(t, f)
+	original := expiredRecord(f)
+	if err := c.Store.Save(original); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewManagerWithClients(c).Token(context.Background(), "chatgpt")
+	if ReasonOf(err) != ReasonUnavailable {
+		t.Fatalf("configuration fault should not revoke sign-in: %v", err)
+	}
+	saved, err := c.Store.Load("chatgpt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.RefreshToken != original.RefreshToken || saved.State != StateActive || saved.ClientID != original.ClientID {
+		t.Fatal("configuration failure destroyed registration or credential")
+	}
+}

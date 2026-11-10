@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -508,5 +509,92 @@ func assertNoCanaryUnder(t *testing.T, dir string) {
 	})
 	if !classSeen {
 		t.Fatal("the journal does not name the credential class of the attempt")
+	}
+}
+
+func TestPlanResponseHeadersCannotExposeCredentials(t *testing.T) {
+	rig := newPlanRig(t, planRef)
+	rig.signIn("plan-access-0-canary", time.Hour)
+	rig.planReply = func(w http.ResponseWriter, r *http.Request, hit int) {
+		w.Header().Set("X-Debug-Echo", r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, planCompleted("done"))
+	}
+	w := rig.chat("")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	for name, values := range w.Header() {
+		if strings.Contains(name+strings.Join(values, " "), "canary") {
+			t.Fatalf("credential leaked in response header %q", name)
+		}
+	}
+}
+
+// Exercise the separate managed-tool dispatch loop; native-tool tests do not
+// cover its retry, SSE completion, or credential scrubbing branches.
+func TestManagedPlanDispatchSecurity(t *testing.T) {
+	for _, scenario := range []string{"completed", "limit", "ineligible", "cut", "refresh"} {
+		t.Run(scenario, func(t *testing.T) {
+			rig := newPlanRig(t, planRef, keyRef)
+			rig.signIn("plan-access-0-canary", time.Hour)
+			rig.planReply = func(w http.ResponseWriter, r *http.Request, hit int) {
+				switch scenario {
+				case "limit":
+					w.WriteHeader(429)
+					_, _ = io.WriteString(w, `{"error":{"code":"subscription_sharing_usage_limit_exceeded"}}`)
+					return
+				case "ineligible":
+					w.WriteHeader(403)
+					return
+				case "refresh":
+					if hit == 1 {
+						w.WriteHeader(401)
+						return
+					}
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("X-Echo", r.Header.Get("Authorization"))
+				if scenario == "cut" {
+					_, _ = io.WriteString(w, planSSE(`{"type":"response.output_text.delta","delta":"partial"}`))
+					return
+				}
+				_, _ = io.WriteString(w, planCompleted(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")))
+			}
+			var candidates []dispatchCandidate
+			for _, ref := range []string{planRef, keyRef} {
+				candidate, err := rig.h.openAICandidateFromRef(ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+				candidates = append(candidates, candidate)
+			}
+			ctx := context.WithValue(context.Background(), dataPolicyKey{}, *testPermissiveDataPolicy())
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+			payload := map[string]any{"model": planRef, "messages": []any{map[string]any{"role": "user", "content": "hello"}}}
+			resp, status, msg, err := rig.h.dispatchCandidatesJSON(ctx, req, "worker", planRef, payload, candidates, nil)
+			if scenario == "ineligible" {
+				if err == nil || status != 403 || rig.keyHits != 0 {
+					t.Fatalf("eligibility refusal changed billing: %d %s %v, key hits %d", status, msg, err, rig.keyHits)
+				}
+				return
+			}
+			if err != nil || resp == nil {
+				t.Fatalf("dispatch: %d %s %v", status, msg, err)
+			}
+			if strings.Contains(string(resp.Body)+fmt.Sprint(resp.Header), "canary") {
+				t.Fatal("managed dispatch exposed a credential")
+			}
+			expectedKeyHits := 0
+			if scenario == "limit" || scenario == "cut" {
+				expectedKeyHits = 1
+			}
+			if rig.keyHits != expectedKeyHits {
+				t.Fatalf("key calls: %d want %d", rig.keyHits, expectedKeyHits)
+			}
+			if scenario == "refresh" && (rig.tokenHits != 1 || rig.planHits != 2) {
+				t.Fatalf("refresh %d plan %d", rig.tokenHits, rig.planHits)
+			}
+		})
 	}
 }
