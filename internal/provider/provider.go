@@ -35,7 +35,20 @@ type KeyEntry struct {
 	LastErrorReason string   `json:"last_error_reason"` // "" = none
 	LastErrorAt     string   `json:"last_error_at"`     // RFC3339 or ""
 	AddedAt         string   `json:"added_at"`          // RFC3339
+	// Kind is "" for an API key and KindSubscription for a plan sign-in. A
+	// sign-in entry never carries a secret: the token lives in the
+	// subscription store and is fetched per request.
+	Kind string `json:"kind,omitempty"`
 }
+
+const (
+	// KindSubscription marks a pool entry that stands for a plan sign-in.
+	KindSubscription = "subscription"
+	// AuthSubscription is the auth mode of a plan provider.
+	AuthSubscription = "subscription"
+	// SubscriptionKeyID is the single pool entry of a plan provider.
+	SubscriptionKeyID = "subscription"
+)
 
 // ProviderState is the v2 per-provider config including key pool.
 type ProviderState struct {
@@ -121,6 +134,55 @@ func NewRegistry(authDir string) *Registry {
 		providers: make(map[string]*ProviderState),
 		authDir:   authDir,
 	}
+}
+
+// RegisterPlan installs a plan provider. Its base URL is fixed by the caller
+// and replaces anything a file or the environment supplied under that name:
+// a sign-in token must never follow an operator-edited endpoint. The pool
+// holds one entry of kind subscription so cooldown and failover work as they
+// do for keys. Plan providers are never written to providers.json.
+func (r *Registry) RegisterPlan(name, baseURL string) {
+	n := normalizeName(name)
+	if n == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.providers[n] = &ProviderState{
+		BaseURL:     baseURL,
+		Auth:        AuthSubscription,
+		APIFormat:   "openai",
+		Source:      "plan",
+		ActiveKeyID: SubscriptionKeyID,
+		Keys: []KeyEntry{{
+			ID:      SubscriptionKeyID,
+			Label:   "plan sign-in",
+			Source:  "plan",
+			State:   KeyStateReady,
+			Kind:    KindSubscription,
+			AddedAt: time.Now().UTC().Format(time.RFC3339),
+		}},
+	}
+}
+
+// IsPlan reports whether a provider is a plan route.
+func (r *Registry) IsPlan(name string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	state, ok := r.providers[normalizeName(name)]
+	return ok && state.Auth == AuthSubscription
+}
+
+// CooldownUntil returns when a provider's pool leaves cooldown, or zero when
+// a key is usable now or none will recover.
+func (r *Registry) CooldownUntil(name string) time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state, ok := r.providers[normalizeName(name)]
+	if !ok || r.activeKey(state) != nil {
+		return time.Time{}
+	}
+	return r.earliestCooldown(state)
 }
 
 // v1File is the legacy format (version absent or 1).
@@ -525,6 +587,9 @@ func (r *Registry) AddRuntimeKey(providerName, label, secret string) (string, er
 	if !ok {
 		return "", fmt.Errorf("unknown provider: %q", providerName)
 	}
+	if state.Auth == AuthSubscription {
+		return "", fmt.Errorf("provider %q is a plan route and takes no API keys", n)
+	}
 	id := "runtime:" + randomHex(4)
 	state.Keys = append(state.Keys, KeyEntry{
 		ID:      id,
@@ -601,6 +666,9 @@ func (r *Registry) DeleteKey(providerName, keyID string) error {
 	state, ok := r.providers[n]
 	if !ok {
 		return fmt.Errorf("unknown provider: %q", providerName)
+	}
+	if state.Auth == AuthSubscription {
+		return fmt.Errorf("provider %q is a plan route; sign out to remove its sign-in", n)
 	}
 	newKeys := state.Keys[:0]
 	found := false
@@ -707,6 +775,9 @@ func (r *Registry) SaveToFile() error {
 	r.mu.RLock()
 	providers := make(map[string]*ProviderState, len(r.providers))
 	for name, state := range r.providers {
+		if state.Auth == AuthSubscription {
+			continue
+		}
 		cp := *state
 		keys := make([]KeyEntry, len(state.Keys))
 		copy(keys, state.Keys)

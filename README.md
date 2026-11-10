@@ -221,6 +221,112 @@ Auth schemes: `bearer` (OpenAI, OpenRouter, Google), `x-api-key` (Anthropic), `n
 
 ---
 
+### Plan sign-ins
+
+cllama can serve requests from an operator's ChatGPT plan in place of an API key. It uses
+OpenAI's [Sign in with ChatGPT plan usage](https://developers.openai.com/siwc/token-sharing-open-source),
+which OpenAI documents for open-source, locally hosted apps. The sign-in is the operator's own
+plan serving the operator's own agents. Paid or hosted multi-user use is not covered by that
+documentation and is not supported here.
+
+The plan is a provider, `chatgpt`. A model reference such as `chatgpt/gpt-5.6-terra` routes
+through it. Order and fallback are the declared model chain, with no separate setting:
+
+| Declared chain | Behavior |
+|---|---|
+| `chatgpt/<model>`, then `openai/<model>` | Plan first, API key second |
+| `openai/<model>`, then `chatgpt/<model>` | API key first, plan second |
+| `chatgpt/<model>` only | Plan only. No request ever uses an API key |
+
+**Signing in.** The operator runs one command on the host. No agent signs in, and nothing is
+imported from another tool.
+
+```bash
+cllama auth login chatgpt            # prints a URL, waits for the browser callback
+cllama auth status [--json]
+cllama auth logout chatgpt [--forget]
+```
+
+`login` starts a listener on `127.0.0.1:1455`, prints the authorization URL, and waits. It
+saves the sign-in only after it has checked the returned state, exchanged the code with PKCE,
+verified the signed ID token (issuer, audience, expiry, nonce) and confirmed that plan usage
+was granted. When cllama runs in a container, run the command in a one-off container of the
+same service with the callback port published on the host's loopback address, and bind the
+listener to all interfaces inside it:
+
+```bash
+docker compose run --rm -p 127.0.0.1:1455:1455 cllama auth login chatgpt --listen 0.0.0.0:1455
+```
+
+The running proxy reads the saved sign-in on each request, so a new sign-in takes effect
+without a restart.
+
+**Where the sign-in lives.** `<CLAW_AUTH_DIR>/subscriptions/chatgpt.json`, in a directory
+with mode 0700 and a file with mode 0600, both owned by the proxy's user. cllama refuses a
+directory or record that is a link, is owned by another user or is readable by others. The
+record holds the issued client ID, a stable host ID, the access token and the rotating
+refresh token. Refresh is serialized across processes with a file lock, and the replacement
+set is written atomically. The token is never placed in agent context, in the environment of
+an agent, in logs or in the trace journal, and it is removed from any provider reply that
+echoes it. It is sent only to OpenAI's fixed endpoints: `OPENAI_BASE_URL`, `providers.json`
+and the dashboard cannot redirect it, and a redirect from those endpoints is not followed.
+
+**Request shape.** The plan route accepts chat completions requests and sends them to the
+Responses API with `store: false` and `stream: true`. System-role messages are sent as
+developer messages. Fields the route refuses (`temperature`, `top_p`, `max_output_tokens`,
+`metadata`, `user`, `service_tier` and the others OpenAI lists) are removed, and each removal
+is logged as a `subscription_field_dropped:<field>` intervention. A reply counts only after
+`response.completed`; a failed, incomplete or cut stream is a failure and none of it reaches
+the agent. Data policy applies as for any provider: attest guarantees for provider `chatgpt`.
+
+**When the plan route cannot serve.** These reasons are distinct from model and transport
+errors. With a later entry in the chain the request moves on; without one it fails with the
+status below and `error.code` set to the reason.
+
+| Reason | Cause | Moves to the next entry | Status when it is the last entry |
+|---|---|---|---|
+| `subscription_signin_required` | No sign-in, or the refresh token was refused. The operator must sign in again | Yes | 503 |
+| `subscription_limit_reached` | OpenAI reported the plan's usage limit. The route rests for `CLLAMA_SUBSCRIPTION_LIMIT_COOLDOWN_SECONDS` (default 900) and is then tried again; OpenAI gives no reset time | Yes | 429 |
+| `subscription_unavailable` | Temporary: refresh or usage check unavailable, or a stream that did not complete | Yes | 503 |
+| `subscription_not_eligible` | The account, workspace or policy does not permit plan usage | No. The request fails | 403 |
+| `subscription_unsupported_request` | The request uses a feature the plan route does not support | No. The request fails | 400 |
+
+The last two never move a request to another billing path. A sign-in is never marked dead by
+a rejected request: only a refused refresh ends it.
+
+**Records.** Every upstream attempt in the trace journal carries `credential`, either
+`subscription` or `api_key`, beside the provider and model. Each `response` log event carries
+`provider` and `credential`. Plan-served requests are recorded at zero cost.
+
+**Status without a request.** On the operator port:
+
+```bash
+curl -H "Authorization: Bearer $CLLAMA_UI_TOKEN" http://localhost:8081/subscriptions
+```
+
+```json
+{
+  "subscriptions": [{"provider": "chatgpt", "state": "signed_in", "account": "you@example.com", "limited_until": ""}],
+  "served_by": {"agent-id": {"subscription": 12, "api_key": 3}},
+  "last_failure": {"agent-id": "subscription_limit_reached"}
+}
+```
+
+`state` is `signed_in`, `not_signed_in` or `signin_required`. `served_by` counts completed
+requests since the proxy started, so it resets on restart; the trace journal is the durable
+record.
+
+**Other vendors' plans.** The provider kind is general, but a plan is added only where the
+vendor's terms document this use. As of November 2026:
+
+| Vendor | Position | Status here |
+|---|---|---|
+| OpenAI | Documents plan usage for open-source, locally hosted apps | Built |
+| Anthropic | Plan sign-in is for unmodified Claude Code; third-party harnesses and credential intermediation are not permitted | Not a proxy provider. A worker that runs Claude Code itself is separate work |
+| Google | Terms forbid third-party tools using its coding-assistant sign-in | Not built |
+| xAI | Documents native sign-in for its own tools; its terms do not establish permission to relay a plan | Not built |
+| Meta | Coding-plan keys are restricted to the specified harness | Not built |
+
 ## Operator Dashboard
 
 Built-in web UI on `:8081`. No JavaScript frameworks, no build step — Go templates compiled into the binary.

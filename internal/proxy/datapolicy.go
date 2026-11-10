@@ -79,6 +79,9 @@ func officialDataEndpoint(name, raw string) (bool, string) {
 		case "jp.api.openai.com", "ca.api.openai.com", "au.api.openai.com", "in.api.openai.com", "sg.api.openai.com", "kr.api.openai.com":
 			return true, ""
 		}
+	case "chatgpt":
+		// The plan route is pinned to this endpoint in code.
+		return host == "api.openai.com" && path == "/v1", ""
 	case "anthropic":
 		return host == "api.anthropic.com" && path == "/v1", ""
 	case "google":
@@ -498,7 +501,7 @@ func enforceProviderDataPolicy(p agentctx.DataPolicy, prov *provider.Provider, u
 	if !retentionOK {
 		return upstream, denyData("retention")
 	}
-	if p.Retention == "none" && (upstream.Path == "/v1/chat/completions" || upstream.Path == "/v1/responses") && (prov.Name == "openai" || prov.Name == "xai" || prov.Name == "openrouter" || prov.Name == "vercel") {
+	if p.Retention == "none" && (upstream.Path == "/v1/chat/completions" || upstream.Path == "/v1/responses") && (prov.Name == "openai" || prov.Name == "chatgpt" || prov.Name == "xai" || prov.Name == "openrouter" || prov.Name == "vercel") {
 		body["store"] = false
 	}
 	var err error

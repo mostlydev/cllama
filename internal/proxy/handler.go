@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mostlydev/cllama/internal/subscription"
 	"io"
 	"net/http"
 	"net/url"
@@ -58,6 +59,7 @@ type Handler struct {
 	managedDuplicateStreakCutoff int
 	policyEvaluator              PolicyEvaluator
 	policyFailMode               string
+	subs                         *subscription.Manager
 }
 
 const (
@@ -880,6 +882,7 @@ func (h *Handler) handleAnthropicMessages(w http.ResponseWriter, r *http.Request
 
 func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit) {
 	sawCooldown := false
+	lastReason := ""
 	downstreamStream := payloadRequestsStream(payload)
 	downstreamIncludeUsage := false
 	if responsesAdapterEligible(r.URL.Path) {
@@ -913,12 +916,22 @@ func (h *Handler) dispatchCandidates(w http.ResponseWriter, r *http.Request, age
 			return
 		}
 		sawCooldown = sawCooldown || candidateCooldown
+		lastReason = fallbackReason
+		if isPlanReason(fallbackReason) {
+			h.subs.NoteFailure(agentID, fallbackReason)
+		}
 		if i+1 < len(candidates) {
 			h.logCandidateFailover(agentID, requestedModel, candidate, candidates[i+1], fallbackReason, i+1, start)
 			h.logger.LogIntervention(agentID, requestedModel, "provider_exhausted_failover")
 		}
 	}
 
+	// A chain that ends on a plan route fails with the plan's own reason, so
+	// the caller can tell a missing sign-in or a spent plan from a model error.
+	if isPlanReason(lastReason) {
+		h.failPlan(w, lastReason, agentID, requestedModel, start)
+		return
+	}
 	if sawCooldown {
 		h.fail(w, http.StatusServiceUnavailable, "all declared provider keys in cooldown", agentID, requestedModel, start, fmt.Errorf("all declared providers cooling down"))
 		return
@@ -946,14 +959,21 @@ func payloadRequestsStream(payload map[string]any) bool {
 func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agentID string, agentCtx *agentctx.AgentContext, requestedModel string, candidate dispatchCandidate, upstream upstreamEncoding, outBody []byte, requestOriginal []byte, start time.Time, requestInfo *logging.RequestInfo, pendingCursor *pendingChannelCursorCommit, downstreamStream, downstreamIncludeUsage, canFallback bool) (bool, bool, string) {
 	const maxKeyAttempts = 5
 	sawCooldown := false
+	reauthorized := false
 
 	for attempt := 0; attempt < maxKeyAttempts; attempt++ {
 		prov, lease, err := h.registry.SelectKey(candidate.ProviderName)
 		if err != nil {
 			if _, ok := err.(*provider.CooldownError); ok {
-				return true, true, "provider_cooldown"
+				return true, true, h.cooldownReason(candidate.ProviderName)
 			}
 			return true, sawCooldown, "provider_key_unavailable"
+		}
+		planToken, planErr := h.planCredential(r.Context(), prov)
+		if planErr != nil {
+			reason := planReasonOf(planErr)
+			h.logCandidateFallback(agentID, requestedModel, reason)
+			return true, sawCooldown, reason
 		}
 
 		checked, policyErr := h.policyUpstream(r.Context(), agentID, requestedModel, prov, upstream)
@@ -1019,7 +1039,31 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 		}
 
 		h.logUpstreamError(agentID, requestedModel, candidate.ProviderName, resp)
-		classification := classifyResponse(resp)
+		classification := classOK
+		if planToken == "" {
+			classification = classifyResponse(resp)
+		} else {
+			// A sign-in is not a key: its replies are classified by the plan
+			// rules, and the pool entry is never marked dead.
+			verdict := h.planResponseVerdict(r.Context(), resp, lease, planToken, &reauthorized)
+			switch verdict.Action {
+			case planRetry:
+				resp.Body.Close()
+				cancel()
+				continue
+			case planAdvance:
+				resp.Body.Close()
+				cancel()
+				h.logCandidateFallback(agentID, requestedModel, verdict.Reason)
+				return true, sawCooldown, verdict.Reason
+			case planFail:
+				resp.Body.Close()
+				cancel()
+				h.subs.NoteFailure(agentID, verdict.Reason)
+				h.failPlan(w, verdict.Reason, agentID, requestedModel, start)
+				return false, sawCooldown, ""
+			}
+		}
 
 		switch classification {
 		case classAuth:
@@ -1090,12 +1134,28 @@ func (h *Handler) dispatchWithRetry(w http.ResponseWriter, r *http.Request, agen
 				if err := adaptUpstreamResponse(resp, upstream, downstreamStream, downstreamIncludeUsage); err != nil {
 					resp.Body.Close()
 					cancel()
+					if verdict, ok := h.planStreamVerdict(err, lease); ok {
+						if verdict.Action == planFail {
+							h.subs.NoteFailure(agentID, verdict.Reason)
+							h.failPlan(w, verdict.Reason, agentID, requestedModel, start)
+							return false, sawCooldown, ""
+						}
+						h.logCandidateFallback(agentID, requestedModel, verdict.Reason)
+						return true, sawCooldown, verdict.Reason
+					}
 					if canFallback {
 						h.logCandidateFallback(agentID, requestedModel, "responses_adapter_error")
 						return true, sawCooldown, "responses_adapter_error"
 					}
 					h.fail(w, http.StatusBadGateway, "failed to translate responses API reply", agentID, requestedModel, start, err)
 					return false, sawCooldown, ""
+				}
+			}
+			if planToken != "" {
+				if err := h.scrubPlanBody(resp); err != nil {
+					cancel()
+					h.logCandidateFallback(agentID, requestedModel, subscription.ReasonUnavailable)
+					return true, sawCooldown, subscription.ReasonUnavailable
 				}
 			}
 			// Success or non-retryable status: forward response back, no key state change.
@@ -1496,11 +1556,11 @@ func (h *Handler) recordResponse(agentID string, agentCtx *agentctx.AgentContext
 	}
 
 	latency := time.Since(start).Milliseconds()
-	if costInfo != nil {
-		h.logger.LogResponseWithCost(agentID, requestedModel, statusCode, latency, costInfo)
-	} else {
-		h.logger.LogResponse(agentID, requestedModel, statusCode, latency)
+	credential := credentialClassFor(providerName)
+	if statusCode >= 200 && statusCode < 300 {
+		h.subs.CountServed(agentID, credential)
 	}
+	h.logger.LogServedResponse(agentID, requestedModel, statusCode, latency, costInfo, providerName, credential)
 	h.scorePolicyResponse(agentID, agentCtx, policyFormatForPath(requestPath), policyMode(agentCtx), isSSE(responseHeader), requestedModel, requestEffective, statusCode, responseHeader, captured)
 }
 
@@ -1608,6 +1668,10 @@ func (h *Handler) resolveCost(providerName, upstreamModel string, usage cost.Usa
 	}
 	rate, ok := h.pricing.Lookup(providerName, upstreamModel)
 	if !ok {
+		// A plan route is not billed per token.
+		if subscription.IsPlanProvider(providerName) {
+			return 0, true
+		}
 		return 0, false
 	}
 	return rate.Compute(usage.PromptTokens, usage.CompletionTokens), true

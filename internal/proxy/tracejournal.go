@@ -116,6 +116,7 @@ func (h *Handler) agentRevoked(agentID string) bool {
 // redacted wherever a body, tool result or error echoes them.
 func (h *Handler) traceSecrets(presentedSecret string, agentCtx *agentctx.AgentContext) []string {
 	secrets := []string{presentedSecret, h.adminToken, os.Getenv("CLLAMA_UI_TOKEN")}
+	secrets = append(secrets, h.subs.Secrets()...)
 	if h.registry != nil {
 		for _, state := range h.registry.All() {
 			for _, key := range state.Keys {
@@ -174,6 +175,8 @@ func upstreamTraceInfo(candidate dispatchCandidate, upstream upstreamEncoding) t
 		Model:    candidate.UpstreamModel,
 		Path:     upstream.Path,
 		Body:     upstream.Body,
+		// A request leaves with the credential class of its provider.
+		Credential: credentialClassFor(candidate.ProviderName),
 	}
 }
 

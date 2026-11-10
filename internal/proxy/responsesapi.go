@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mostlydev/cllama/internal/subscription"
 	"io"
 	"net/http"
 	"os"
@@ -543,6 +544,9 @@ type upstreamEncoding struct {
 	Adapter bool
 	// Kind names the active adapter; it is empty when Adapter is false.
 	Kind upstreamAdapterKind
+	// Plan marks a plan-route request: the upstream reply is always an event
+	// stream and counts only once it completes.
+	Plan bool
 	// Mutations lists env-knob request rewrites applied during translation.
 	// Dispatch sites log each as an intervention alongside the adapter event.
 	Mutations []string
@@ -607,7 +611,11 @@ func encodeUpstreamRequestWithReasoning(candidate dispatchCandidate, requestPath
 		}
 		return upstreamEncoding{Path: anthropicMessagesPath, Body: body, Adapter: true, Kind: adapterAnthropic, Mutations: mutations}, false, nil
 	}
-	if !responsesAdapterEligible(requestPath) || !responsesAPIRequired(candidate.ProviderName, candidate.UpstreamModel) {
+	plan := subscription.IsPlanProvider(candidate.ProviderName)
+	if plan && !responsesAdapterEligible(requestPath) {
+		return upstreamEncoding{}, false, &responsesAdapterRequestError{message: "a plan route accepts chat completions requests only"}
+	}
+	if !responsesAdapterEligible(requestPath) || !(plan || responsesAPIRequired(candidate.ProviderName, candidate.UpstreamModel)) {
 		return upstreamEncoding{Path: requestPath, Body: chatBody}, false, nil
 	}
 	matchingReplay, droppedReplay := responsesReasoningForCandidate(replay, candidate)
@@ -620,12 +628,19 @@ func encodeUpstreamRequestWithReasoning(candidate dispatchCandidate, requestPath
 		return upstreamEncoding{}, droppedReplay, err
 	}
 	mutations = append(mutations, capabilityMutations...)
+	if plan {
+		planMutations, err := shapePlanResponsesRequest(translated)
+		if err != nil {
+			return upstreamEncoding{}, droppedReplay, err
+		}
+		mutations = append(mutations, planMutations...)
+	}
 
 	body, err := json.Marshal(translated)
 	if err != nil {
 		return upstreamEncoding{}, droppedReplay, err
 	}
-	return upstreamEncoding{Path: responsesAPIPath, Body: body, Adapter: true, Kind: adapterResponses, Mutations: mutations}, droppedReplay, nil
+	return upstreamEncoding{Path: responsesAPIPath, Body: body, Adapter: true, Kind: adapterResponses, Plan: plan, Mutations: mutations}, droppedReplay, nil
 }
 
 func responsesReasoningForCandidate(replay []responsesReasoningReplay, candidate dispatchCandidate) ([]responsesReasoningReplay, bool) {
@@ -748,6 +763,11 @@ func adaptResponsesResponse(resp *http.Response, downstreamStream, downstreamInc
 // adaptUpstreamResponse rewrites an adapted upstream reply in place with the
 // converter for the encoding's adapter.
 func adaptUpstreamResponse(resp *http.Response, upstream upstreamEncoding, downstreamStream, downstreamIncludeUsage bool) error {
+	if upstream.Plan {
+		if err := collapsePlanStream(resp); err != nil {
+			return err
+		}
+	}
 	if upstream.Kind != adapterAnthropic {
 		return adaptResponsesResponse(resp, downstreamStream, downstreamIncludeUsage)
 	}

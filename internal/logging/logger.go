@@ -96,6 +96,9 @@ type entry struct {
 	Action        string `json:"action,omitempty"`
 	Reason        string `json:"reason,omitempty"`
 	CooldownUntil string `json:"cooldown_until,omitempty"`
+	// Credential is the class of credential that served a response:
+	// "subscription" or "api_key". Never a credential value.
+	Credential string `json:"credential,omitempty"`
 	// failover event fields
 	FromProvider string `json:"from_provider,omitempty"`
 	ToProvider   string `json:"to_provider,omitempty"`
@@ -259,6 +262,32 @@ func (l *Logger) LogResponseWithCost(clawID, model string, statusCode int, laten
 		LatencyMS:    ptrI64(latencyMS),
 		StatusCode:   ptrInt(statusCode),
 		Intervention: nil,
+	}
+	if ci != nil {
+		e.TokensIn = ptrInt(ci.InputTokens)
+		e.TokensOut = ptrInt(ci.OutputTokens)
+		e.CachedTokens = ci.CachedTokens
+		e.CacheWriteTokens = ci.CacheWriteTokens
+		if ci.CostUSD != nil {
+			e.CostUSD = ci.CostUSD
+		}
+	}
+	l.log(e)
+}
+
+// LogServedResponse records a response with the provider and the class of
+// credential that served it.
+func (l *Logger) LogServedResponse(clawID, model string, statusCode int, latencyMS int64, ci *CostInfo, provider, credential string) {
+	e := entry{
+		TS:           time.Now().UTC().Format(time.RFC3339),
+		ClawID:       clawID,
+		Type:         "response",
+		Model:        model,
+		LatencyMS:    ptrI64(latencyMS),
+		StatusCode:   ptrInt(statusCode),
+		Intervention: nil,
+		Provider:     provider,
+		Credential:   credential,
 	}
 	if ci != nil {
 		e.TokensIn = ptrInt(ci.InputTokens)

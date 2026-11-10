@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/mostlydev/cllama/internal/subscription"
 	"io"
 	"log"
 	"net"
@@ -52,6 +53,9 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) error {
+	if len(args) > 0 && args[0] == "auth" {
+		return runAuth(args[1:], stdout, stderr)
+	}
 	fs := flag.NewFlagSet("cllama", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	healthcheck := fs.Bool("healthcheck", false, "check API server health and exit")
@@ -144,8 +148,16 @@ func newAPIHandler(contextRoot string, reg *provider.Registry, logger *logging.L
 }
 
 func newHandlers(cfg config, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, recorder *sessionhistory.Recorder, snapshots *proxy.ContextSnapshotStore, extra ...proxy.HandlerOption) (http.Handler, http.Handler) {
+	// Plan routes are installed after the file and the environment, with
+	// endpoints fixed in code, so neither can redirect a sign-in token.
+	subs := subscription.NewManager(cfg.AuthDir)
+	for _, name := range subscription.Providers() {
+		plan, _ := subscription.Lookup(name)
+		reg.RegisterPlan(plan.Provider, plan.InferenceBase)
+	}
+	extra = append(extra, proxy.WithSubscriptions(subs))
 	shared := newProxyHandler(cfg.ContextRoot, reg, logger, acc, pricing, cfg.PodName, recorder, cfg.ContextLedgerDir, cfg.GovernanceDir, cfg.UIToken, snapshots, extra...)
-	return newAPIHandlerWithProxy(shared), newUIHandler(reg, acc, cfg.ContextRoot, cfg.UIToken, snapshots, shared.HandleRevoke)
+	return newAPIHandlerWithProxy(shared), newUIHandler(reg, acc, cfg.ContextRoot, cfg.UIToken, snapshots, subs, shared.HandleRevoke)
 }
 
 func newProxyHandler(contextRoot string, reg *provider.Registry, logger *logging.Logger, acc *cost.Accumulator, pricing *cost.Pricing, podName string, recorder *sessionhistory.Recorder, contextLedgerDir string, governanceDir string, adminToken string, snapshots *proxy.ContextSnapshotStore, extra ...proxy.HandlerOption) *proxy.Handler {
@@ -184,9 +196,9 @@ func newAPIHandlerWithProxy(proxyHandler *proxy.Handler) http.Handler {
 	return mux
 }
 
-func newUIHandler(reg *provider.Registry, acc *cost.Accumulator, contextRoot, uiToken string, snapshots *proxy.ContextSnapshotStore, revoke ...http.HandlerFunc) http.Handler {
+func newUIHandler(reg *provider.Registry, acc *cost.Accumulator, contextRoot, uiToken string, snapshots *proxy.ContextSnapshotStore, subs *subscription.Manager, revoke ...http.HandlerFunc) http.Handler {
 	mux := http.NewServeMux()
-	opts := []ui.UIOption{ui.WithAccumulator(acc), ui.WithContextRoot(contextRoot), ui.WithSnapshotStore(snapshots)}
+	opts := []ui.UIOption{ui.WithAccumulator(acc), ui.WithContextRoot(contextRoot), ui.WithSnapshotStore(snapshots), ui.WithSubscriptions(subs)}
 	if uiToken != "" {
 		opts = append(opts, ui.WithUIToken(uiToken))
 	}

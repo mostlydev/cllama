@@ -146,12 +146,26 @@ func (s *Segment) omitTooLarge(n int) any {
 	return map[string]any{"omitted": "too_large", "bytes": n}
 }
 
+// AddSecrets extends the values redacted from every later record of this
+// segment. A credential minted while the request is in flight, such as a
+// refreshed sign-in token, is added before it is used.
+func (s *Segment) AddSecrets(secrets ...string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.secrets = usableSecrets(append(append([]string(nil), s.secrets...), secrets...))
+}
+
 // UpstreamInfo describes one provider dispatch attempt.
 type UpstreamInfo struct {
 	Provider string
 	Model    string
 	Path     string
 	Body     []byte
+	// Credential is the class of credential used, never its value.
+	Credential string
 }
 
 // BeginUpstream durably records a provider request before it is sent. The
@@ -167,13 +181,17 @@ func (s *Segment) BeginUpstream(info UpstreamInfo) (int, error) {
 	s.calls++
 	call := s.calls
 	s.pending[call] = true
-	err := s.appendLocked("upstream_request", map[string]any{
+	record := map[string]any{
 		"call":     call,
 		"provider": info.Provider,
 		"model":    info.Model,
 		"path":     info.Path,
 		"body":     body,
-	})
+	}
+	if info.Credential != "" {
+		record["credential"] = info.Credential
+	}
+	err := s.appendLocked("upstream_request", record)
 	return call, err
 }
 

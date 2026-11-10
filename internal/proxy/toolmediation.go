@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mostlydev/cllama/internal/subscription"
 	"io"
 	"net/http"
 	"net/url"
@@ -898,6 +899,7 @@ func (h *Handler) dispatchCandidatesJSON(ctx context.Context, r *http.Request, a
 
 func (h *Handler) dispatchCandidatesJSONWithReasoning(ctx context.Context, r *http.Request, agentID string, requestedModel string, payload map[string]any, candidates []dispatchCandidate, requestInfo *logging.RequestInfo, reasoningReplay []responsesReasoningReplay) (*capturedResponse, int, string, error) {
 	sawCooldown := false
+	lastReason := ""
 	start := time.Now()
 	for i, candidate := range candidates {
 		canFallback := i+1 < len(candidates)
@@ -930,12 +932,20 @@ func (h *Handler) dispatchCandidatesJSONWithReasoning(ctx context.Context, r *ht
 			return nil, result.ClientStatus, result.ClientMessage, result.Err
 		}
 		sawCooldown = sawCooldown || result.CandidateSawCooldown
+		lastReason = result.FallbackReason
+		if isPlanReason(lastReason) {
+			h.subs.NoteFailure(agentID, lastReason)
+		}
 		if i+1 < len(candidates) {
 			h.logCandidateFailover(agentID, requestedModel, candidate, candidates[i+1], result.FallbackReason, i+1, start)
 			h.logger.LogIntervention(agentID, requestedModel, "provider_exhausted_failover")
 		}
 	}
 
+	if isPlanReason(lastReason) {
+		status, _ := planFailure(lastReason)
+		return nil, status, planErrorMessage(lastReason), fmt.Errorf("%s", lastReason)
+	}
 	if sawCooldown {
 		err := fmt.Errorf("all declared providers cooling down")
 		return nil, http.StatusServiceUnavailable, "all declared provider keys in cooldown", err
@@ -949,6 +959,7 @@ func (h *Handler) dispatchCandidatesJSONWithReasoning(ctx context.Context, r *ht
 func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, agentID string, requestedModel string, candidate dispatchCandidate, upstream upstreamEncoding, outBody []byte, requestInfo *logging.RequestInfo, canFallback bool, reasoningReplay []responsesReasoningReplay) dispatchJSONAttemptResult {
 	const maxKeyAttempts = 5
 	sawCooldown := false
+	reauthorized := false
 
 	for attempt := 0; attempt < maxKeyAttempts; attempt++ {
 		prov, lease, err := h.registry.SelectKey(candidate.ProviderName)
@@ -957,13 +968,19 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 				return dispatchJSONAttemptResult{
 					AdvanceToNextCandidate: true,
 					CandidateSawCooldown:   true,
-					FallbackReason:         "provider_cooldown",
+					FallbackReason:         h.cooldownReason(candidate.ProviderName),
 				}
 			}
 			return dispatchJSONAttemptResult{
 				AdvanceToNextCandidate: true,
 				FallbackReason:         "provider_key_unavailable",
 			}
+		}
+		planToken, planErr := h.planCredential(ctx, prov)
+		if planErr != nil {
+			reason := planReasonOf(planErr)
+			h.logCandidateFallback(agentID, requestedModel, reason)
+			return dispatchJSONAttemptResult{AdvanceToNextCandidate: true, FallbackReason: reason}
 		}
 
 		checked, policyErr := h.policyUpstream(ctx, agentID, requestedModel, prov, upstream)
@@ -1026,7 +1043,29 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 		}
 
 		h.logUpstreamError(agentID, requestedModel, candidate.ProviderName, resp)
-		classification := classifyResponse(resp)
+		classification := classOK
+		if planToken == "" {
+			classification = classifyResponse(resp)
+		} else {
+			verdict := h.planResponseVerdict(ctx, resp, lease, planToken, &reauthorized)
+			switch verdict.Action {
+			case planRetry:
+				resp.Body.Close()
+				cancel()
+				continue
+			case planAdvance:
+				resp.Body.Close()
+				cancel()
+				h.logCandidateFallback(agentID, requestedModel, verdict.Reason)
+				return dispatchJSONAttemptResult{AdvanceToNextCandidate: true, FallbackReason: verdict.Reason}
+			case planFail:
+				resp.Body.Close()
+				cancel()
+				h.subs.NoteFailure(agentID, verdict.Reason)
+				status, _ := planFailure(verdict.Reason)
+				return dispatchJSONAttemptResult{ClientStatus: status, ClientMessage: planErrorMessage(verdict.Reason), Err: fmt.Errorf("%s", verdict.Reason)}
+			}
+		}
 		switch classification {
 		case classAuth:
 			resp.Body.Close()
@@ -1094,6 +1133,27 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 				return dispatchJSONAttemptResult{
 					AdvanceToNextCandidate: true,
 					FallbackReason:         reason,
+				}
+			}
+			if upstream.Plan {
+				if streamErr := collapsePlanStream(resp); streamErr != nil {
+					resp.Body.Close()
+					cancel()
+					verdict, _ := h.planStreamVerdict(streamErr, lease)
+					if verdict.Action == planFail {
+						h.subs.NoteFailure(agentID, verdict.Reason)
+						status, _ := planFailure(verdict.Reason)
+						return dispatchJSONAttemptResult{ClientStatus: status, ClientMessage: planErrorMessage(verdict.Reason), Err: streamErr}
+					}
+					h.logCandidateFallback(agentID, requestedModel, verdict.Reason)
+					return dispatchJSONAttemptResult{AdvanceToNextCandidate: true, FallbackReason: verdict.Reason, Err: streamErr}
+				}
+			}
+			if planToken != "" {
+				if scrubErr := h.scrubPlanBody(resp); scrubErr != nil {
+					cancel()
+					h.logCandidateFallback(agentID, requestedModel, subscription.ReasonUnavailable)
+					return dispatchJSONAttemptResult{AdvanceToNextCandidate: true, FallbackReason: subscription.ReasonUnavailable, Err: scrubErr}
 				}
 			}
 			limited, readErr := readBodyLimited(resp.Body, maxManagedLLMResponseBytes)
