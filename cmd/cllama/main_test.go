@@ -79,7 +79,7 @@ func TestDualServerIntegrationSmoke(t *testing.T) {
 	acc := cost.NewAccumulator()
 	snapshots := proxy.NewContextSnapshotStore()
 	apiHandler := newAPIHandler(contextRoot, reg, logging.New(io.Discard), acc, pricing, "test-pod", nil, "", "", "", snapshots)
-	uiHandler := newUIHandler(reg, acc, contextRoot, "", snapshots)
+	uiHandler := newUIHandler(reg, acc, contextRoot, "", snapshots, nil)
 
 	apiServer := &http.Server{Handler: apiHandler}
 	uiServer := &http.Server{Handler: uiHandler}

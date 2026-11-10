@@ -4,6 +4,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"github.com/mostlydev/cllama/internal/subscription"
 	"html/template"
 	"net/http"
 	"net/url"
@@ -46,6 +47,34 @@ func WithUIToken(token string) UIOption {
 	}
 }
 
+// WithSubscriptions exposes plan sign-in state on the operator port.
+func WithSubscriptions(m *subscription.Manager) UIOption {
+	return func(h *Handler) {
+		h.subs = m
+	}
+}
+
+// handleSubscriptions reports each plan's sign-in state and, per agent, how
+// many requests each credential class served and the last plan failure. It
+// never returns a token.
+func (h *Handler) handleSubscriptions(w http.ResponseWriter) {
+	statuses := h.subs.Status()
+	for i := range statuses {
+		if until := h.registry.CooldownUntil(statuses[i].Provider); !until.IsZero() {
+			statuses[i].LimitedUntil = until.UTC().Format(time.RFC3339)
+		}
+	}
+	if statuses == nil {
+		statuses = []subscription.Status{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"subscriptions": statuses,
+		"served_by":     h.subs.Served(),
+		"last_failure":  h.subs.Failures(),
+	})
+}
+
 func WithSnapshotStore(store *proxy.ContextSnapshotStore) UIOption {
 	return func(h *Handler) {
 		if store != nil {
@@ -55,6 +84,7 @@ func WithSnapshotStore(store *proxy.ContextSnapshotStore) UIOption {
 }
 
 type Handler struct {
+	subs          *subscription.Manager
 	registry      *provider.Registry
 	accumulator   *cost.Accumulator
 	contextRoot   string
@@ -141,6 +171,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleContextSnapshot(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/costs/api":
 		h.handleCostsAPI(w)
+	case r.Method == http.MethodGet && r.URL.Path == "/subscriptions":
+		h.handleSubscriptions(w)
 	case r.Method == http.MethodPost && r.URL.Path == "/providers/add":
 		h.handleProviderAdd(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/keys/add":

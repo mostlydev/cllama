@@ -384,7 +384,7 @@ func (h *Handler) HandleRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 	h.clearRevokedSnapshot(id)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(record)
+	_ = json.NewEncoder(w).Encode(h.revokeAck(record))
 }
 
 // clearRevokedSnapshot runs both after the fence drains and after each handler
