@@ -15,6 +15,10 @@ type dispatchCandidate struct {
 	// candidate on the chat/completions path dispatches through the Anthropic
 	// Messages adapter.
 	APIFormat string
+	// ViaResponses and DropSampling carry what the vendor's rejections have
+	// taught about this model's request shape; see modelhints.go.
+	ViaResponses bool
+	DropSampling bool
 }
 
 type modelResolution struct {

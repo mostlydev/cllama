@@ -615,7 +615,7 @@ func encodeUpstreamRequestWithReasoning(candidate dispatchCandidate, requestPath
 	if plan && !responsesAdapterEligible(requestPath) {
 		return upstreamEncoding{}, false, &responsesAdapterRequestError{message: "a plan route accepts chat completions requests only"}
 	}
-	if !responsesAdapterEligible(requestPath) || !(plan || responsesAPIRequired(candidate.ProviderName, candidate.UpstreamModel)) {
+	if !responsesAdapterEligible(requestPath) || !(plan || responsesAPIRequired(candidate.ProviderName, candidate.UpstreamModel) || (candidate.ViaResponses && !boolEnv(EnvResponsesAPIDisabled))) {
 		return upstreamEncoding{Path: requestPath, Body: chatBody}, false, nil
 	}
 	matchingReplay, droppedReplay := responsesReasoningForCandidate(replay, candidate)

@@ -33,6 +33,20 @@ func openAIModelAcceptsSampling(family, effort string) bool {
 // for audit at both direct and managed dispatch boundaries. Never change a
 // caller's explicit reasoning effort to make a request pass.
 func normalizeOpenAIResponses(candidate dispatchCandidate, translated map[string]any) ([]string, error) {
+	var learned []string
+	// The vendor refused sampling controls for this model on an earlier
+	// attempt. That holds whatever the family list says.
+	if candidate.DropSampling && dropSampling(translated) {
+		learned = []string{"responses_adapter_dropped_sampling"}
+	}
+	mutations, err := normalizeOpenAIFamily(candidate, translated)
+	if err != nil {
+		return nil, err
+	}
+	return append(learned, mutations...), nil
+}
+
+func normalizeOpenAIFamily(candidate dispatchCandidate, translated map[string]any) ([]string, error) {
 	if !strings.EqualFold(candidate.ProviderName, "openai") {
 		return nil, nil
 	}
@@ -49,14 +63,7 @@ func normalizeOpenAIResponses(candidate dispatchCandidate, translated map[string
 	if openAIModelAcceptsSampling(family, effort) {
 		return nil, nil
 	}
-	dropped := false
-	for _, field := range []string{"temperature", "top_p"} {
-		if _, ok := translated[field]; ok {
-			delete(translated, field)
-			dropped = true
-		}
-	}
-	if dropped {
+	if dropSampling(translated) {
 		return []string{"responses_adapter_dropped_sampling"}, nil
 	}
 	return nil, nil
