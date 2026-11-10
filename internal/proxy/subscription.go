@@ -298,6 +298,8 @@ type planStreamError struct {
 	LastEvent   string
 	Events      int
 	ContentType string
+	// Bytes is how much of the stream was read before it ended.
+	Bytes int
 }
 
 func (e *planStreamError) Error() string {
@@ -315,11 +317,15 @@ func collapsePlanStream(resp *http.Response) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil
 	}
-	if !isSSE(resp.Header) {
-		// A success that is not an event stream carries no completion proof.
+	mediaType := planMediaType(resp.Header)
+	if !isSSE(resp.Header) && resp.Header.Get("Content-Type") != "" {
+		// A success that declares another type carries no completion proof.
 		resp.Body.Close()
-		return &planStreamError{Detail: "reply was not an event stream", Branch: planBranchNotEventStream, Status: resp.StatusCode, ContentType: planMediaType(resp.Header)}
+		return &planStreamError{Detail: "reply was not an event stream", Branch: planBranchNotEventStream, Status: resp.StatusCode, ContentType: mediaType}
 	}
+	// A reply that declares no type is read as a stream. The header was never
+	// the proof: only a response.completed event below is, so an empty body,
+	// a JSON object or an error page read this way still ends as a failure.
 	defer resp.Body.Close()
 	reader := bufio.NewReaderSize(io.LimitReader(resp.Body, maxPlanStreamBytes+1), 64<<10)
 	var (
@@ -330,7 +336,7 @@ func collapsePlanStream(resp *http.Response) error {
 		lastEvent string
 	)
 	failed := func(branch, detail string) *planStreamError {
-		return &planStreamError{Detail: detail, Branch: branch, Status: resp.StatusCode, LastEvent: lastEvent, Events: events}
+		return &planStreamError{Detail: detail, Branch: branch, Status: resp.StatusCode, LastEvent: lastEvent, Events: events, ContentType: mediaType, Bytes: total}
 	}
 	flush := func() error {
 		defer data.Reset()
@@ -353,6 +359,15 @@ func collapsePlanStream(resp *http.Response) error {
 		lastEvent = event.Type
 		switch event.Type {
 		case "response.completed":
+			// The generic adapter deliberately passes non-response JSON through.
+			// A plan completion must first prove it carries a completed response.
+			var result map[string]any
+			if json.Unmarshal(event.Response, &result) != nil || result["object"] != "response" || result["status"] != "completed" {
+				return failed(planBranchInvalidCompleted, "invalid completed response")
+			}
+			if _, ok := result["output"].([]any); !ok {
+				return failed(planBranchInvalidCompleted, "completed response has no output array")
+			}
 			completed = append(json.RawMessage(nil), event.Response...)
 		case "response.failed", "response.incomplete", "error":
 			code, kind := event.Code, ""
@@ -388,7 +403,7 @@ func collapsePlanStream(resp *http.Response) error {
 					}
 				}
 			}
-			return &planStreamError{Code: code, Detail: event.Type, Branch: planBranchStreamTerminal, Status: resp.StatusCode, Kind: kind, Event: event.Type, Events: events}
+			return &planStreamError{Code: code, Detail: event.Type, Branch: planBranchStreamTerminal, Status: resp.StatusCode, Kind: kind, Event: event.Type, Events: events, ContentType: mediaType, Bytes: total}
 		}
 		return nil
 	}

@@ -281,7 +281,8 @@ HTTP 400. Fields the route refuses (`temperature`, `top_p`, `max_output_tokens`,
 `metadata`, `user`, `service_tier` and the others OpenAI lists) are removed, and each removal
 is logged as a `subscription_field_dropped:<field>` intervention. A reply counts only after
 `response.completed`; a failed, incomplete or cut stream is a failure and none of it reaches
-the agent. Data policy applies as for any provider: attest guarantees for provider `chatgpt`.
+the agent. OpenAI's reply declares no `Content-Type`, so a 2xx reply without one is read as an
+event stream; one that declares another type is refused unread. Data policy applies as for any provider: attest guarantees for provider `chatgpt`.
 
 **When the plan route cannot serve.** These reasons are distinct from model and transport
 errors. With a later entry in the chain the request moves on; without one it fails with the
@@ -317,8 +318,8 @@ plan attempt also writes a `plan_failure` log event that names the cause:
 | `upstream_error_code`, `upstream_error_type` | The vendor's machine-readable code and type |
 | `body_shape` | Top-level form of an error body: `error`, `detail`, `other_object`, `not_json_object` or `empty` |
 | `stream_event` | The event that ended a stream: `response.failed`, `response.incomplete` or `error` |
-| `stream_last_event`, `stream_events` | The last event read and how many were read, when a stream ended without completing |
-| `content_type` | Media type of a 2xx reply that was not an event stream |
+| `stream_last_event`, `stream_events`, `stream_bytes` | The last event read, how many events and how many bytes were read, when a stream did not complete. Zero bytes is an empty reply |
+| `content_type` | Media type of a 2xx reply that was not an event stream or did not complete; `none` when the reply declared no type |
 
 | Branch | What happened |
 |---|---|
@@ -335,9 +336,10 @@ plan attempt also writes a `plan_failure` log event that names the cause:
 | `http_401_refresh_failed` | The token was refused and the refresh failed; a `stage: token` event precedes it |
 | `http_403`, `http_400_unsupported` | Not eligible, or an unsupported feature |
 | `http_other` | Any other error status, left to the ordinary handling |
-| `not_event_stream` | A 2xx reply that was not an event stream |
+| `not_event_stream` | A 2xx reply that declared a type other than an event stream. It is refused unread |
 | `stream_terminal_event` | The stream ended in a failure event |
 | `stream_ended_early`, `stream_interrupted`, `stream_too_large` | The stream stopped before `response.completed` |
+| `stream_invalid_completed` | A completion event lacks a response object, completed status or output array |
 | `adapter_error` | A completed reply could not be translated |
 | `response_read_error` / `response_too_large` | Managed dispatch could not read the reply or it exceeded the response limit |
 | `scrub_failed` | The reply could not be buffered for the token scrub |

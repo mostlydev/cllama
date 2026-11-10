@@ -15,24 +15,25 @@ import (
 // the outcome. They are constants: nothing from a vendor reply selects one
 // except through the comparisons in this package.
 const (
-	planBranchCredential     = "credential_" // completed by a subscription stage
-	planBranchTransport      = "transport"
-	planBranchLimit          = "http_429_limit"
-	planBranchRateLimit      = "http_429_rate"
-	planBranch401Repeated    = "http_401_after_refresh"
-	planBranch401RefreshFail = "http_401_refresh_failed"
-	planBranch403            = "http_403"
-	planBranch400Unsupported = "http_400_unsupported"
-	planBranchHTTPOther      = "http_other"
-	planBranchNotEventStream = "not_event_stream"
-	planBranchStreamTerminal = "stream_terminal_event"
-	planBranchStreamEnded    = "stream_ended_early"
-	planBranchStreamCut      = "stream_interrupted"
-	planBranchStreamTooLarge = "stream_too_large"
-	planBranchScrub          = "scrub_failed"
-	planBranchAdapter        = "adapter_error"
-	planBranchRead           = "response_read_error"
-	planBranchResponseLimit  = "response_too_large"
+	planBranchCredential       = "credential_" // completed by a subscription stage
+	planBranchTransport        = "transport"
+	planBranchLimit            = "http_429_limit"
+	planBranchRateLimit        = "http_429_rate"
+	planBranch401Repeated      = "http_401_after_refresh"
+	planBranch401RefreshFail   = "http_401_refresh_failed"
+	planBranch403              = "http_403"
+	planBranch400Unsupported   = "http_400_unsupported"
+	planBranchHTTPOther        = "http_other"
+	planBranchNotEventStream   = "not_event_stream"
+	planBranchStreamTerminal   = "stream_terminal_event"
+	planBranchStreamEnded      = "stream_ended_early"
+	planBranchInvalidCompleted = "stream_invalid_completed"
+	planBranchStreamCut        = "stream_interrupted"
+	planBranchStreamTooLarge   = "stream_too_large"
+	planBranchScrub            = "scrub_failed"
+	planBranchAdapter          = "adapter_error"
+	planBranchRead             = "response_read_error"
+	planBranchResponseLimit    = "response_too_large"
 
 	planStageToken     = "token"
 	planStageInference = "inference"
@@ -136,6 +137,8 @@ type planDiag struct {
 	ContentType string
 	// Shape classifies an error body by its top-level form, a fixed label.
 	Shape string
+	// Bytes counts what was read of a stream that did not complete.
+	Bytes int
 }
 
 // credentialDiag describes a failure of the sign-in step. The error's detail
@@ -172,6 +175,7 @@ func streamDiag(err error) planDiag {
 		d.LastEvent = e.LastEvent
 		d.Events = e.Events
 		d.ContentType = e.ContentType
+		d.Bytes = e.Bytes
 	}
 	return d
 }
@@ -195,6 +199,7 @@ func (h *Handler) logPlanFailure(agentID, model, providerName, reason string, d 
 		StreamEvents:    d.Events,
 		ContentType:     d.ContentType,
 		BodyShape:       d.Shape,
+		StreamBytes:     d.Bytes,
 	})
 }
 
