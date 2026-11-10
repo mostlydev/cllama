@@ -178,3 +178,29 @@ func TestGPT5ProDoesNotUseGPT56LongContextMultiplier(t *testing.T) {
 		t.Fatalf("gpt-5-pro must retain uniform pricing above 272K: got %.12f want %.12f", got, want)
 	}
 }
+
+func TestGPT61PricesAreExactEntries(t *testing.T) {
+	p := DefaultPricing()
+	for model, want := range map[string][4]float64{
+		// base input, base output, long-context input, long-context output
+		"gpt-6.1-terra": {1, 5, 2, 7.5},
+		"gpt-6.1-sol":   {2, 10, 4, 15},
+	} {
+		r, ok := p.Lookup("openai", model)
+		if !ok || r.InputPerMTok != want[0] || r.OutputPerMTok != want[1] {
+			t.Fatalf("%s base = %+v", model, r)
+		}
+		short := r.Compute(272000, 1_000_000)
+		if short != 0.272*want[0]+want[1] {
+			t.Fatalf("%s at the threshold = %v", model, short)
+		}
+		long := r.Compute(1_000_000, 1_000_000)
+		if long != want[2]+want[3] {
+			t.Fatalf("%s long context = %v, want %v", model, long, want[2]+want[3])
+		}
+	}
+	// A sibling the table does not list has no price, exact or by prefix.
+	if _, ok := p.Lookup("openai", "gpt-6.1-luna"); ok {
+		t.Fatal("gpt-6.1-luna is priced by a catch-all")
+	}
+}
