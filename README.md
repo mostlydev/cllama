@@ -339,6 +339,7 @@ plan attempt also writes a `plan_failure` log event that names the cause:
 | `stream_terminal_event` | The stream ended in a failure event |
 | `stream_ended_early`, `stream_interrupted`, `stream_too_large` | The stream stopped before `response.completed` |
 | `adapter_error` | A completed reply could not be translated |
+| `response_read_error` / `response_too_large` | Managed dispatch could not read the reply or it exceeded the response limit |
 | `scrub_failed` | The reply could not be buffered for the token scrub |
 
 A vendor reply is untrusted text, so none of it is logged as given. Codes, types, event names

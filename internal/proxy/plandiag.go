@@ -31,6 +31,8 @@ const (
 	planBranchStreamTooLarge = "stream_too_large"
 	planBranchScrub          = "scrub_failed"
 	planBranchAdapter        = "adapter_error"
+	planBranchRead           = "response_read_error"
+	planBranchResponseLimit  = "response_too_large"
 
 	planStageToken     = "token"
 	planStageInference = "inference"

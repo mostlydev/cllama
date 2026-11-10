@@ -1167,6 +1167,9 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			resp.Body.Close()
 			if readErr != nil {
 				cancel()
+				if planToken != "" {
+					h.logPlanFailure(agentID, requestedModel, candidate.ProviderName, "response_read_error", planDiag{Branch: planBranchRead, Stage: planStageInference, Status: resp.StatusCode})
+				}
 				// Headers were committed upstream, but no downstream bytes were
 				// written, so advancing is as safe here as it is for transport
 				// errors and 5xx. Without this the runner retries the failing
@@ -1188,6 +1191,9 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 			}
 			if limited.Truncated {
 				cancel()
+				if planToken != "" {
+					h.logPlanFailure(agentID, requestedModel, candidate.ProviderName, "response_too_large", planDiag{Branch: planBranchResponseLimit, Stage: planStageInference, Status: resp.StatusCode})
+				}
 				return dispatchJSONAttemptResult{
 					ClientStatus:  http.StatusBadGateway,
 					ClientMessage: "managed tool mediation upstream response exceeded size limit",
@@ -1202,6 +1208,9 @@ func (h *Handler) dispatchJSONWithRetry(ctx context.Context, r *http.Request, ag
 				// the loop parses the chat/completions shape.
 				converted, reasoning, convErr := upstream.toChatCompletion(capturedBody)
 				if convErr != nil {
+					if planToken != "" {
+						h.logPlanFailure(agentID, requestedModel, candidate.ProviderName, "responses_adapter_error", planDiag{Branch: planBranchAdapter, Stage: planStageInference, Status: resp.StatusCode})
+					}
 					if canFallback {
 						h.logCandidateFallback(agentID, requestedModel, "responses_adapter_error")
 						return dispatchJSONAttemptResult{

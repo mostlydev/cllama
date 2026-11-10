@@ -343,7 +343,7 @@ func collapsePlanStream(resp *http.Response) error {
 			Code     string          `json:"code"`
 			Error    *struct {
 				Code string `json:"code"`
-				Type string `json:"type"`
+				Type any    `json:"type"`
 			} `json:"error"`
 		}
 		if json.Unmarshal(data.Bytes(), &event) != nil {
@@ -357,7 +357,7 @@ func collapsePlanStream(resp *http.Response) error {
 		case "response.failed", "response.incomplete", "error":
 			code, kind := event.Code, ""
 			if event.Error != nil {
-				kind = event.Error.Type
+				kind, _ = event.Error.Type.(string)
 				if event.Error.Code != "" {
 					code = event.Error.Code
 				}
@@ -366,11 +366,9 @@ func collapsePlanStream(resp *http.Response) error {
 				var inner struct {
 					Error *struct {
 						Code string `json:"code"`
-						Type string `json:"type"`
+						Type any    `json:"type"`
 					} `json:"error"`
-					Incomplete *struct {
-						Reason string `json:"reason"`
-					} `json:"incomplete_details"`
+					Incomplete any `json:"incomplete_details"`
 				}
 				if json.Unmarshal(event.Response, &inner) == nil {
 					if inner.Error != nil {
@@ -378,13 +376,15 @@ func collapsePlanStream(resp *http.Response) error {
 							code = inner.Error.Code
 						}
 						if kind == "" {
-							kind = inner.Error.Type
+							kind, _ = inner.Error.Type.(string)
 						}
 					}
 					// An incomplete response gives its cause as a reason, not
 					// an error. It is recorded only; routing ignores it.
-					if code == "" && inner.Incomplete != nil {
-						kind = inner.Incomplete.Reason
+					if code == "" {
+						if details, ok := inner.Incomplete.(map[string]any); ok {
+							kind, _ = details["reason"].(string)
+						}
 					}
 				}
 			}

@@ -251,6 +251,8 @@ func TestManagedPlanFailureNamesItsBranch(t *testing.T) {
 		expire bool
 		branch string
 	}{
+		"adapter":        {reply: sseReply(planSSE(`{"type":"response.completed","response":{"object":"response","status":"completed","output":"invalid"}}`)), branch: "adapter_error"},
+		"response limit": {reply: sseReply(planCompleted(strings.Repeat("x", maxManagedLLMResponseBytes))), branch: "response_too_large"},
 		"credential":     {expire: true, branch: "credential_refresh_http"},
 		"http":           {reply: jsonReply(401, `{"error":{"code":"invalid_token"}}`), branch: "http_401_after_refresh"},
 		"not a stream":   {reply: jsonReply(200, `{}`), branch: "not_event_stream"},
@@ -284,5 +286,53 @@ func TestManagedPlanFailureNamesItsBranch(t *testing.T) {
 				t.Fatalf("events = %v, want branch %s", events, tc.branch)
 			}
 		})
+	}
+}
+
+// Diagnostic-only fields must not turn a refusal into billable API fallback.
+func TestPlanDiagnosticsMalformedAdvisoryCannotChangeRouting(t *testing.T) {
+	events := map[string]string{
+		"incomplete_container": `{"type":"response.failed","response":{"error":{"code":"subscription_sharing_unsupported_capability"},"incomplete_details":42}}`,
+		"outer_type":           `{"type":"response.failed","error":{"code":"subscription_sharing_unsupported_capability","type":{"account":"private"}}}`,
+		"nested_type":          `{"type":"response.failed","response":{"error":{"code":"subscription_sharing_unsupported_capability","type":42}}}`,
+		"incomplete_reason":    `{"type":"response.failed","response":{"error":{"code":"subscription_sharing_unsupported_capability"},"incomplete_details":{"reason":["private"]}}}`,
+	}
+	for name, event := range events {
+		for _, managed := range []bool{false, true} {
+			mode := "direct"
+			if managed {
+				mode = "managed"
+			}
+			t.Run(name+"/"+mode, func(t *testing.T) {
+				rig := newPlanRig(t, planRef, keyRef)
+				rig.signIn("plan-access-0-canary", time.Hour)
+				rig.planReply = sseReply(planSSE(event))
+				if !managed {
+					w := rig.chat("")
+					if w.Code != http.StatusBadRequest || errorCode(t, w) != "subscription_unsupported_request" {
+						t.Fatalf("refusal changed: status=%d body=%s", w.Code, w.Body.String())
+					}
+				} else {
+					var candidates []dispatchCandidate
+					for _, ref := range []string{planRef, keyRef} {
+						c, err := rig.h.openAICandidateFromRef(ref)
+						if err != nil {
+							t.Fatal(err)
+						}
+						candidates = append(candidates, c)
+					}
+					ctx := context.WithValue(context.Background(), dataPolicyKey{}, *testPermissiveDataPolicy())
+					req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+					payload := map[string]any{"model": planRef, "messages": []any{map[string]any{"role": "user", "content": "hello"}}}
+					_, status, _, _ := rig.h.dispatchCandidatesJSON(ctx, req, "worker", planRef, payload, candidates, nil)
+					if status != http.StatusBadRequest {
+						t.Fatalf("refusal changed: status=%d", status)
+					}
+				}
+				if rig.keyHits != 0 {
+					t.Fatalf("diagnostic field triggered %d API calls", rig.keyHits)
+				}
+			})
+		}
 	}
 }
