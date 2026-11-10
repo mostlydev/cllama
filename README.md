@@ -427,9 +427,15 @@ a compiler can run the pinned image once and use the same prices the proxy will 
   "cllama": {"version": "v0.16.0", "revision": "<commit>"},
   "currency": "USD",
   "unit": "per_million_tokens",
+  "scope": {
+    "service_tier": "standard", "tokens": "uncached_text",
+    "includes": ["long_context"],
+    "excludes": ["regional_or_compliance_uplift", "priority_or_fast_service_tiers",
+      "cache_write", "cached_input_discount", "batch", "non_text_modalities", "hosted_tool_fees"]
+  },
   "entries": [
     {"provider": "openai", "model": "gpt-5.6-terra", "input": 2, "output": 12,
-     "max_input": 4, "max_output": 18, "long_context_threshold_tokens": 272000, "tiers": "all"}
+     "max_input": 4, "max_output": 18, "long_context_threshold_tokens": 272000, "context_tiers": "all"}
   ]
 }
 ```
@@ -437,7 +443,7 @@ a compiler can run the pinned image once and use the same prices the proxy will 
 - Entries are sorted by provider, then model, so the output is stable for a build.
 - `input` and `output` are base rates. `max_input` and `max_output` are the highest rates the
   entry encodes, including its long-context multipliers. Compare a price bound with those.
-- `tiers` is `all` when the entry encodes every tier the table knows for the model, and
+- `context_tiers` is `all` when the entry encodes every context-length tier the table knows for the model, and
   `base_only` when it is knowingly simplified to the base tier (Google's models, here and
   through OpenRouter). A `base_only` entry is an estimate, not a ceiling.
 - An ID equal to `model` is priced exactly. The proxy also costs a longer ID by its longest
@@ -445,8 +451,15 @@ a compiler can run the pinned image once and use the same prices the proxy will 
   IDs for equality.
 - The command prints nothing and fails if any rate is negative or not finite.
 
+`scope` states what the rates cover: the vendor's standard service tier and uncached text
+tokens, with the long-context tier included in the `max_` figures. Everything in
+`scope.excludes` is outside the table. A consumer that bounds a price must add any uplift
+its own route applies, such as a regional endpoint, or treat the price as unresolved.
+
 These are listed prices kept up to date by hand. They are not a billing cap. A model the
 table does not list is unpriced: the proxy serves it and records its cost as unknown.
+
+The GPT-6.1 Terra and Sol entries use [OpenAI Standard pricing](https://developers.openai.com/api/docs/pricing), checked on 2026-11-10, including the long-context tier above 272K input tokens.
 
 ## Operator Dashboard
 

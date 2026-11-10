@@ -17,6 +17,7 @@ type priceExport struct {
 	Currency string       `json:"currency"`
 	Unit     string       `json:"unit"`
 	Note     string       `json:"note"`
+	Scope    priceScope   `json:"scope"`
 	Entries  []cost.Entry `json:"entries"`
 }
 
@@ -25,11 +26,24 @@ type buildInfo struct {
 	Revision string `json:"revision"`
 }
 
-const priceExportNote = "An id equal to an entry's model is priced exactly. " +
-	"cllama also costs a longer id by its longest matching entry; that is an estimate, not an exact price. " +
-	"max_input and max_output are the highest rates the entry encodes. " +
-	"An entry whose tiers is base_only omits a higher tier and is not a ceiling. " +
-	"These are listed prices, not a billing cap."
+type priceScope struct {
+	ServiceTier string   `json:"service_tier"`
+	Tokens      string   `json:"tokens"`
+	Includes    []string `json:"includes"`
+	Excludes    []string `json:"excludes"`
+}
+
+func exportedPriceScope() priceScope {
+	return priceScope{ServiceTier: "standard", Tokens: "uncached_text",
+		Includes: []string{"long_context"},
+		Excludes: []string{"regional_or_compliance_uplift", "priority_or_fast_service_tiers", "cache_write", "cached_input_discount", "batch", "non_text_modalities", "hosted_tool_fees"}}
+}
+
+const priceExportNote = "Rates are the vendor's standard service tier for uncached text tokens. " +
+	"max_input and max_output add the long-context tier where the entry has one, and nothing else. " +
+	"Regional or compliance uplifts, priority or fast service tiers, cache writes, batch and non-text pricing are outside this table. " +
+	"An id equal to an entry's model is priced exactly; a longer id costed by its longest matching entry is an estimate. " +
+	"context_tiers base_only means a higher context tier exists and is not encoded. These are listed prices, not a billing cap."
 
 func runPrices(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("cllama prices", flag.ContinueOnError)
@@ -47,7 +61,7 @@ func runPrices(args []string, stdout, stderr io.Writer) error {
 	}
 	out, err := json.MarshalIndent(priceExport{
 		Schema: 1, Cllama: buildInfo{Version: version, Revision: revision},
-		Currency: "USD", Unit: "per_million_tokens", Note: priceExportNote, Entries: entries,
+		Currency: "USD", Unit: "per_million_tokens", Note: priceExportNote, Scope: exportedPriceScope(), Entries: entries,
 	}, "", "  ")
 	if err != nil {
 		return err

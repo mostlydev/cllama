@@ -57,13 +57,13 @@ func TestEntriesMarkKnownIncompleteTiers(t *testing.T) {
 	}
 	seen := map[string]string{}
 	for _, e := range entries {
-		seen[e.Provider+"/"+e.Model] = e.Tiers
+		seen[e.Provider+"/"+e.Model] = e.ContextTiers
 	}
 	for id, want := range map[string]string{
-		"openai/gpt-5.6-terra":               TiersAll,
-		"google/gemini-2.5-pro":              TiersBaseOnly,
-		"openrouter/google/gemini-2.5-pro":   TiersBaseOnly,
-		"openrouter/anthropic/claude-opus-5": TiersAll,
+		"openai/gpt-5.6-terra":               ContextTiersAll,
+		"google/gemini-2.5-pro":              ContextTiersBaseOnly,
+		"openrouter/google/gemini-2.5-pro":   ContextTiersBaseOnly,
+		"openrouter/anthropic/claude-opus-5": ContextTiersAll,
 	} {
 		if seen[id] != want {
 			t.Errorf("%s tiers = %q, want %q", id, seen[id], want)

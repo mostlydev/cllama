@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -29,6 +30,12 @@ func TestPricesPrintsTheCompiledTable(t *testing.T) {
 	if got.Schema != 1 || got.Currency != "USD" || got.Unit != "per_million_tokens" || got.Note == "" {
 		t.Fatalf("header = %+v", got)
 	}
+	wantScope := priceScope{ServiceTier: "standard", Tokens: "uncached_text",
+		Includes: []string{"long_context"},
+		Excludes: []string{"regional_or_compliance_uplift", "priority_or_fast_service_tiers", "cache_write", "cached_input_discount", "batch", "non_text_modalities", "hosted_tool_fees"}}
+	if !reflect.DeepEqual(got.Scope, wantScope) {
+		t.Fatalf("scope = %+v", got.Scope)
+	}
 	if got.Cllama.Version != version || got.Cllama.Revision != revision {
 		t.Fatalf("build = %+v", got.Cllama)
 	}
@@ -36,7 +43,7 @@ func TestPricesPrintsTheCompiledTable(t *testing.T) {
 	for _, e := range got.Entries {
 		if e.Provider == "openai" && e.Model == "gpt-5.6-terra" {
 			terra = true
-			if e.Input != 2 || e.Output != 12 || e.MaxInput != 4 || e.MaxOutput != 18 || e.LongContextThresholdTokens != 272000 || e.Tiers != "all" {
+			if e.Input != 2 || e.Output != 12 || e.MaxInput != 4 || e.MaxOutput != 18 || e.LongContextThresholdTokens != 272000 || e.ContextTiers != "all" {
 				t.Fatalf("terra = %+v", e)
 			}
 		}

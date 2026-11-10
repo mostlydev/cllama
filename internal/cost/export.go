@@ -9,13 +9,13 @@ import (
 
 // Tier coverage of a table entry.
 const (
-	// TiersAll means the entry encodes every rate tier the table knows for
+	// ContextTiersAll means the entry encodes every rate tier the table knows for
 	// the model, so its maximum rates are the highest the table can charge.
-	TiersAll = "all"
-	// TiersBaseOnly means the entry is knowingly simplified to the model's
+	ContextTiersAll = "all"
+	// ContextTiersBaseOnly means the entry is knowingly simplified to the model's
 	// base tier: a higher tier exists and is not in the table. Its rates are
 	// fine for estimating cost and are not a ceiling.
-	TiersBaseOnly = "base_only"
+	ContextTiersBaseOnly = "base_only"
 )
 
 // Entry is one row of the compiled price table, as exported.
@@ -30,7 +30,7 @@ type Entry struct {
 	MaxInput                   float64 `json:"max_input"`
 	MaxOutput                  float64 `json:"max_output"`
 	LongContextThresholdTokens int     `json:"long_context_threshold_tokens,omitempty"`
-	Tiers                      string  `json:"tiers"`
+	ContextTiers               string  `json:"context_tiers"`
 }
 
 // baseTierOnly reports whether a table entry is knowingly simplified to the
@@ -60,10 +60,10 @@ func (p *Pricing) Entries() ([]Entry, error) {
 				MaxInput:                   maxRate(r.InputPerMTok, r.LongContextInputMultiplier, r.LongContextThresholdTokens),
 				MaxOutput:                  maxRate(r.OutputPerMTok, r.LongContextOutputMultiplier, r.LongContextThresholdTokens),
 				LongContextThresholdTokens: r.LongContextThresholdTokens,
-				Tiers:                      TiersAll,
+				ContextTiers:               ContextTiersAll,
 			}
 			if baseTierOnly(provider, model) {
-				e.Tiers = TiersBaseOnly
+				e.ContextTiers = ContextTiersBaseOnly
 			}
 			for _, v := range []float64{e.Input, e.Output, e.MaxInput, e.MaxOutput, r.LongContextInputMultiplier, r.LongContextOutputMultiplier} {
 				if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
