@@ -598,3 +598,84 @@ func TestManagedPlanDispatchSecurity(t *testing.T) {
 		})
 	}
 }
+
+// The plan route takes function tools only inside a namespace, and replays
+// earlier calls under it. The agent still sees plain tool calls.
+func TestPlanRouteNamespacesFunctionTools(t *testing.T) {
+	rig := newPlanRig(t, planRef)
+	rig.signIn("plan-access-0-canary", time.Hour)
+	rig.planReply = func(w http.ResponseWriter, r *http.Request, hit int) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, planSSE(`{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.6-terra","output":[{"type":"function_call","id":"fc_1","call_id":"call_2","name":"ping","namespace":"agent_tools","arguments":"{}"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`))
+	}
+	w := rig.chat(`{"model":"chatgpt/gpt-5.6-terra","messages":[
+		{"role":"user","content":"go"},
+		{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"ping","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"call_1","content":"pong"}],
+		"tools":[{"type":"function","function":{"name":"ping","description":"p","parameters":{"type":"object","properties":{}}}}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("reply: %d %s", w.Code, w.Body.String())
+	}
+	tools := rig.planBody[0]["tools"].([]any)
+	ns := tools[0].(map[string]any)
+	if len(tools) != 1 || ns["type"] != "namespace" || ns["name"] != "agent_tools" {
+		t.Fatalf("tools must be one namespace: %v", tools)
+	}
+	member := ns["tools"].([]any)[0].(map[string]any)
+	if member["type"] != "function" || member["name"] != "ping" {
+		t.Fatalf("namespace member: %v", member)
+	}
+	replayed := false
+	for _, raw := range rig.planBody[0]["input"].([]any) {
+		item := raw.(map[string]any)
+		if item["type"] == "function_call" {
+			replayed = item["namespace"] == "agent_tools" && item["name"] == "ping"
+		}
+	}
+	if !replayed {
+		t.Fatalf("earlier call not replayed under the namespace: %v", rig.planBody[0]["input"])
+	}
+	var reply struct {
+		Choices []struct {
+			Message struct {
+				ToolCalls []struct {
+					Function struct {
+						Name string `json:"name"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &reply); err != nil || len(reply.Choices) != 1 || len(reply.Choices[0].Message.ToolCalls) != 1 || reply.Choices[0].Message.ToolCalls[0].Function.Name != "ping" {
+		t.Fatalf("agent-facing tool call: %s", w.Body.String())
+	}
+	assertInterventionLogged(t, rig.logs.Bytes(), "subscription_tools_namespaced")
+}
+
+func TestPlanRouteRefusesHostedTools(t *testing.T) {
+	body := map[string]any{"tools": []any{map[string]any{"type": "web_search"}}}
+	if _, err := shapePlanResponsesRequest(body); err == nil {
+		t.Fatal("a hosted tool must be refused on a plan route")
+	}
+}
+
+// A namespace is judged by its members, so grouping cannot hide a hosted
+// tool from the data policy.
+func TestDataPolicySeesInsideNamespaces(t *testing.T) {
+	fn := map[string]any{"type": "function", "name": "ping"}
+	ns := func(members ...any) map[string]any {
+		return map[string]any{"tools": []any{map[string]any{"type": "namespace", "name": "agent_tools", "tools": members}}}
+	}
+	if hasUnscopedFeature(ns(fn)) {
+		t.Fatal("a namespace of function tools is not a hosted feature")
+	}
+	if !hasUnscopedFeature(ns(fn, map[string]any{"type": "web_search"})) {
+		t.Fatal("a hosted tool inside a namespace must be seen")
+	}
+	if !hasUnscopedFeature(ns(map[string]any{"type": "namespace", "tools": []any{fn}})) {
+		t.Fatal("a nested namespace must not be accepted")
+	}
+	if !hasUnscopedFeature(map[string]any{"tools": []any{map[string]any{"type": "namespace"}}}) {
+		t.Fatal("a namespace without members must not be accepted")
+	}
+}

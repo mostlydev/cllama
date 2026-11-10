@@ -30,6 +30,9 @@ const (
 	// maxPlanStreamBytes bounds the buffered plan-route event stream.
 	maxPlanStreamBytes = 64 << 20
 
+	// planToolNamespace groups the agent's function tools on a plan route.
+	planToolNamespace = "agent_tools"
+
 	planLimitCode       = "subscription_sharing_usage_limit_exceeded"
 	planUnsupportedCode = "subscription_sharing_unsupported_capability"
 )
@@ -92,6 +95,30 @@ func shapePlanResponsesRequest(body map[string]any) ([]string, error) {
 		if moved {
 			mutations = append(mutations, "subscription_system_as_developer")
 		}
+	}
+	// The route takes function and custom tools only inside a namespace.
+	// Calls the model made earlier are replayed under the same namespace.
+	if tools, ok := body["tools"].([]any); ok && len(tools) > 0 {
+		for _, raw := range tools {
+			tool, _ := raw.(map[string]any)
+			if typ, _ := tool["type"].(string); typ != "function" && typ != "custom" {
+				return nil, &responsesAdapterRequestError{message: fmt.Sprintf("tool type %q is not supported on a plan route", typ)}
+			}
+		}
+		body["tools"] = []any{map[string]any{
+			"type":        "namespace",
+			"name":        planToolNamespace,
+			"description": "Tools available to the agent.",
+			"tools":       tools,
+		}}
+		if input, ok := body["input"].([]any); ok {
+			for _, raw := range input {
+				if item, ok := raw.(map[string]any); ok && item["type"] == "function_call" {
+					item["namespace"] = planToolNamespace
+				}
+			}
+		}
+		mutations = append(mutations, "subscription_tools_namespaced")
 	}
 	body["store"] = false
 	body["stream"] = true

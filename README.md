@@ -273,7 +273,8 @@ and the dashboard cannot redirect it, and a redirect from those endpoints is not
 
 **Request shape.** The plan route accepts chat completions requests and sends them to the
 Responses API with `store: false` and `stream: true`. System-role messages are sent as
-developer messages. Fields the route refuses (`temperature`, `top_p`, `max_output_tokens`,
+developer messages. Function tools are grouped in one namespace, `agent_tools`, as the route
+requires; the agent still sees plain tool calls. Hosted tools are refused. Fields the route refuses (`temperature`, `top_p`, `max_output_tokens`,
 `metadata`, `user`, `service_tier` and the others OpenAI lists) are removed, and each removal
 is logged as a `subscription_field_dropped:<field>` intervention. A reply counts only after
 `response.completed`; a failed, incomplete or cut stream is a failure and none of it reaches

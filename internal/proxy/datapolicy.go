@@ -229,12 +229,36 @@ func hasUnscopedFeature(x map[string]any) bool {
 	}
 	if tools, ok := x["tools"].([]any); ok {
 		for _, raw := range tools {
-			if tool, ok := raw.(map[string]any); ok {
-				typ, _ := tool["type"].(string)
-				if typ != "" && typ != "function" && typ != "custom" {
-					return true
-				}
+			if tool, ok := raw.(map[string]any); ok && unscopedTool(tool) {
+				return true
 			}
+		}
+	}
+	return false
+}
+
+// unscopedTool reports whether a tool entry is anything but a function or
+// custom tool. A namespace is only a grouping: it is judged by its members,
+// and a member that is itself a namespace is not accepted.
+func unscopedTool(tool map[string]any) bool {
+	typ, _ := tool["type"].(string)
+	if typ == "" || typ == "function" || typ == "custom" {
+		return false
+	}
+	if typ != "namespace" {
+		return true
+	}
+	members, ok := tool["tools"].([]any)
+	if !ok {
+		return true
+	}
+	for _, raw := range members {
+		member, ok := raw.(map[string]any)
+		if !ok {
+			return true
+		}
+		if mt, _ := member["type"].(string); mt != "function" && mt != "custom" {
+			return true
 		}
 	}
 	return false
